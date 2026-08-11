@@ -131,9 +131,9 @@ static int initialize_context(bench_context *context, const char *weights,
     const uint64_t kernel_shape[] = {128, 128, 3, 3, 3};
     context->gpu = h3_gpu_create("h3_shaders.metal", error, error_size);
     if (context->gpu) context->store = h3_weight_store_open(weights, error, error_size);
-#define LOAD_VECTOR(field, index) context->field = h3_weight_load_bf16( \
+#define LOAD_VECTOR(field, index) context->field = h3_weight_load_f32( \
     context->store, context->gpu, names[index], 1, vector_shape, error, error_size)
-#define LOAD_KERNEL(field, index) context->field = h3_weight_load_bf16( \
+#define LOAD_KERNEL(field, index) context->field = h3_weight_load_f32( \
     context->store, context->gpu, names[index], 5, kernel_shape, error, error_size)
     if (context->store) {
         LOAD_VECTOR(norm1_weight, 0); LOAD_VECTOR(norm1_bias, 1);
