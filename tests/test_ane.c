@@ -1,5 +1,7 @@
 #include "h3_ane_receipt.h"
 #include "h3_ane.h"
+#include "h3_ane_dispatch.h"
+#include "h3_video_encoder.h"
 
 #include <fcntl.h>
 #include <math.h>
@@ -783,6 +785,149 @@ static void test_runtime_bridge(const char *root) {
     unsetenv("H3_ANE_MODEL");
 }
 
+typedef struct {
+    h3_gpu *gpu;
+    h3_gpu_tensor *expected_input;
+    h3_gpu_tensor *returned;
+    size_t count;
+    int calls;
+} fake_metal_block;
+
+static h3_gpu_tensor *fake_metal_run(void *opaque,
+                                     h3_gpu_tensor *original_input,
+                                     char *error, size_t error_size) {
+    fake_metal_block *fake = opaque;
+    (void)error;
+    (void)error_size;
+    require(original_input == fake->expected_input,
+            "Metal fallback did not receive the original tensor pointer");
+    fake->calls++;
+    fake->returned = h3_gpu_tensor_new_f32(fake->gpu, fake->count);
+    return fake->returned;
+}
+
+static void test_dispatch_fallback(const char *root) {
+    static const char source[] =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const size_t count = (size_t)1 * 1 * 256 * 256 * 128;
+    char model_path[512], error[256];
+    make_qualified_model(root, "dispatch-model", source, model_path);
+    h3_ane_contract contract = valid_contract(source);
+    h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
+    require(gpu != NULL, error);
+    float *input_values = calloc(count, sizeof(*input_values));
+    require(input_values != NULL, "cannot allocate dispatch input fixture");
+    input_values[0] = 4.0f;
+    h3_gpu_tensor *input = h3_gpu_tensor_from_f32(gpu, input_values, count);
+    require(input != NULL, "cannot create dispatch input tensor");
+
+    fake_ane_backend fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    h3_ane *ane = create_enabled(model_path, &contract, 0, error);
+    require(ane != NULL, error);
+    fake_metal_block metal = {
+        .gpu = gpu, .expected_input = input, .count = count,
+    };
+    h3_ane_stats stats = {0};
+    h3_gpu_tensor *result = h3_ane_dispatch_gpu_block(
+        ane, gpu, input, count, fake_metal_run, &metal, &stats, error,
+        sizeof(error));
+    require(result != NULL && metal.calls == 0,
+            "successful non-shadow prediction did not adopt Core ML");
+    float first = 0.0f, original = 0.0f;
+    require(h3_gpu_tensor_read_f32_range(result, 0, &first, 1) &&
+                h3_gpu_tensor_read_f32_range(input, 0, &original, 1),
+            "cannot read dispatch result");
+    require(first == 5.0f && original == 4.0f,
+            "successful dispatch mutated input or returned wrong output");
+    require(stats.predictions == 1 && stats.fallbacks == 0 &&
+                stats.last_reason == H3_ANE_REASON_NONE,
+            "successful dispatch stats are incorrect");
+    h3_gpu_tensor_free(result);
+    h3_ane_free(ane);
+
+    for (int reason = H3_ANE_REASON_DISABLED;
+         reason <= H3_ANE_REASON_NONFINITE; reason++) {
+        fake = valid_fake_backend();
+        if (reason == H3_ANE_REASON_NONFINITE)
+            fake.emit_nonfinite = 1;
+        else
+            fake.predict_result = -reason;
+        install_fake_backend(&fake);
+        ane = create_enabled(model_path, &contract, 0, error);
+        require(ane != NULL, "cannot create forced-failure dispatch handle");
+        memset(&metal, 0, sizeof(metal));
+        metal.gpu = gpu;
+        metal.expected_input = input;
+        metal.count = count;
+        memset(&stats, 0, sizeof(stats));
+        result = h3_ane_dispatch_gpu_block(
+            ane, gpu, input, count, fake_metal_run, &metal, &stats, error,
+            sizeof(error));
+        require(result == metal.returned && metal.calls == 1,
+                "forced bridge failure did not adopt Metal fallback");
+        require(stats.last_reason == (h3_ane_reason)reason &&
+                    stats.fallbacks == 1,
+                "forced bridge failure lost its stable stats reason");
+        require(h3_gpu_tensor_read_f32_range(input, 0, &original, 1) &&
+                    original == 4.0f,
+                "forced bridge failure mutated the original input");
+        h3_gpu_tensor_free(result);
+        h3_ane_free(ane);
+    }
+
+    fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 1, error);
+    require(ane != NULL && h3_ane_is_shadow(ane),
+            "cannot create handle-owned shadow dispatch fixture");
+    memset(&metal, 0, sizeof(metal));
+    metal.gpu = gpu;
+    metal.expected_input = input;
+    metal.count = count;
+    result = h3_ane_dispatch_gpu_block(
+        ane, gpu, input, count, fake_metal_run, &metal, &stats, error,
+        sizeof(error));
+    require(result == metal.returned && metal.calls == 1 &&
+                stats.shadow == 1 && stats.predictions == 1,
+            "shadow dispatch did not run both backends and adopt Metal");
+    h3_gpu_tensor_free(result);
+    h3_ane_free(ane);
+
+    fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    memset(&metal, 0, sizeof(metal));
+    metal.gpu = gpu;
+    metal.expected_input = input;
+    metal.count = count;
+    result = h3_ane_dispatch_gpu_block(
+        ane, gpu, input, count - 1, fake_metal_run, &metal, &stats, error,
+        sizeof(error));
+    require(result == metal.returned && metal.calls == 1 &&
+                fake.predict_count == 0,
+            "other-shape dispatch attempted Core ML or skipped Metal");
+    h3_gpu_tensor_free(result);
+    h3_ane_free(ane);
+
+    h3_gpu_tensor_free(input);
+    free(input_values);
+    h3_gpu_free(gpu);
+    h3_ane_test_set_backend(NULL);
+    unsetenv("H3_ANE_MODEL");
+}
+
+static void test_video_encoder_ane_surface(void) {
+    h3_video_latent latent = {0};
+    require(latent.ane_stats.attempts == 0,
+            "video latent ANE stats do not initialize to zero");
+    int (*qualification)(const char *, const char *, const float *, size_t,
+                         float *, float *, size_t, char *, size_t) =
+        h3_video_encoder_block0_qualification;
+    require(qualification != NULL,
+            "video encoder qualification surface is unavailable");
+}
+
 int main(void) {
     char root[] = "/tmp/h3-ane-tests.XXXXXX";
     require(mkdtemp(root) != NULL, "cannot create temporary fixture root");
@@ -793,6 +938,8 @@ int main(void) {
     test_compiled_directory_receipt_integration(root);
     test_runtime_metadata();
     test_runtime_bridge(root);
+    test_dispatch_fallback(root);
+    test_video_encoder_ane_surface();
     printf("PASS tests/test_ane.c\n");
     return 0;
 }
