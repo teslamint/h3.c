@@ -392,6 +392,9 @@ checks.
 
 ## Experimental Apple Neural Engine harness
 
+Reusable implementation lessons, including evidence boundaries for ANE claims,
+are collected under `docs/solutions/`.
+
 The Apple Neural Engine (ANE) path is an **experimental, default-off measurement
 harness** for one fixed FL2VA visual-encoder block. Normal builds and runs remain
 Metal-only. Setting `H3_ANE_MODEL` opts a supported macOS 14.4 or newer process
