@@ -1,6 +1,6 @@
 ---
 title: Experimental Apple Neural Engine Acceleration
-status: draft
+status: approved
 date: 2026-08-11
 schema: spec/v1
 ---
