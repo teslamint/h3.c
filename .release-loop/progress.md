@@ -2,9 +2,9 @@
 schema: release-loop/v1
 feature: ane-acceleration
 phase: ship
-phase_status: waiting-user
+phase_status: in-progress
 started: 2026-08-11T13:46:38Z
-updated: 2026-08-11T17:06:00Z
+updated: 2026-08-11T23:18:17Z
 branch: feat/ane-acceleration
 base_branch: main
 flags: []
@@ -12,7 +12,7 @@ spec: docs/specs/2026-08-11-ane-acceleration-design.md
 plan: docs/plans/2026-08-11-001-feat-ane-acceleration-plan.md
 retro: null
 design_approved: {by: user, at: 2026-08-11T14:06:58Z}
-ship_approved: null
+ship_approved: {by: user, at: 2026-08-11T23:18:17Z, conditions: "local main merge approved after clean review and full tests; GitHub path preparation-only"}
 final_action:
   kind: merge-to-base
   status: determined
@@ -58,3 +58,4 @@ blocked_reason: null
 - 2026-08-11T17:00:16Z implement final branch review fix: corrected compute-plan preference labeling, configured fallback diagnostics, explicit benchmark authorization, and stride-aware MLMultiArray transfer with noncontiguous regression; 16 Python tests, focused actual-Metal ANE tests, and diff check passed; full-suite rerun remains for the final verifier.
 - 2026-08-11T17:06:00Z review: final branch re-review clean after `346825c`; spec compliance clean, quality clean, P0-P3 zero; full actual-Metal suite passed.
 - 2026-08-11T17:06:00Z ship: preflight found invalid GitHub auth and upstream-only origin; PR path is preparation-only. Determined local merge command `git switch main && git merge --no-ff feat/ane-acceleration -m "Merge feature 'ane-acceleration'"`; preparation evidence only, user consent still required.
+- 2026-08-11T23:18:17Z ship: user approved the determined local main merge command; execution started.
