@@ -2,17 +2,17 @@
 
 - Plan identity: `docs/plans/2026-08-11-001-feat-ane-acceleration-plan.md` (`plan/v1`, U4)
 - Matrix row: `compile`
-- Source commit: `396205de2d7f3483b68438d96df89d1157cf1dde`
-- Fixture identity: `h3-u4-evidence-mearkrwn`
-- Timestamp: `2026-08-11T15:58:21Z`
-- Disposable fixture root: `/private/tmp/h3-u4-evidence-mearkrwn`
-- Complete configured target inventory: `/private/tmp/h3-u4-evidence-mearkrwn/compile/ane.mlpackage, /private/tmp/h3-u4-evidence-mearkrwn/compile/compiled, /private/tmp/h3-u4-evidence-mearkrwn/compile/bin/xcrun`
-- Stub identity: `local xcrun stub missing-manifest injection`
-- Boundary sentinel: `/private/tmp/h3-u4-evidence-mearkrwn/BOUNDARY_SENTINEL_NO_REAL_TARGETS` existed during the fixture run with the recorded no-real-targets marker; every configured target resolved below the disposable fixture root, so no real target or source weights was reachable.
+- Source commit: `a113bc70ff9ea9774cbe4eeae7a5d5cf50d5e5fd`
+- Fixture identity: `h3-u4-authoritative-uizkm1rc`
+- Timestamp: `2026-08-11T16:24:32Z`
+- Disposable fixture root: `/private/tmp/h3-u4-authoritative-uizkm1rc`
+- Complete configured target inventory: `/private/tmp/h3-u4-authoritative-uizkm1rc/compile/ane.mlpackage, /private/tmp/h3-u4-authoritative-uizkm1rc/compile/ane.mlmodelc, /private/tmp/h3-u4-authoritative-uizkm1rc/compile/.ane.mlmodelc.compile-*, /private/tmp/h3-u4-authoritative-uizkm1rc/compile/bin/xcrun`
+- Stub identity: `xcrun stub manifest failure`
+- Boundary sentinel: `/private/tmp/h3-u4-authoritative-uizkm1rc/BOUNDARY_SENTINEL_NO_REAL_TARGETS` contained `all configured targets are disposable children of this root`; all command paths below resolve within that inventory, and no real weights were configured.
 - Pre-state: malformed package; destination absent
-- Exact injection/command: `/private/tmp/h3-u4-evidence-mearkrwn/compile/bin/xcrun coremlcompiler compile /private/tmp/h3-u4-evidence-mearkrwn/compile/ane.mlpackage /private/tmp/h3-u4-evidence-mearkrwn/compile/compiled`
+- Exact injection/command: `PATH=/private/tmp/h3-u4-authoritative-uizkm1rc/compile/bin:$PATH /opt/homebrew/opt/python@3.14/bin/python3.14 /private/tmp/h3-u4-authoritative-uizkm1rc/compile/driver.py compile /private/tmp/h3-u4-authoritative-uizkm1rc/compile/ane.mlpackage /private/tmp/h3-u4-authoritative-uizkm1rc/compile/ane.mlmodelc`
 - Exit status: `42`
-- Sanitized output: `exit 42`
-- Post-state: destination absent
-- Next invocation / compensation result: restoring manifest permits success
-- Mechanism check: status 42 is emitted by missing-manifest guard before mkdir
+- Sanitized output: `compiler exit 42`
+- Post-state: destination and owned compile temp absent
+- Next invocation / compensation result: restore manifest then command exits 0
+- Mechanism check: stub exits 42 at manifest check before output; production finally removes temp

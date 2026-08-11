@@ -2,17 +2,17 @@
 
 - Plan identity: `docs/plans/2026-08-11-001-feat-ane-acceleration-plan.md` (`plan/v1`, U4)
 - Matrix row: `qualification`
-- Source commit: `396205de2d7f3483b68438d96df89d1157cf1dde`
-- Fixture identity: `h3-u4-evidence-mearkrwn`
-- Timestamp: `2026-08-11T15:58:21Z`
-- Disposable fixture root: `/private/tmp/h3-u4-evidence-mearkrwn`
-- Complete configured target inventory: `/private/tmp/h3-u4-evidence-mearkrwn/qualification/model.mlmodelc, /private/tmp/h3-u4-evidence-mearkrwn/qualification/result.json, /private/tmp/h3-u4-evidence-mearkrwn/qualification/model.mlmodelc.qualification.json, /private/tmp/h3-u4-evidence-mearkrwn/qualification/model.mlmodelc.qualification.json.invalid`
+- Source commit: `a113bc70ff9ea9774cbe4eeae7a5d5cf50d5e5fd`
+- Fixture identity: `h3-u4-authoritative-uizkm1rc`
+- Timestamp: `2026-08-11T16:24:32Z`
+- Disposable fixture root: `/private/tmp/h3-u4-authoritative-uizkm1rc`
+- Complete configured target inventory: `/private/tmp/h3-u4-authoritative-uizkm1rc/qualification/model.mlmodelc, /private/tmp/h3-u4-authoritative-uizkm1rc/qualification/result.json, /private/tmp/h3-u4-authoritative-uizkm1rc/qualification/model.mlmodelc.qualification.json, /private/tmp/h3-u4-authoritative-uizkm1rc/qualification/model.mlmodelc.qualification.json.invalid, /private/tmp/h3-u4-authoritative-uizkm1rc/qualification/result.json.tmp-*`
 - Stub identity: `deterministic metrics seam`
-- Boundary sentinel: `/private/tmp/h3-u4-evidence-mearkrwn/BOUNDARY_SENTINEL_NO_REAL_TARGETS` existed during the fixture run with the recorded no-real-targets marker; every configured target resolved below the disposable fixture root, so no real target or source weights was reachable.
+- Boundary sentinel: `/private/tmp/h3-u4-authoritative-uizkm1rc/BOUNDARY_SENTINEL_NO_REAL_TARGETS` contained `all configured targets are disposable children of this root`; all command paths below resolve within that inventory, and no real weights were configured.
 - Pre-state: passing receipt exists
-- Exact injection/command: `run identical passing qualification twice`
+- Exact injection/command: `H3_ANE_TEST_METRICS=0.001,0.01 H3_ANE_TEST_SOURCE_SHA256=1111111111111111111111111111111111111111111111111111111111111111 /Users/teslamint/workspace/h3.c/h3_ane_qualification_test --model unused --coreml-model /private/tmp/h3-u4-authoritative-uizkm1rc/qualification/model.mlmodelc --output /private/tmp/h3-u4-authoritative-uizkm1rc/qualification/result.json && H3_ANE_TEST_METRICS=0.001,0.01 H3_ANE_TEST_SOURCE_SHA256=1111111111111111111111111111111111111111111111111111111111111111 /Users/teslamint/workspace/h3.c/h3_ane_qualification_test --model unused --coreml-model /private/tmp/h3-u4-authoritative-uizkm1rc/qualification/model.mlmodelc --output /private/tmp/h3-u4-authoritative-uizkm1rc/qualification/result.json`
 - Exit status: `0`
-- Sanitized output: `{"schema":"h3-ane-qualification/v1","status":"passed","model_sha256":"4460992ef1d2f53c03cf31e5396725c9e0a755a9cacebcf300a5374fb9ac939a","source_sha256":"1111111111111111111111111111111111111111111111111111111111111111","test_vector":"xorshift32-v1","qualified_at":"2026-08-11T15:58:21Z","max_abs":0.001,"relative_l2":0.01,"receipt_path":"/private/tmp/h3-u4-evidence-mearkrwn/qualification/model.mlmodelc.qualification.json","failure_reason":null}`
-- Post-state: prior receipt invalidated then exactly one new passing receipt exists
-- Next invocation / compensation result: third run repeats same state transition
-- Mechanism check: presence of .invalid plus one live receipt proves invalidate-before-test
+- Sanitized output: `(no output)`
+- Post-state: previous receipt invalidated and one new live receipt committed last
+- Next invocation / compensation result: third identical run exits 0
+- Mechanism check: live receipt and .invalid audit file coexist; no temp remains
