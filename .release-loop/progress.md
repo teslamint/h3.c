@@ -10,7 +10,7 @@ base_branch: main
 flags: []
 spec: docs/specs/2026-08-11-ane-acceleration-design.md
 plan: docs/plans/2026-08-11-001-feat-ane-acceleration-plan.md
-retro: null
+retro: docs/retros/2026-08-12-ane-acceleration-retro.md
 design_approved: {by: user, at: 2026-08-11T14:06:58Z}
 ship_approved: {by: user, at: 2026-08-11T23:18:17Z, conditions: "local main merge approved after clean review and full tests; GitHub path preparation-only"}
 final_action:
