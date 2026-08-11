@@ -68,7 +68,7 @@ tests/qualify_ane_tool_test.o: tests/qualify_ane.c
 tests/bench_ane_tool_test.o: tests/bench_ane.c
 	$(CC) $(CFLAGS) -DH3_ANE_TOOL_TESTING -I. -c $< -o $@
 
-h3_ane_tool_tests: h3_ane_qualification_test h3_ane_bench_test
+h3_ane_tool_tests: h3_ane_qualification_test h3_ane_bench_test h3_ane_bench
 
 h3_ane_test.o: h3_ane.m h3_ane.h
 	$(CC) $(OBJCFLAGS) -DH3_ANE_TESTING -I. -c $< -o $@

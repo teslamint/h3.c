@@ -191,6 +191,32 @@ static int write_result(const char *path, int passed, const char *model_sha,
     return atomic_finish(stream, path);
 }
 
+static void pause_after_receipt_if_requested(void) {
+#ifdef H3_ANE_TOOL_TESTING
+    const char *path = getenv("H3_ANE_TEST_PAUSE_AFTER_RECEIPT");
+    if (!path || !*path) return;
+    FILE *stream = fopen(path, "w");
+    if (stream) {
+        fputs("receipt committed\n", stream);
+        fclose(stream);
+    }
+    for (;;) pause();
+#endif
+}
+
+static void pause_after_invalidation_if_requested(void) {
+#ifdef H3_ANE_TOOL_TESTING
+    const char *path = getenv("H3_ANE_TEST_PAUSE_AFTER_INVALIDATION");
+    if (!path || !*path) return;
+    FILE *stream = fopen(path, "w");
+    if (stream) {
+        fputs("receipt invalidated\n", stream);
+        fclose(stream);
+    }
+    for (;;) pause();
+#endif
+}
+
 int main(int argc, char **argv) {
     const char *weights = NULL, *model = NULL, *output = NULL;
     if (!parse_args(argc, argv, &weights, &model, &output)) {
@@ -211,6 +237,7 @@ int main(int argc, char **argv) {
             free(receipt); free(invalid); return 2;
         }
     }
+    pause_after_invalidation_if_requested();
 
     char model_sha[65] = "", source_sha[65] = "", at[32] = "";
     char error[512] = "";
@@ -223,17 +250,21 @@ int main(int argc, char **argv) {
     const char *failure = NULL;
     if (!measured) failure = error[0] ? error : "qualification execution failed";
     else if (!passed) failure = "parity bounds failed";
-    if (passed && !write_receipt(receipt, model_sha, source_sha, at,
-                                 max_abs, relative_l2)) {
-        passed = 0; failure = "cannot atomically write passing receipt";
-    }
     if (!write_result(output, passed, model_sha, source_sha, at, max_abs,
                       relative_l2, receipt, failure)) {
         fprintf(stderr, "h3_ane_qualification: cannot write result: %s\n",
                 strerror(errno));
         unlink(receipt); free(receipt); free(invalid); return 2;
     }
-    if (!passed) unlink(receipt);
+    if (passed && !write_receipt(receipt, model_sha, source_sha, at,
+                                 max_abs, relative_l2)) {
+        passed = 0; failure = "cannot atomically write passing receipt";
+        unlink(receipt);
+        (void)write_result(output, 0, model_sha, source_sha, at, max_abs,
+                           relative_l2, receipt, failure);
+    }
+    if (passed) pause_after_receipt_if_requested();
+    else unlink(receipt);
     free(receipt); free(invalid);
     return passed ? 0 : 1;
 }

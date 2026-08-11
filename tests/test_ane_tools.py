@@ -104,15 +104,57 @@ class ConverterTests(unittest.TestCase):
 
     def test_contract_metadata_pins_layout_norm_and_padding(self):
         metadata = self.converter.contract_metadata("a" * 64)
-        self.assertEqual(metadata["h3_ane_contract_version"], "1")
-        self.assertEqual(metadata["h3_ane_variant"], "FL2VA")
-        self.assertEqual(metadata["h3_ane_shape"], "1,1,256,256,128")
+        self.assertEqual(metadata["version"], "1")
+        self.assertEqual(metadata["variant"], "FL2VA")
+        self.assertEqual(metadata["shape"], "1,1,256,256,128")
+        self.assertEqual(metadata["source_sha256"], "a" * 64)
         self.assertEqual(metadata["h3_ane_boundary_layout"], "NDHWC")
         self.assertEqual(metadata["h3_ane_weight_layout"], "OIDHW")
         self.assertEqual(metadata["h3_ane_group_count"], "32")
         self.assertEqual(metadata["h3_ane_epsilon"], "1e-6")
         self.assertEqual(metadata["h3_ane_temporal_padding"], "front=2,back=0,mode=constant")
         self.assertEqual(metadata["h3_ane_spatial_padding"], "1,1,1,1,mode=reflect")
+
+    def test_failed_publish_preserves_prior_package(self):
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "model.mlpackage"
+            destination.mkdir()
+            (destination / "old").write_text("authoritative")
+
+            class Model:
+                user_defined_metadata = {}
+                def save(self, path):
+                    Path(path).mkdir()
+                    (Path(path) / "new").write_text("candidate")
+
+            original = self.converter._publish_directory
+            self.converter._publish_directory = lambda *_: (_ for _ in ()).throw(
+                OSError("injected publish failure"))
+            try:
+                with self.assertRaisesRegex(OSError, "publish failure"):
+                    self.converter.atomic_save(Model(), destination, {})
+            finally:
+                self.converter._publish_directory = original
+            self.assertEqual((destination / "old").read_text(), "authoritative")
+            self.assertFalse(list(Path(root).glob(".model.mlpackage.tmp-*")))
+
+    def test_compile_owns_temp_and_publishes_only_complete_model(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            package = root / "model.mlpackage"
+            package.mkdir()
+            destination = root / "model.mlmodelc"
+
+            def runner(command, check):
+                self.assertEqual(command[:3], ["xcrun", "coremlcompiler", "compile"])
+                output_root = Path(command[4])
+                compiled = output_root / "model.mlmodelc"
+                compiled.mkdir(parents=True)
+                (compiled / "complete").write_text("yes")
+
+            self.converter.compile_package(package, destination, runner=runner)
+            self.assertEqual((destination / "complete").read_text(), "yes")
+            self.assertFalse(list(root.glob(".model.mlmodelc.compile-*")))
 
 
 class AnalyzerTests(unittest.TestCase):
@@ -205,6 +247,69 @@ class NativeToolTests(unittest.TestCase):
             self.assertFalse(receipt.exists())
             self.assertTrue(Path(f"{receipt}.invalid").exists())
 
+    def test_receipt_is_final_commit_point_under_post_receipt_signal(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            model = root / "model.mlmodelc"
+            model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            result_path = root / "result.json"
+            marker = root / "receipt-committed"
+            receipt = Path(f"{model}.qualification.json")
+            env = os.environ.copy()
+            env.update({
+                "H3_ANE_TEST_METRICS": "0.001,0.01",
+                "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+                "H3_ANE_TEST_PAUSE_AFTER_RECEIPT": str(marker),
+            })
+            process = subprocess.Popen(
+                [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                 "--coreml-model", str(model), "--output", str(result_path)],
+                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for _ in range(200):
+                if marker.exists():
+                    break
+                import time
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "tool did not reach receipt commit point")
+            process.terminate()
+            process.wait(timeout=5)
+            process.communicate()
+            self.assertTrue(result_path.exists())
+            self.assertTrue(receipt.exists())
+            self.assertEqual(json.loads(result_path.read_text())["status"], "passed")
+
+    def test_signal_after_invalidation_leaves_no_authorizing_receipt(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            model = root / "model.mlmodelc"
+            model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            receipt = Path(f"{model}.qualification.json")
+            receipt.write_text("old authority")
+            marker = root / "invalidated"
+            output = root / "result.json"
+            env = os.environ.copy()
+            env["H3_ANE_TEST_PAUSE_AFTER_INVALIDATION"] = str(marker)
+            process = subprocess.Popen(
+                [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                 "--coreml-model", str(model), "--output", str(output)],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            import time
+            for _ in range(200):
+                if marker.exists():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            process.terminate()
+            process.wait(timeout=5)
+            process.communicate()
+            self.assertFalse(receipt.exists())
+            self.assertTrue(Path(f"{receipt}.invalid").exists())
+            self.assertFalse(list(root.glob("result.json.tmp-*")))
+
     def test_benchmark_writes_complete_alternating_artifact_atomically(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -223,8 +328,10 @@ class NativeToolTests(unittest.TestCase):
             result = subprocess.run(command, env=env, text=True,
                                     capture_output=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(self.analyzer_for_native().analyze(
-                json.loads(output.read_text()))["claim_passed"])
+            document = json.loads(output.read_text())
+            self.assertEqual(document["placement_summary"],
+                             "observed:cpu+neural-engine")
+            self.assertTrue(self.analyzer_for_native().analyze(document)["claim_passed"])
 
             output.unlink()
             env["H3_ANE_TEST_ABORT_AFTER"] = "3"
@@ -233,6 +340,22 @@ class NativeToolTests(unittest.TestCase):
             self.assertNotEqual(interrupted.returncode, 0)
             self.assertFalse(output.exists())
             self.assertFalse(list(root.glob(".benchmark.json.tmp-*")))
+
+    def test_production_binary_ignores_test_environment(self):
+        env = os.environ.copy()
+        env.update({
+            "H3_ANE_TEST_METAL_SECONDS": "1.0",
+            "H3_ANE_TEST_COREML_SECONDS": "0.8",
+            "H3_ANE_WEIGHT_DIR": "/definitely/absent",
+        })
+        with tempfile.TemporaryDirectory() as root:
+            result = subprocess.run(
+                [str(ROOT / "h3_ane_bench"), "--backend", "metal",
+                 "--pairs", "1", "--output", str(Path(root) / "out.json")],
+                env=env, text=True, capture_output=True, check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((Path(root) / "out.json").exists())
 
     @staticmethod
     def analyzer_for_native():

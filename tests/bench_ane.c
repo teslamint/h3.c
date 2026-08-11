@@ -1,5 +1,6 @@
 #include "h3_ane_receipt.h"
 #include "h3_ane.h"
+#include "h3_ane_internal.h"
 #include "h3_gpu.h"
 #include "h3_video_encoder.h"
 #include "h3_weights.h"
@@ -66,6 +67,30 @@ static int fake_seconds(bench_mode mode, double *elapsed) {
     (void)mode; (void)elapsed;
 #endif
     return 0;
+}
+
+static int test_mode_enabled(void) {
+#ifdef H3_ANE_TOOL_TESTING
+    return getenv("H3_ANE_TEST_METAL_SECONDS") != NULL &&
+           getenv("H3_ANE_TEST_COREML_SECONDS") != NULL;
+#else
+    return 0;
+#endif
+}
+
+static void placement_summary(uint32_t devices, bench_mode mode,
+                              char output[96]) {
+    if (mode == MODE_METAL) {
+        snprintf(output, 96, "observed:metal-only");
+        return;
+    }
+    snprintf(output, 96, "observed:%s%s%s",
+             devices & H3_ANE_DEVICE_CPU ? "cpu" : "",
+             devices & H3_ANE_DEVICE_GPU ?
+                 (devices & H3_ANE_DEVICE_CPU ? "+gpu" : "gpu") : "",
+             devices & H3_ANE_DEVICE_NEURAL_ENGINE ?
+                 (devices & (H3_ANE_DEVICE_CPU | H3_ANE_DEVICE_GPU) ?
+                    "+neural-engine" : "neural-engine") : "");
 }
 
 static void destroy_context(bench_context *context) {
@@ -184,9 +209,12 @@ static int run_once(bench_context *context, bench_mode selected,
                     const float *input, const float *metal_oracle,
                     float *scratch, size_t count, double *elapsed,
                     double phases[3], double *max_abs, double *relative_l2,
+                    uint32_t *observed_devices,
                     char *error, size_t error_size) {
     if (fake_seconds(selected, elapsed)) {
         phases[0] = 0.0; phases[1] = *elapsed; phases[2] = 0.0;
+        if (selected == MODE_COREML)
+            *observed_devices |= H3_ANE_DEVICE_CPU | H3_ANE_DEVICE_NEURAL_ENGINE;
         *max_abs = 0.001; *relative_l2 = 0.01; return 1;
     }
     double start = seconds();
@@ -200,6 +228,7 @@ static int run_once(bench_context *context, bench_mode selected,
     phases[0] = stats.input_seconds;
     phases[1] = stats.prediction_seconds;
     phases[2] = stats.output_seconds;
+    if (selected == MODE_COREML) *observed_devices |= stats.preferred_device;
     if (selected == MODE_METAL) {
         *max_abs = 0.0; *relative_l2 = 0.0; return 1;
     }
@@ -270,7 +299,8 @@ int main(int argc, char **argv) {
     const size_t count = (size_t)1 * 1 * 256 * 256 * 128;
     float *input = NULL, *metal = NULL, *scratch = NULL;
     bench_context context = {0};
-    if (!getenv("H3_ANE_TEST_METAL_SECONDS")) {
+    int testing = test_mode_enabled();
+    if (!testing) {
         input = malloc(count * sizeof(*input)); metal = malloc(count * sizeof(*metal));
         scratch = malloc(count * sizeof(*scratch));
         if (!input || !metal || !scratch) return 2;
@@ -281,7 +311,6 @@ int main(int argc, char **argv) {
         }
     }
     char error[512] = "";
-    int testing = getenv("H3_ANE_TEST_METAL_SECONDS") != NULL;
     if (!testing && !initialize_context(&context, weights, model,
                                         mode != MODE_METAL, error, sizeof(error))) {
         fprintf(stderr, "h3_ane_bench: %s\n", error);
@@ -292,6 +321,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "h3_ane_bench: oracle failed: %s\n", error);
         destroy_context(&context); return 1;
     }
+    uint32_t observed_devices = 0;
+    if (!testing && context.ane) {
+        h3_ane_stats initial_stats;
+        h3_ane_stats_snapshot(context.ane, &initial_stats);
+        observed_devices = initial_stats.preferred_device;
+    }
     for (int iteration = 0; iteration < warmup; iteration++) {
         int first_backend = mode == MODE_AB ? 0 : (int)mode;
         int last_backend = mode == MODE_AB ? 1 : (int)mode;
@@ -299,6 +334,7 @@ int main(int argc, char **argv) {
             double elapsed, phases[3], max_abs, relative_l2;
             if (!run_once(&context, (bench_mode)backend, input, metal, scratch,
                           count, &elapsed, phases, &max_abs, &relative_l2,
+                          &observed_devices,
                           error, sizeof(error))) {
                 fprintf(stderr, "h3_ane_bench: warmup failed: %s\n", error); return 1;
             }
@@ -309,10 +345,13 @@ int main(int argc, char **argv) {
     int descriptor = mkstemp(active_temp);
     FILE *stream = descriptor >= 0 ? fdopen(descriptor, "w") : NULL;
     if (!stream) { cleanup(0); return 2; }
+    char observed_summary[96];
+    placement_summary(observed_devices, mode, observed_summary);
     fprintf(stream, "{\"schema\":\"h3-ane-benchmark/v1\",\"mode\":\"%s\","
                     "\"warmup\":%d,\"pairs\":%d,"
-                    "\"placement_summary\":\"runtime-qualified; retain H3_ANE_TRACE evidence\","
-                    "\"samples\":[", mode_name, warmup, pairs);
+                    "\"placement_summary\":\"%s\","
+                    "\"samples\":[", mode_name, warmup, pairs,
+            observed_summary);
     int first = 1, completed = 0;
     for (int pair = 0; pair < pairs; pair++) {
         bench_mode order[2]; int samples = mode == MODE_AB ? 2 : 1;
@@ -324,7 +363,8 @@ int main(int argc, char **argv) {
         for (int index = 0; index < samples; index++, completed++) {
             double elapsed, phases[3], max_abs, relative_l2;
             if (!run_once(&context, order[index], input, metal, scratch, count,
-                          &elapsed, phases, &max_abs, &relative_l2, error, sizeof(error))) {
+                          &elapsed, phases, &max_abs, &relative_l2,
+                          &observed_devices, error, sizeof(error))) {
                 fprintf(stderr, "h3_ane_bench: sample failed: %s\n", error);
                 fclose(stream); cleanup(0); return 1;
             }
