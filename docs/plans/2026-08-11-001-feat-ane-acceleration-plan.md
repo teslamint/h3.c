@@ -2,11 +2,12 @@
 schema: plan/v1
 title: Experimental Apple Neural Engine Acceleration
 type: feat
-status: draft
+status: approved
 date: 2026-08-11
 execution: code
 origin: docs/specs/2026-08-11-ane-acceleration-design.md
 deepened: true
+body_seal: f85bfaadb5e706ecac7877ffb5dd6fb1775dbbe43f59a764287ba09921671beb
 ---
 
 # Experimental Apple Neural Engine Acceleration Plan
