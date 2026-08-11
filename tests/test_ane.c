@@ -1,6 +1,8 @@
 #include "h3_ane_receipt.h"
+#include "h3_ane.h"
 
 #include <fcntl.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -339,6 +341,287 @@ static void test_compiled_directory_receipt_integration(const char *root) {
             "receipt remained valid after compiled bytes changed");
 }
 
+typedef struct {
+    int load_result;
+    int plan_result;
+    int predict_result;
+    int load_count;
+    int plan_count;
+    int predict_count;
+    int free_count;
+    int emit_nonfinite;
+    h3_ane_operation_usage operations[3];
+    size_t operation_count;
+} fake_ane_backend;
+
+static int fake_load(void *opaque) {
+    fake_ane_backend *fake = opaque;
+    fake->load_count++;
+    return fake->load_result;
+}
+
+static int fake_plan(void *opaque, h3_ane_operation_usage *operations,
+                     size_t *operation_count) {
+    fake_ane_backend *fake = opaque;
+    fake->plan_count++;
+    if (!fake->plan_result) return 0;
+    require(*operation_count >= fake->operation_count,
+            "bridge did not provide enough operation storage");
+    memcpy(operations, fake->operations,
+           fake->operation_count * sizeof(*operations));
+    *operation_count = fake->operation_count;
+    return fake->plan_result;
+}
+
+static int fake_predict(void *opaque, const float *input, size_t input_count,
+                        float *output, size_t output_count) {
+    fake_ane_backend *fake = opaque;
+    fake->predict_count++;
+    if (!fake->predict_result) return 0;
+    require(input != output, "prediction reused caller input storage");
+    require(input_count == output_count, "fake prediction count mismatch");
+    for (size_t index = 0; index < output_count; index++)
+        output[index] = input[index] + 1.0f;
+    if (fake->emit_nonfinite) output[output_count - 1] = NAN;
+    return fake->predict_result;
+}
+
+static void fake_free(void *opaque) {
+    fake_ane_backend *fake = opaque;
+    fake->free_count++;
+}
+
+static fake_ane_backend valid_fake_backend(void) {
+    fake_ane_backend fake = {
+        .load_result = 1,
+        .plan_result = 1,
+        .predict_result = 1,
+        .operations = {
+            {.name = "const-weight", .is_constant = 1,
+             .supported_devices = H3_ANE_DEVICE_CPU,
+             .preferred_device = H3_ANE_DEVICE_CPU},
+            {.name = "conv_0", .is_constant = 0,
+             .supported_devices = H3_ANE_DEVICE_CPU |
+                                  H3_ANE_DEVICE_NEURAL_ENGINE,
+             .preferred_device = H3_ANE_DEVICE_NEURAL_ENGINE},
+            {.name = "add_0", .is_constant = 0,
+             .supported_devices = H3_ANE_DEVICE_CPU |
+                                  H3_ANE_DEVICE_NEURAL_ENGINE,
+             .preferred_device = H3_ANE_DEVICE_CPU},
+        },
+        .operation_count = 3,
+    };
+    return fake;
+}
+
+static void install_fake_backend(fake_ane_backend *fake) {
+    h3_ane_test_backend backend = {
+        .load = fake_load,
+        .plan = fake_plan,
+        .predict = fake_predict,
+        .free = fake_free,
+        .opaque = fake,
+    };
+    h3_ane_test_set_backend(&backend);
+}
+
+static void make_qualified_model(const char *root, const char *name,
+                                 const char *source, char model_path[512]) {
+    char artifact[512], receipt_path[512], digest[65], error[256];
+    make_directory(model_path, root, name);
+    make_path(artifact, model_path, "model.mil");
+    write_bytes(artifact, "runtime-model", 13);
+    require(h3_ane_sha256_directory(model_path, digest, error, sizeof(error)),
+            error);
+    int written = snprintf(receipt_path, sizeof(receipt_path),
+                           "%s.qualification.json", model_path);
+    require(written > 0 && (size_t)written < sizeof(receipt_path),
+            "qualification receipt path is too long");
+    const char *json = valid_receipt_json(digest, source);
+    write_bytes(receipt_path, json, strlen(json));
+}
+
+static h3_ane *create_enabled(const char *model_path,
+                              const h3_ane_contract *contract, int shadow,
+                              char error[256]) {
+    require(setenv("H3_ANE_MODEL", model_path, 1) == 0,
+            "cannot enable fake ANE model");
+    return h3_ane_create(model_path, contract, shadow, error, 256);
+}
+
+static void require_predict_reason(h3_ane *ane, size_t count,
+                                   h3_ane_reason expected,
+                                   const char *message) {
+    float input = 1.0f, output = 0.0f;
+    h3_ane_stats stats = {0};
+    char error[256];
+    require(!h3_ane_predict(ane, &input, count, &output, count, &stats, error,
+                            sizeof(error)), message);
+    require(stats.last_reason == expected, message);
+}
+
+static void test_runtime_bridge(const char *root) {
+    static const char source[] =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    char model_path[512], error[256];
+    make_qualified_model(root, "runtime-model", source, model_path);
+    h3_ane_contract contract = valid_contract(source);
+    fake_ane_backend fake = valid_fake_backend();
+    install_fake_backend(&fake);
+
+    require(unsetenv("H3_ANE_MODEL") == 0, "cannot clear ANE model setting");
+    h3_ane *ane = h3_ane_create(model_path, &contract, 0, error, sizeof(error));
+    require(ane != NULL, "default-off create did not return fallback handle");
+    require(fake.load_count == 0, "default environment loaded Core ML");
+    require_predict_reason(ane, 1, H3_ANE_REASON_DISABLED,
+                           "default-off reason was unstable");
+    h3_ane_free(ane);
+    require(fake.free_count == 0, "disabled handle freed an unloaded backend");
+
+    ane = create_enabled(model_path, &contract, 0, error);
+    require(ane != NULL, error);
+    require(fake.load_count == 1 && fake.plan_count == 1,
+            "qualified fake backend did not load and plan exactly once");
+    require(!h3_ane_is_shadow(ane), "qualified handle became shadow");
+    const size_t count = (size_t)1 * 1 * 256 * 256 * 128;
+    float *input = calloc(count, sizeof(*input));
+    float *output = calloc(count, sizeof(*output));
+    require(input != NULL && output != NULL, "cannot allocate bridge fixture");
+    input[0] = 4.0f;
+    h3_ane_stats stats = {0};
+    require(h3_ane_predict(ane, input, count, output, count, &stats, error,
+                           sizeof(error)), error);
+    require(input[0] == 4.0f && output[0] == 5.0f,
+            "prediction mutated input or failed to copy separate output");
+    require(stats.attempts == 1 && stats.predictions == 1 &&
+                stats.fallbacks == 0 && stats.last_reason == H3_ANE_REASON_NONE,
+            "successful prediction stats are incorrect");
+    require(stats.preferred_device ==
+                (H3_ANE_DEVICE_CPU | H3_ANE_DEVICE_NEURAL_ENGINE),
+            "preferred placement summary is incorrect");
+    require(stats.shadow == 0 && stats.load_seconds >= 0.0 &&
+                stats.input_seconds >= 0.0 &&
+                stats.prediction_seconds >= 0.0 &&
+                stats.output_seconds >= 0.0,
+            "timing or mode stats are incorrect");
+    h3_ane_free(ane);
+    require(fake.free_count == 1, "loaded backend was not freed exactly once");
+
+    char shadow_path[512];
+    make_directory(shadow_path, root, "shadow-model");
+    fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    ane = create_enabled(shadow_path, &contract, 1, error);
+    require(ane != NULL && h3_ane_is_shadow(ane),
+            "shadow model without receipt did not load");
+    memset(&stats, 0, sizeof(stats));
+    require(h3_ane_predict(ane, input, count, output, count, &stats, error,
+                           sizeof(error)), error);
+    require(stats.shadow == 1, "shadow output was marked adoptable");
+    h3_ane_free(ane);
+
+    h3_ane_contract changed = contract;
+    changed.block_index = 1;
+    fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &changed, 0, error);
+    require_predict_reason(ane, 1, H3_ANE_REASON_CONTRACT,
+                           "contract failure reason was unstable");
+    h3_ane_free(ane);
+
+    changed = contract;
+    changed.boundary_dtype = (h3_ane_dtype)99;
+    ane = create_enabled(model_path, &changed, 0, error);
+    require_predict_reason(ane, 1, H3_ANE_REASON_DTYPE,
+                           "dtype failure reason was unstable");
+    h3_ane_free(ane);
+
+    h3_ane_contract fingerprint = contract;
+    fingerprint.source_sha256[0] = 'e';
+    ane = create_enabled(model_path, &fingerprint, 0, error);
+    require_predict_reason(ane, 1, H3_ANE_REASON_FINGERPRINT,
+                           "fingerprint failure reason was unstable");
+    h3_ane_free(ane);
+
+    fake = valid_fake_backend();
+    fake.load_result = 0;
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    require_predict_reason(ane, 1, H3_ANE_REASON_LOAD,
+                           "load failure reason was unstable");
+    h3_ane_free(ane);
+
+    fake = valid_fake_backend();
+    fake.load_result = -(int)H3_ANE_REASON_OS;
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    require_predict_reason(ane, 1, H3_ANE_REASON_OS,
+                           "OS failure reason was unstable");
+    h3_ane_free(ane);
+
+    fake = valid_fake_backend();
+    fake.operations[1].supported_devices = H3_ANE_DEVICE_CPU;
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    require_predict_reason(ane, 1, H3_ANE_REASON_ELIGIBILITY,
+                           "eligibility failure reason was unstable");
+    h3_ane_free(ane);
+
+    fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    require(setenv("H3_ANE_TRACE", "1", 1) == 0,
+            "cannot enable ANE trace");
+    ane = create_enabled(model_path, &contract, 0, error);
+    require(ane != NULL, "trace-enabled plan failed");
+    h3_ane_free(ane);
+    require(unsetenv("H3_ANE_TRACE") == 0, "cannot clear ANE trace");
+
+    fake = valid_fake_backend();
+    fake.predict_result = 0;
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    require(!h3_ane_predict(ane, input, count, output, count, &stats, error,
+                            sizeof(error)),
+            "prediction failure was accepted");
+    require(stats.last_reason == H3_ANE_REASON_PREDICTION &&
+                stats.attempts == 1 && stats.predictions == 0 &&
+                stats.fallbacks == 1,
+            "prediction failure stats are incorrect");
+    h3_ane_free(ane);
+
+    fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    require_predict_reason(ane, count - 1, H3_ANE_REASON_SHAPE,
+                           "shape failure reason was unstable");
+    h3_ane_free(ane);
+
+    fake = valid_fake_backend();
+    fake.emit_nonfinite = 1;
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    require(!h3_ane_predict(ane, input, count, output, count, &stats, error,
+                            sizeof(error)),
+            "non-finite prediction was accepted");
+    require(stats.last_reason == H3_ANE_REASON_NONFINITE,
+            "non-finite failure reason was unstable");
+    h3_ane_free(ane);
+
+    char unqualified[512];
+    make_directory(unqualified, root, "unqualified-model");
+    fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    ane = create_enabled(unqualified, &contract, 0, error);
+    require_predict_reason(ane, 1, H3_ANE_REASON_RECEIPT,
+                           "receipt failure reason was unstable");
+    h3_ane_free(ane);
+
+    free(output);
+    free(input);
+    h3_ane_test_set_backend(NULL);
+    unsetenv("H3_ANE_MODEL");
+}
+
 int main(void) {
     char root[] = "/tmp/h3-ane-tests.XXXXXX";
     require(mkdtemp(root) != NULL, "cannot create temporary fixture root");
@@ -347,6 +630,7 @@ int main(void) {
     test_receipt_load_and_validate(root);
     test_contract_is_exact();
     test_compiled_directory_receipt_integration(root);
+    test_runtime_bridge(root);
     printf("PASS tests/test_ane.c\n");
     return 0;
 }
