@@ -114,6 +114,16 @@ static void test_directory_digest(const char *root) {
     require(symlink(outside, linked) == 0, "cannot create traversal fixture");
     require(!h3_ane_sha256_directory(first, changed, error, sizeof(error)),
             "directory digest followed a symlink traversal");
+
+    char outside_directory[512], directory_link[512];
+    make_directory(outside_directory, root, "outside-directory");
+    make_path(path, outside_directory, "payload.bin");
+    write_bytes(path, "outside", 7);
+    make_path(directory_link, second, "substituted-directory");
+    require(symlink(outside_directory, directory_link) == 0,
+            "cannot create directory substitution fixture");
+    require(!h3_ane_sha256_directory(second, changed, error, sizeof(error)),
+            "directory digest followed a substituted directory symlink");
 }
 
 static void test_tensor_digest(const char *root) {
@@ -130,6 +140,15 @@ static void test_tensor_digest(const char *root) {
     require(h3_ane_sha256_tensors(store, names, 2, repeated, error,
                                   sizeof(error)), error);
     require(strcmp(digest, repeated) == 0, "tensor digest is not deterministic");
+    const char *reversed_names[] = {"b", "a"};
+    require(h3_ane_sha256_tensors(store, reversed_names, 2, repeated, error,
+                                  sizeof(error)), error);
+    require(strcmp(digest, repeated) == 0,
+            "tensor digest depends on caller tensor order");
+    const char *duplicate_names[] = {"a", "a"};
+    require(!h3_ane_sha256_tensors(store, duplicate_names, 2, repeated, error,
+                                   sizeof(error)),
+            "duplicate tensor name was accepted");
     require(!h3_ane_sha256_tensors(store, (const char *const[]){"missing"}, 1,
                                    changed, error, sizeof(error)),
             "missing tensor was accepted");
@@ -184,6 +203,18 @@ static void test_receipt_load_and_validate(const char *root) {
     require(!h3_ane_receipt_load(path, &receipt, error, sizeof(error)),
             "receipt with unknown field was accepted");
 
+    const char trailing_comma[] =
+        "{\"version\":1,"
+        "\"model_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+        "\"source_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+        "\"test_vector\":\"ane-v1-seed-7\","
+        "\"qualified_at\":\"2026-08-11T00:00:00Z\","
+        "\"max_abs\":0.001,\"relative_l2\":0.01,"
+        "\"status\":\"passed\",}";
+    write_bytes(path, trailing_comma, sizeof(trailing_comma) - 1);
+    require(!h3_ane_receipt_load(path, &receipt, error, sizeof(error)),
+            "receipt parser accepted a trailing comma");
+
     const char non_json_number[] =
         "{\"version\":1,"
         "\"model_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
@@ -229,6 +260,57 @@ static void test_receipt_load_and_validate(const char *root) {
             "relative-L2 equality was accepted");
 }
 
+static void test_contract_is_exact(void) {
+    static const char source[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char model[] =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    h3_ane_contract contract = valid_contract(source);
+    h3_ane_receipt receipt = {
+        .version = 1,
+        .model_sha256 =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .source_sha256 =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .test_vector = "ane-v1-seed-7",
+        .qualified_at = "2026-08-11T00:00:00Z",
+        .max_abs = 0.001,
+        .relative_l2 = 0.01,
+        .passed = 1,
+    };
+    char error[256];
+    require(h3_ane_receipt_validate(&contract, &receipt, model, error,
+                                    sizeof(error)), error);
+
+    h3_ane_contract changed = contract;
+    memcpy(changed.variant, "Ref2VA", 7);
+    require(!h3_ane_receipt_validate(&changed, &receipt, model, error,
+                                     sizeof(error)),
+            "non-FL2VA contract was accepted");
+    changed = contract;
+    changed.block_level = 1;
+    require(!h3_ane_receipt_validate(&changed, &receipt, model, error,
+                                     sizeof(error)),
+            "nonzero block level was accepted");
+    changed = contract;
+    changed.block_index = 1;
+    require(!h3_ane_receipt_validate(&changed, &receipt, model, error,
+                                     sizeof(error)),
+            "nonzero block index was accepted");
+    changed = contract;
+    memcpy(changed.weight_prefix, "encoder.down.0.block.1", 23);
+    require(!h3_ane_receipt_validate(&changed, &receipt, model, error,
+                                     sizeof(error)),
+            "wrong weight prefix was accepted");
+    for (size_t dimension = 0; dimension < 5; dimension++) {
+        changed = contract;
+        changed.shape[dimension]++;
+        require(!h3_ane_receipt_validate(&changed, &receipt, model, error,
+                                         sizeof(error)),
+                "wrong fixed boundary shape was accepted");
+    }
+}
+
 static void test_compiled_directory_receipt_integration(const char *root) {
     static const char source[] =
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -263,6 +345,7 @@ int main(void) {
     test_directory_digest(root);
     test_tensor_digest(root);
     test_receipt_load_and_validate(root);
+    test_contract_is_exact();
     test_compiled_directory_receipt_integration(root);
     printf("PASS tests/test_ane.c\n");
     return 0;

@@ -18,7 +18,6 @@ enum { RECEIPT_LIMIT = 65536, HASH_BUFFER_SIZE = 65536 };
 
 typedef struct {
     char *relative;
-    char *absolute;
     off_t size;
 } digest_file;
 
@@ -62,14 +61,13 @@ static int join_path(const char *left, const char *right, char **out) {
 static void free_digest_files(digest_files *files) {
     for (size_t index = 0; index < files->count; index++) {
         free(files->items[index].relative);
-        free(files->items[index].absolute);
     }
     free(files->items);
     memset(files, 0, sizeof(*files));
 }
 
 static int append_digest_file(digest_files *files, const char *relative,
-                              const char *absolute, off_t size,
+                              off_t size,
                               char *error, size_t error_size) {
     if (files->count == files->capacity) {
         size_t next = files->capacity ? files->capacity * 2 : 16;
@@ -88,11 +86,9 @@ static int append_digest_file(digest_files *files, const char *relative,
     }
     digest_file *item = &files->items[files->count];
     item->relative = copy_string(relative);
-    item->absolute = copy_string(absolute);
     item->size = size;
-    if (!item->relative || !item->absolute) {
+    if (!item->relative) {
         free(item->relative);
-        free(item->absolute);
         fail(error, error_size, "out of memory recording compiled-model file");
         return 0;
     }
@@ -100,27 +96,14 @@ static int append_digest_file(digest_files *files, const char *relative,
     return 1;
 }
 
-static int collect_directory(const char *root, const char *relative,
+static int collect_directory(int directory_fd, const char *relative,
                              digest_files *files,
                              char *error, size_t error_size) {
-    char *directory = NULL;
-    if (*relative) {
-        if (!join_path(root, relative, &directory)) {
-            fail(error, error_size, "compiled-model path is too long");
-            return 0;
-        }
-    } else {
-        directory = copy_string(root);
-        if (!directory) {
-            fail(error, error_size, "out of memory resolving compiled model");
-            return 0;
-        }
-    }
-    DIR *stream = opendir(directory);
+    DIR *stream = fdopendir(directory_fd);
     if (!stream) {
         fail(error, error_size, "cannot open compiled-model directory: %s",
              strerror(errno));
-        free(directory);
+        close(directory_fd);
         return 0;
     }
     int result = 1;
@@ -129,22 +112,20 @@ static int collect_directory(const char *root, const char *relative,
         if (strcmp(entry->d_name, ".") == 0 ||
             strcmp(entry->d_name, "..") == 0) continue;
         char *child_relative = NULL;
-        char *child_absolute = NULL;
         if (*relative) {
             if (!join_path(relative, entry->d_name, &child_relative)) result = 0;
         } else {
             child_relative = copy_string(entry->d_name);
             if (!child_relative) result = 0;
         }
-        if (result && !join_path(root, child_relative, &child_absolute)) result = 0;
         if (!result) {
             fail(error, error_size, "out of memory resolving compiled-model path");
             free(child_relative);
-            free(child_absolute);
             break;
         }
         struct stat status;
-        if (lstat(child_absolute, &status) != 0) {
+        if (fstatat(dirfd(stream), entry->d_name, &status,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
             fail(error, error_size, "cannot inspect compiled-model entry %s: %s",
                  child_relative, strerror(errno));
             result = 0;
@@ -153,21 +134,28 @@ static int collect_directory(const char *root, const char *relative,
                  "compiled-model symlink is not allowed: %s", child_relative);
             result = 0;
         } else if (S_ISDIR(status.st_mode)) {
-            result = collect_directory(root, child_relative, files,
-                                       error, error_size);
+            int child_fd = openat(dirfd(stream), entry->d_name,
+                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (child_fd < 0) {
+                fail(error, error_size,
+                     "cannot open compiled-model directory %s without following links: %s",
+                     child_relative, strerror(errno));
+                result = 0;
+            } else {
+                result = collect_directory(child_fd, child_relative, files,
+                                           error, error_size);
+            }
         } else if (S_ISREG(status.st_mode)) {
-            result = append_digest_file(files, child_relative, child_absolute,
-                                        status.st_size, error, error_size);
+            result = append_digest_file(files, child_relative, status.st_size,
+                                        error, error_size);
         } else {
             fail(error, error_size,
                  "unsupported compiled-model entry: %s", child_relative);
             result = 0;
         }
         free(child_relative);
-        free(child_absolute);
     }
     closedir(stream);
-    free(directory);
     return result;
 }
 
@@ -206,12 +194,49 @@ static void digest_hex(const unsigned char digest[CC_SHA256_DIGEST_LENGTH],
     out[64] = '\0';
 }
 
-static int hash_file(CC_SHA256_CTX *context, const char *path, off_t expected,
-                     char *error, size_t error_size) {
-    int descriptor = open(path, O_RDONLY | O_NOFOLLOW);
-    if (descriptor < 0) {
-        fail(error, error_size, "cannot open compiled-model file: %s",
+static int open_relative_file(int root_fd, const char *relative,
+                              char *error, size_t error_size) {
+    char *path = copy_string(relative);
+    if (!path) {
+        fail(error, error_size, "out of memory resolving compiled-model file");
+        return -1;
+    }
+    int current = dup(root_fd);
+    if (current < 0) {
+        fail(error, error_size, "cannot duplicate compiled-model directory: %s",
              strerror(errno));
+        free(path);
+        return -1;
+    }
+    char *component = path;
+    for (;;) {
+        char *slash = strchr(component, '/');
+        if (slash) *slash = '\0';
+        int flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC;
+        if (slash) flags |= O_DIRECTORY;
+        int next = openat(current, component, flags);
+        close(current);
+        if (next < 0) {
+            fail(error, error_size,
+                 "cannot open compiled-model path without following links: %s",
+                 strerror(errno));
+            free(path);
+            return -1;
+        }
+        if (!slash) {
+            free(path);
+            return next;
+        }
+        current = next;
+        component = slash + 1;
+    }
+}
+
+static int hash_file(CC_SHA256_CTX *context, int root_fd,
+                     const char *relative, off_t expected,
+                     char *error, size_t error_size) {
+    int descriptor = open_relative_file(root_fd, relative, error, error_size);
+    if (descriptor < 0) {
         return 0;
     }
     struct stat status;
@@ -239,15 +264,25 @@ int h3_ane_sha256_directory(const char *path, char out[65],
         fail(error, error_size, "compiled-model directory and digest are required");
         return 0;
     }
-    struct stat root_status;
-    if (lstat(path, &root_status) != 0 || !S_ISDIR(root_status.st_mode) ||
-        S_ISLNK(root_status.st_mode)) {
+    int root_fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root_fd < 0) {
         fail(error, error_size, "compiled-model path is not a real directory");
         return 0;
     }
+    struct stat root_status;
+    if (fstat(root_fd, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
+        fail(error, error_size, "compiled-model path is not a real directory");
+        close(root_fd);
+        return 0;
+    }
     digest_files files = {0};
-    if (!collect_directory(path, "", &files, error, error_size)) {
+    int walk_fd = dup(root_fd);
+    if (walk_fd < 0 || !collect_directory(walk_fd, "", &files,
+                                          error, error_size)) {
+        if (walk_fd < 0)
+            fail(error, error_size, "cannot duplicate compiled-model directory");
         free_digest_files(&files);
+        close(root_fd);
         return 0;
     }
     qsort(files.items, files.count, sizeof(*files.items), compare_digest_files);
@@ -262,7 +297,7 @@ int h3_ane_sha256_directory(const char *path, char out[65],
         hash_u64(&context, (uint64_t)relative_size);
         hash_bytes(&context, files.items[index].relative, relative_size);
         hash_u64(&context, (uint64_t)files.items[index].size);
-        result = hash_file(&context, files.items[index].absolute,
+        result = hash_file(&context, root_fd, files.items[index].relative,
                            files.items[index].size, error, error_size);
     }
     if (result) {
@@ -271,7 +306,14 @@ int h3_ane_sha256_directory(const char *path, char out[65],
         digest_hex(digest, out);
     }
     free_digest_files(&files);
+    close(root_fd);
     return result;
+}
+
+static int compare_tensor_names(const void *left, const void *right) {
+    const char *const *a = left;
+    const char *const *b = right;
+    return strcmp(*a, *b);
 }
 
 int h3_ane_sha256_tensors(const h3_weight_store *store,
@@ -286,25 +328,50 @@ int h3_ane_sha256_tensors(const h3_weight_store *store,
     static const char domain[] = "h3-ane-tensors-v1";
     hash_bytes(&context, domain, sizeof(domain) - 1);
     hash_u64(&context, (uint64_t)name_count);
-    unsigned char buffer[HASH_BUFFER_SIZE];
+    if (name_count > SIZE_MAX / sizeof(const char *)) {
+        fail(error, error_size, "tensor name list is too large");
+        return 0;
+    }
+    const char **sorted_names = malloc(name_count * sizeof(*sorted_names));
+    if (!sorted_names) {
+        fail(error, error_size, "out of memory sorting tensor names");
+        return 0;
+    }
     for (size_t index = 0; index < name_count; index++) {
         if (!names[index] || !*names[index]) {
             fail(error, error_size, "tensor name is required");
+            free(sorted_names);
             return 0;
         }
+        sorted_names[index] = names[index];
+    }
+    qsort(sorted_names, name_count, sizeof(*sorted_names), compare_tensor_names);
+    for (size_t index = 1; index < name_count; index++) {
+        if (strcmp(sorted_names[index - 1], sorted_names[index]) == 0) {
+            fail(error, error_size, "duplicate tensor name: %s",
+                 sorted_names[index]);
+            free(sorted_names);
+            return 0;
+        }
+    }
+    unsigned char buffer[HASH_BUFFER_SIZE];
+    for (size_t index = 0; index < name_count; index++) {
+        const char *name = sorted_names[index];
         const h3_st_header *header = NULL;
-        const h3_st_tensor *tensor = h3_weight_find(store, names[index], &header);
+        const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
         if (!tensor || !header) {
-            fail(error, error_size, "required weight is absent: %s", names[index]);
+            fail(error, error_size, "required weight is absent: %s", name);
+            free(sorted_names);
             return 0;
         }
         if (tensor->data_end < tensor->data_begin) {
-            fail(error, error_size, "weight has invalid byte range: %s", names[index]);
+            fail(error, error_size, "weight has invalid byte range: %s", name);
+            free(sorted_names);
             return 0;
         }
-        size_t name_size = strlen(names[index]);
+        size_t name_size = strlen(name);
         hash_u64(&context, (uint64_t)name_size);
-        hash_bytes(&context, names[index], name_size);
+        hash_bytes(&context, name, name_size);
         hash_u64(&context, (uint64_t)tensor->dtype);
         hash_u64(&context, (uint64_t)tensor->ndim);
         for (int dimension = 0; dimension < tensor->ndim; dimension++)
@@ -314,6 +381,7 @@ int h3_ane_sha256_tensors(const h3_weight_store *store,
         int descriptor = open(header->path, O_RDONLY | O_NOFOLLOW);
         if (descriptor < 0) {
             fail(error, error_size, "cannot open weight shard: %s", strerror(errno));
+            free(sorted_names);
             return 0;
         }
         uint64_t offset = tensor->file_offset;
@@ -325,7 +393,7 @@ int h3_ane_sha256_tensors(const h3_weight_store *store,
             ssize_t amount = pread(descriptor, buffer, requested, (off_t)offset);
             if (amount <= 0) {
                 fail(error, error_size, "cannot read weight bytes for %s",
-                     names[index]);
+                     name);
                 result = 0;
                 break;
             }
@@ -334,11 +402,15 @@ int h3_ane_sha256_tensors(const h3_weight_store *store,
             remaining -= (uint64_t)amount;
         }
         close(descriptor);
-        if (!result) return 0;
+        if (!result) {
+            free(sorted_names);
+            return 0;
+        }
     }
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256_Final(digest, &context);
     digest_hex(digest, out);
+    free(sorted_names);
     return 1;
 }
 
@@ -426,7 +498,7 @@ static int json_u32(json_reader *reader, uint32_t *out) {
 }
 
 static int valid_sha256(const char value[65]) {
-    if (!value || strlen(value) != 64) return 0;
+    if (!value || value[64] != '\0') return 0;
     for (size_t index = 0; index < 64; index++) {
         if (!((value[index] >= '0' && value[index] <= '9') ||
               (value[index] >= 'a' && value[index] <= 'f'))) return 0;
@@ -532,6 +604,11 @@ int h3_ane_receipt_load(const char *path, h3_ane_receipt *out,
         skip_space(&reader);
         if (reader.cursor < reader.end && *reader.cursor == ',') {
             reader.cursor++;
+            skip_space(&reader);
+            if (reader.cursor == reader.end || *reader.cursor == '}') {
+                result = 0;
+                break;
+            }
             continue;
         }
         if (reader.cursor < reader.end && *reader.cursor == '}') {
@@ -566,14 +643,18 @@ int h3_ane_receipt_validate(const h3_ane_contract *contract,
         fail(error, error_size, "unsupported ANE receipt contract version");
         return 0;
     }
-    if (!*contract->variant || !*contract->weight_prefix ||
+    static const uint32_t expected_shape[5] = {1, 1, 256, 256, 128};
+    if (strncmp(contract->variant, "FL2VA", sizeof(contract->variant)) != 0 ||
+        contract->block_level != 0 || contract->block_index != 0 ||
+        strncmp(contract->weight_prefix, "encoder.down.0.block.0",
+                sizeof(contract->weight_prefix)) != 0 ||
         contract->boundary_dtype != H3_ANE_DTYPE_F32) {
-        fail(error, error_size, "ANE model contract is incomplete");
+        fail(error, error_size, "ANE model contract is not the fixed FL2VA block");
         return 0;
     }
     for (size_t index = 0; index < 5; index++) {
-        if (contract->shape[index] == 0) {
-            fail(error, error_size, "ANE model contract has an empty dimension");
+        if (contract->shape[index] != expected_shape[index]) {
+            fail(error, error_size, "ANE model contract has the wrong fixed shape");
             return 0;
         }
     }
