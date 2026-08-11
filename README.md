@@ -390,6 +390,25 @@ storage path; wide BF16 matrix products and SDPA use cached MPSGraph graphs, wit
 direct Metal correctness fallbacks. `make parity` runs only those Metal/MLX
 checks.
 
+## Experimental Apple Neural Engine harness
+
+The Apple Neural Engine (ANE) path is an **experimental, default-off measurement
+harness** for one fixed FL2VA visual-encoder block. Normal builds and runs remain
+Metal-only. Setting `H3_ANE_MODEL` opts a supported macOS 14.4 or newer process
+into the experiment; `H3_ANE_SHADOW=1` keeps Metal output authoritative while
+measuring Core ML, and `H3_ANE_TRACE=1` prints compute-plan diagnostics.
+
+This checkout has converted and compiled the real block successfully, but real
+qualification failed closed with `ANE backend is unavailable`. No passing
+qualification receipt exists, so there is currently no verified ANE execution,
+placement, or acceleration claim. Build success and Core ML compute-plan
+eligibility are harness-readiness evidence only.
+
+See [Experimental ANE acceleration](docs/ane-acceleration.md) for the pinned
+conversion environment, artifact contract, qualification and fallback rules,
+benchmark commands, and the independent parity, placement, latency, process
+memory, and energy evidence gates.
+
 FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 (`H3_FFMPEG` and `H3_FFPROBE` may select explicit executables). Generated RGB24 and
 32 kHz stereo F32 PCM are fed through concurrent pipes; no intermediate

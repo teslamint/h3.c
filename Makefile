@@ -5,19 +5,19 @@ CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 OBJCFLAGS := $(CFLAGS) -fobjc-arc
 FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
-	-framework Accelerate
+	-framework Accelerate -framework CoreML
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c
+	h3_dit_schedule.c h3_dit.c h3_ane_receipt.c h3_ane_dispatch.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
-LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
+LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m h3_ane.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
-.PHONY: all test parity real-parity clean
+.PHONY: all test parity real-parity h3_ane_tool_tests clean
 
 all: h3 libh3.a
 
@@ -44,6 +44,39 @@ h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_tests: tests/test_ane.o \
+	$(filter-out h3_ane.o h3_ane_dispatch.o,$(LIB_OBJ)) \
+	h3_ane_test.o h3_ane_dispatch_test.o
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_qualification: tests/qualify_ane.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_bench: tests/bench_ane.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_qualification_test: tests/qualify_ane_tool_test.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_bench_test: tests/bench_ane_tool_test.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+tests/qualify_ane_tool_test.o: tests/qualify_ane.c
+	$(CC) $(CFLAGS) -DH3_ANE_TOOL_TESTING -I. -c $< -o $@
+
+tests/bench_ane_tool_test.o: tests/bench_ane.c
+	$(CC) $(CFLAGS) -DH3_ANE_TOOL_TESTING -I. -c $< -o $@
+
+h3_ane_tool_tests: h3_ane_qualification_test h3_ane_bench_test h3_ane_bench
+
+h3_ane_test.o: h3_ane.m h3_ane.h
+	$(CC) $(OBJCFLAGS) -DH3_ANE_TESTING -I. -c $< -o $@
+
+h3_ane_dispatch_test.o: h3_ane_dispatch.c h3_ane_dispatch.h
+	$(CC) $(CFLAGS) -DH3_ANE_TESTING -I. -c $< -o $@
+
+tests/test_ane.o: CFLAGS += -DH3_ANE_TESTING
 
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
@@ -205,6 +238,9 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
+		h3_ane_tests \
+		h3_ane_qualification h3_ane_bench \
+		h3_ane_qualification_test h3_ane_bench_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \
 		h3_real_video_encoder_test h3_real_qwen_vision_test \
