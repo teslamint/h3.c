@@ -1,4 +1,5 @@
 #import "h3_ane.h"
+#import "h3_ane_internal.h"
 
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
@@ -406,6 +407,7 @@ static void mark_unavailable(h3_ane *ane, h3_ane_reason reason,
 
 static h3_ane *create_impl(const char *model_path,
                            const h3_ane_contract *contract, int shadow,
+                           int authorized,
                            char *error, size_t error_size) {
     h3_ane *ane = calloc(1, sizeof(*ane));
     if (!ane) {
@@ -419,8 +421,9 @@ static h3_ane *create_impl(const char *model_path,
     }
     ane->stats.shadow = shadow != 0;
     const char *enabled_path = getenv("H3_ANE_MODEL");
-    if (!model_path || !*model_path || !enabled_path || !*enabled_path ||
-        strcmp(model_path, enabled_path) != 0) {
+    if (!model_path || !*model_path ||
+        (!authorized && (!enabled_path || !*enabled_path ||
+                         strcmp(model_path, enabled_path) != 0))) {
         mark_unavailable(ane, H3_ANE_REASON_DISABLED, error, error_size,
                          "ANE backend is disabled");
         return ane;
@@ -550,8 +553,50 @@ h3_ane *h3_ane_create(const char *model_path,
                       const h3_ane_contract *contract, int shadow,
                       char *error, size_t error_size) {
     @autoreleasepool {
-        return create_impl(model_path, contract, shadow, error, error_size);
+        return create_impl(model_path, contract, shadow, 0, error, error_size);
     }
+}
+
+h3_ane *h3_ane_create_authorized(const char *model_path,
+                                 const h3_ane_contract *contract, int shadow,
+                                 char *error, size_t error_size) {
+    @autoreleasepool {
+        return create_impl(model_path, contract, shadow, 1, error, error_size);
+    }
+}
+
+void h3_ane_stats_snapshot(h3_ane *ane, h3_ane_stats *stats) {
+    if (!stats) return;
+    if (!ane) {
+        memset(stats, 0, sizeof(*stats));
+        stats->last_reason = H3_ANE_REASON_DISABLED;
+        return;
+    }
+    pthread_mutex_lock(&ane->prediction_mutex);
+    *stats = ane->stats;
+    pthread_mutex_unlock(&ane->prediction_mutex);
+}
+
+void h3_ane_record_fallback(h3_ane *ane, h3_ane_reason reason,
+                            h3_ane_stats *stats) {
+    if (!ane) {
+        if (stats) {
+            memset(stats, 0, sizeof(*stats));
+            stats->attempts = 1;
+            stats->fallbacks = 1;
+            stats->last_reason = reason;
+        }
+        return;
+    }
+    pthread_mutex_lock(&ane->prediction_mutex);
+    ane->stats.attempts++;
+    ane->stats.fallbacks++;
+    ane->stats.last_reason = reason;
+    ane->stats.input_seconds = 0.0;
+    ane->stats.prediction_seconds = 0.0;
+    ane->stats.output_seconds = 0.0;
+    if (stats) *stats = ane->stats;
+    pthread_mutex_unlock(&ane->prediction_mutex);
 }
 
 int h3_ane_is_shadow(const h3_ane *ane) {

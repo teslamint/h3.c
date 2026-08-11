@@ -15,4 +15,9 @@ h3_gpu_tensor *h3_ane_dispatch_gpu_block(
     h3_ane_metal_block_fn metal, void *metal_opaque, h3_ane_stats *stats,
     char *error, size_t error_size);
 
+#ifdef H3_ANE_TESTING
+void h3_ane_dispatch_test_fail_allocation(int enabled);
+void h3_ane_dispatch_test_fail_host_read(int enabled);
+#endif
+
 #endif

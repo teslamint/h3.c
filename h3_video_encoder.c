@@ -1,6 +1,7 @@
 #include "h3_video_encoder.h"
 
 #include "h3_ane_dispatch.h"
+#include "h3_ane_internal.h"
 #include "h3_weights.h"
 
 #include <errno.h>
@@ -75,6 +76,7 @@ typedef struct {
     float latent_std[LATENT_CHANNELS];
     h3_ane *ane;
     h3_ane_stats ane_stats;
+    int ane_run_candidate;
 } encoder_context;
 
 typedef struct {
@@ -377,7 +379,17 @@ static int block0_contract(const h3_weight_store *store,
         contract->source_sha256, error, error_size);
 }
 
-static void prepare_ane(encoder_context *encoder) {
+int h3_video_encoder_test_ane_candidate(
+    int frames, int encoder_height, int encoder_width, int level, int block,
+    uint32_t depth, uint32_t height, uint32_t width,
+    uint32_t input_channels, uint32_t output_channels) {
+    return frames == 1 && encoder_height == 256 && encoder_width == 256 &&
+           level == 0 && block == 0 && depth == 1 && height == 256 &&
+           width == 256 && input_channels == 128 && output_channels == 128;
+}
+
+static void prepare_ane(encoder_context *encoder, int frames,
+                        int height, int width) {
     const char *model_path = getenv("H3_ANE_MODEL");
     encoder->ane_stats.last_reason = H3_ANE_REASON_DISABLED;
     if (!model_path || !*model_path) return;
@@ -391,8 +403,18 @@ static void prepare_ane(encoder_context *encoder) {
                  strcmp(getenv("H3_ANE_SHADOW"), "1") == 0;
     encoder->ane = h3_ane_create(model_path, &contract, shadow,
                                  error, sizeof(error));
-    if (!encoder->ane)
+    if (!encoder->ane) {
         encoder->ane_stats.last_reason = H3_ANE_REASON_LOAD;
+        return;
+    }
+    h3_ane_stats_snapshot(encoder->ane, &encoder->ane_stats);
+    encoder->ane_run_candidate =
+        h3_video_encoder_test_ane_candidate(
+            frames, height, width, 0, 0, (uint32_t)frames,
+            (uint32_t)height, (uint32_t)width, 128, 128);
+    if (!encoder->ane_run_candidate)
+        h3_ane_record_fallback(encoder->ane, H3_ANE_REASON_SHAPE,
+                               &encoder->ane_stats);
 }
 
 static size_t tensor_elements(uint32_t depth, uint32_t height, uint32_t width,
@@ -598,9 +620,10 @@ static float *encode_tile(encoder_context *encoder, const float *pixels,
         uint32_t channels = level_channels[level];
         for (int block = 0; block < BLOCKS && hidden; block++) {
             uint32_t input_channels = block ? channels : previous;
-            if (encoder->ane && level == 0 && block == 0 && depth == 1 &&
-                h == 256 && w == 256 && input_channels == 128 &&
-                channels == 128) {
+            if (encoder->ane && encoder->ane_run_candidate &&
+                h3_video_encoder_test_ane_candidate(
+                    1, 256, 256, level, block, depth, h, w,
+                    input_channels, channels)) {
                 metal_block_context context = {
                     .encoder = encoder,
                     .block = &encoder->levels[level].blocks[block],
@@ -865,7 +888,7 @@ int h3_video_vae_encode(const char *weight_directory,
     ok = encoder.gpu && encoder.store &&
          load_normalization(&encoder, weight_directory, error, error_size) &&
          load_weights(&encoder, error, error_size);
-    if (ok) prepare_ane(&encoder);
+    if (ok) prepare_ane(&encoder, frames, height, width);
     int tile_count = y_axis.count * x_axis.count;
     float **tiles = ok ? calloc((size_t)tile_count, sizeof(*tiles)) : NULL;
     if (ok && !tiles) {
@@ -923,20 +946,8 @@ int h3_video_encoder_block0_qualification(
              load_weights(&encoder, error, error_size);
     h3_ane_contract contract;
     if (ok) ok = block0_contract(encoder.store, &contract, error, error_size);
-    char *previous_model = getenv("H3_ANE_MODEL") ?
-        strdup(getenv("H3_ANE_MODEL")) : NULL;
-    if (ok && setenv("H3_ANE_MODEL", model_path, 1) != 0) {
-        fail(error, error_size, "cannot enable qualification model");
-        ok = 0;
-    }
-    if (ok) encoder.ane = h3_ane_create(model_path, &contract, 1,
-                                        error, error_size);
-    if (previous_model) {
-        if (setenv("H3_ANE_MODEL", previous_model, 1) != 0) ok = 0;
-    } else if (unsetenv("H3_ANE_MODEL") != 0) {
-        ok = 0;
-    }
-    free(previous_model);
+    if (ok) encoder.ane = h3_ane_create_authorized(
+        model_path, &contract, 1, error, error_size);
     if (ok && !encoder.ane) ok = 0;
     h3_gpu_tensor *original = ok ?
         h3_gpu_tensor_from_f32(encoder.gpu, input, input_count) : NULL;

@@ -366,6 +366,7 @@ typedef struct {
     int emit_nonfinite;
     int plan_never_completes;
     int predict_delay_us;
+    const char *predict_block_ready_path;
     int active_predictions;
     int max_active_predictions;
     h3_ane_operation_usage operations[3];
@@ -403,6 +404,10 @@ static int fake_predict(void *opaque, const float *input, size_t input_count,
         fake->max_active_predictions = fake->active_predictions;
     if (fake->predict_delay_us > 0)
         usleep((useconds_t)fake->predict_delay_us);
+    if (fake->predict_block_ready_path) {
+        write_bytes(fake->predict_block_ready_path, "ready\n", 6);
+        for (;;) pause();
+    }
     if (!fake->predict_result) {
         fake->active_predictions--;
         return 0;
@@ -892,6 +897,19 @@ static void test_dispatch_fallback(const char *root) {
                 stats.shadow == 1 && stats.predictions == 1,
             "shadow dispatch did not run both backends and adopt Metal");
     h3_gpu_tensor_free(result);
+    memset(&metal, 0, sizeof(metal));
+    metal.gpu = gpu;
+    metal.expected_input = input;
+    metal.count = count;
+    result = h3_ane_dispatch_gpu_block(
+        ane, gpu, input, count - 1, fake_metal_run, &metal, &stats, error,
+        sizeof(error));
+    require(result == metal.returned && stats.shadow == 1 &&
+                stats.attempts == 2 && stats.fallbacks == 1 &&
+                stats.last_reason == H3_ANE_REASON_SHAPE &&
+                stats.load_seconds >= 0.0,
+            "unsupported shadow shape lost cumulative handle stats");
+    h3_gpu_tensor_free(result);
     h3_ane_free(ane);
 
     fake = valid_fake_backend();
@@ -905,8 +923,39 @@ static void test_dispatch_fallback(const char *root) {
         ane, gpu, input, count - 1, fake_metal_run, &metal, &stats, error,
         sizeof(error));
     require(result == metal.returned && metal.calls == 1 &&
-                fake.predict_count == 0,
+                fake.predict_count == 0 && stats.attempts == 1 &&
+                stats.fallbacks == 1 &&
+                stats.last_reason == H3_ANE_REASON_SHAPE &&
+                stats.load_seconds >= 0.0,
             "other-shape dispatch attempted Core ML or skipped Metal");
+    h3_gpu_tensor_free(result);
+
+    memset(&metal, 0, sizeof(metal));
+    metal.gpu = gpu;
+    metal.expected_input = input;
+    metal.count = count;
+    h3_ane_dispatch_test_fail_allocation(1);
+    result = h3_ane_dispatch_gpu_block(
+        ane, gpu, input, count, fake_metal_run, &metal, &stats, error,
+        sizeof(error));
+    require(result == metal.returned && stats.attempts == 2 &&
+                stats.fallbacks == 2 &&
+                stats.last_reason == H3_ANE_REASON_PREDICTION,
+            "allocation fallback stats were not cumulative");
+    h3_gpu_tensor_free(result);
+
+    memset(&metal, 0, sizeof(metal));
+    metal.gpu = gpu;
+    metal.expected_input = input;
+    metal.count = count;
+    h3_ane_dispatch_test_fail_host_read(1);
+    result = h3_ane_dispatch_gpu_block(
+        ane, gpu, input, count, fake_metal_run, &metal, &stats, error,
+        sizeof(error));
+    require(result == metal.returned && stats.attempts == 3 &&
+                stats.fallbacks == 3 &&
+                stats.last_reason == H3_ANE_REASON_PREDICTION,
+            "host-read fallback stats were not cumulative");
     h3_gpu_tensor_free(result);
     h3_ane_free(ane);
 
@@ -926,11 +975,72 @@ static void test_video_encoder_ane_surface(void) {
         h3_video_encoder_block0_qualification;
     require(qualification != NULL,
             "video encoder qualification surface is unavailable");
+
+    require(h3_video_encoder_test_ane_candidate(
+                1, 256, 256, 0, 0, 1, 256, 256, 128, 128),
+            "exact encoder candidate was rejected");
+    const int variations[][10] = {
+        {2, 256, 256, 0, 0, 2, 256, 256, 128, 128},
+        {1, 512, 256, 0, 0, 1, 256, 256, 128, 128},
+        {1, 256, 512, 0, 0, 1, 256, 256, 128, 128},
+        {1, 256, 256, 1, 0, 1, 256, 256, 128, 128},
+        {1, 256, 256, 0, 1, 1, 256, 256, 128, 128},
+        {1, 256, 256, 0, 0, 2, 256, 256, 128, 128},
+        {1, 256, 256, 0, 0, 1, 128, 256, 128, 128},
+        {1, 256, 256, 0, 0, 1, 256, 128, 128, 128},
+        {1, 256, 256, 0, 0, 1, 256, 256, 256, 128},
+        {1, 256, 256, 0, 0, 1, 256, 256, 128, 256},
+    };
+    for (size_t index = 0; index < sizeof(variations) / sizeof(variations[0]);
+         index++)
+        require(!h3_video_encoder_test_ane_candidate(
+                    variations[index][0], variations[index][1],
+                    variations[index][2], variations[index][3],
+                    variations[index][4], (uint32_t)variations[index][5],
+                    (uint32_t)variations[index][6],
+                    (uint32_t)variations[index][7],
+                    (uint32_t)variations[index][8],
+                    (uint32_t)variations[index][9]),
+                "unsupported encoder candidate was accepted");
+}
+
+static void run_cancellation_fixture(const char *root,
+                                     const char *ready_path) {
+    static const char source[] =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const size_t count = (size_t)1 * 1 * 256 * 256 * 128;
+    char model_path[512], error[256];
+    make_qualified_model(root, "cancel-model", source, model_path);
+    h3_ane_contract contract = valid_contract(source);
+    fake_ane_backend fake = valid_fake_backend();
+    fake.predict_block_ready_path = ready_path;
+    install_fake_backend(&fake);
+    h3_ane *ane = create_enabled(model_path, &contract, 0, error);
+    require(ane != NULL, error);
+    h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
+    require(gpu != NULL, error);
+    float *values = calloc(count, sizeof(*values));
+    require(values != NULL, "cannot allocate cancellation input");
+    h3_gpu_tensor *input = h3_gpu_tensor_from_f32(gpu, values, count);
+    require(input != NULL, "cannot create cancellation input tensor");
+    fake_metal_block metal = {
+        .gpu = gpu, .expected_input = input, .count = count,
+    };
+    h3_ane_stats stats;
+    (void)h3_ane_dispatch_gpu_block(
+        ane, gpu, input, count, fake_metal_run, &metal, &stats, error,
+        sizeof(error));
+    die("blocking fake prediction returned unexpectedly");
 }
 
 int main(void) {
     char root[] = "/tmp/h3-ane-tests.XXXXXX";
     require(mkdtemp(root) != NULL, "cannot create temporary fixture root");
+    const char *cancel_ready = getenv("H3_ANE_CANCEL_READY");
+    if (cancel_ready && *cancel_ready) {
+        run_cancellation_fixture(root, cancel_ready);
+        return 1;
+    }
     test_directory_digest(root);
     test_tensor_digest(root);
     test_receipt_load_and_validate(root);

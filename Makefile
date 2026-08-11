@@ -45,11 +45,16 @@ h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-h3_ane_tests: tests/test_ane.o $(filter-out h3_ane.o,$(LIB_OBJ)) h3_ane_test.o
+h3_ane_tests: tests/test_ane.o \
+	$(filter-out h3_ane.o h3_ane_dispatch.o,$(LIB_OBJ)) \
+	h3_ane_test.o h3_ane_dispatch_test.o
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_ane_test.o: h3_ane.m h3_ane.h
 	$(CC) $(OBJCFLAGS) -DH3_ANE_TESTING -I. -c $< -o $@
+
+h3_ane_dispatch_test.o: h3_ane_dispatch.c h3_ane_dispatch.h
+	$(CC) $(CFLAGS) -DH3_ANE_TESTING -I. -c $< -o $@
 
 tests/test_ane.o: CFLAGS += -DH3_ANE_TESTING
 
