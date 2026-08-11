@@ -851,6 +851,57 @@ static void test_dispatch_fallback(const char *root) {
     h3_gpu_tensor_free(result);
     h3_ane_free(ane);
 
+    struct unavailable_case {
+        const char *name;
+        h3_ane_reason reason;
+    } unavailable_cases[] = {
+        {"receipt", H3_ANE_REASON_RECEIPT},
+        {"fingerprint", H3_ANE_REASON_FINGERPRINT},
+        {"load", H3_ANE_REASON_LOAD},
+        {"plan", H3_ANE_REASON_ELIGIBILITY},
+    };
+    for (size_t case_index = 0;
+         case_index < sizeof(unavailable_cases) / sizeof(unavailable_cases[0]);
+         case_index++) {
+        fake = valid_fake_backend();
+        h3_ane_contract unavailable_contract = contract;
+        const char *unavailable_path = model_path;
+        char case_path[512];
+        if (unavailable_cases[case_index].reason == H3_ANE_REASON_RECEIPT) {
+            make_directory(case_path, root, "dispatch-no-receipt");
+            unavailable_path = case_path;
+        } else if (unavailable_cases[case_index].reason ==
+                   H3_ANE_REASON_FINGERPRINT) {
+            unavailable_contract.source_sha256[0] = 'e';
+        } else if (unavailable_cases[case_index].reason == H3_ANE_REASON_LOAD) {
+            fake.load_result = 0;
+        } else {
+            fake.operations[1].supported_devices = H3_ANE_DEVICE_CPU;
+        }
+        install_fake_backend(&fake);
+        ane = create_enabled(unavailable_path, &unavailable_contract, 0, error);
+        require(ane != NULL, "cannot create unavailable dispatch handle");
+        memset(&metal, 0, sizeof(metal));
+        metal.gpu = gpu;
+        metal.expected_input = input;
+        metal.count = count;
+        memset(&stats, 0, sizeof(stats));
+        result = h3_ane_dispatch_gpu_block(
+            ane, gpu, input, count, fake_metal_run, &metal, &stats, error,
+            sizeof(error));
+        require(result == metal.returned && metal.calls == 1,
+                "unavailable handle did not adopt Metal");
+        require(stats.attempts == 1 && stats.fallbacks == 1 &&
+                    stats.predictions == 0 &&
+                    stats.last_reason == unavailable_cases[case_index].reason,
+                unavailable_cases[case_index].name);
+        require(h3_gpu_tensor_read_f32_range(input, 0, &original, 1) &&
+                    original == 4.0f,
+                "unavailable handle mutated original input");
+        h3_gpu_tensor_free(result);
+        h3_ane_free(ane);
+    }
+
     for (int reason = H3_ANE_REASON_DISABLED;
          reason <= H3_ANE_REASON_NONFINITE; reason++) {
         fake = valid_fake_backend();
@@ -956,6 +1007,25 @@ static void test_dispatch_fallback(const char *root) {
                 stats.fallbacks == 3 &&
                 stats.last_reason == H3_ANE_REASON_PREDICTION,
             "host-read fallback stats were not cumulative");
+    h3_gpu_tensor_free(result);
+    h3_ane_free(ane);
+
+    fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    memset(&metal, 0, sizeof(metal));
+    metal.gpu = gpu;
+    metal.expected_input = input;
+    metal.count = count;
+    h3_ane_dispatch_test_fail_replacement_allocation(1);
+    result = h3_ane_dispatch_gpu_block(
+        ane, gpu, input, count, fake_metal_run, &metal, &stats, error,
+        sizeof(error));
+    require(result == metal.returned && metal.calls == 1 &&
+                stats.attempts == 1 && stats.predictions == 1 &&
+                stats.fallbacks == 1 &&
+                stats.last_reason == H3_ANE_REASON_PREDICTION,
+            "replacement allocation failure double-counted prediction attempt");
     h3_gpu_tensor_free(result);
     h3_ane_free(ane);
 

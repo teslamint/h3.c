@@ -10,6 +10,7 @@ static const size_t h3_ane_block_elements =
 #ifdef H3_ANE_TESTING
 static int fail_allocation;
 static int fail_host_read;
+static int fail_replacement_allocation;
 
 void h3_ane_dispatch_test_fail_allocation(int enabled) {
     fail_allocation = enabled;
@@ -17,6 +18,10 @@ void h3_ane_dispatch_test_fail_allocation(int enabled) {
 
 void h3_ane_dispatch_test_fail_host_read(int enabled) {
     fail_host_read = enabled;
+}
+
+void h3_ane_dispatch_test_fail_replacement_allocation(int enabled) {
+    fail_replacement_allocation = enabled;
 }
 #endif
 
@@ -58,12 +63,14 @@ h3_gpu_tensor *h3_ane_dispatch_gpu_block(
         return run_metal(metal, metal_opaque, original_input, error, error_size);
     }
 
-    int inject_allocation = 0, inject_read = 0;
+    int inject_allocation = 0, inject_read = 0, inject_replacement = 0;
 #ifdef H3_ANE_TESTING
     inject_allocation = fail_allocation;
     fail_allocation = 0;
     inject_read = fail_host_read;
     fail_host_read = 0;
+    inject_replacement = fail_replacement_allocation;
+    fail_replacement_allocation = 0;
 #endif
     float *input = inject_allocation ? NULL : malloc(count * sizeof(*input));
     float *output = inject_allocation ? NULL : malloc(count * sizeof(*output));
@@ -79,7 +86,7 @@ h3_gpu_tensor *h3_ane_dispatch_gpu_block(
     free(input);
 
     if (predicted && !h3_ane_is_shadow(ane)) {
-        h3_gpu_tensor *replacement =
+        h3_gpu_tensor *replacement = inject_replacement ? NULL :
             h3_gpu_tensor_from_f32(gpu, output, count);
         free(output);
         if (replacement) {
@@ -87,8 +94,8 @@ h3_gpu_tensor *h3_ane_dispatch_gpu_block(
             set_error(error, error_size, "");
             return replacement;
         }
-        current.last_reason = H3_ANE_REASON_PREDICTION;
-        h3_ane_record_fallback(ane, H3_ANE_REASON_PREDICTION, &current);
+        h3_ane_record_current_attempt_fallback(
+            ane, H3_ANE_REASON_PREDICTION, &current);
     } else {
         free(output);
     }

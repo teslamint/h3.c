@@ -18,6 +18,7 @@ h3_gpu_tensor *h3_ane_dispatch_gpu_block(
 #ifdef H3_ANE_TESTING
 void h3_ane_dispatch_test_fail_allocation(int enabled);
 void h3_ane_dispatch_test_fail_host_read(int enabled);
+void h3_ane_dispatch_test_fail_replacement_allocation(int enabled);
 #endif
 
 #endif

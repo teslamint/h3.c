@@ -599,6 +599,20 @@ void h3_ane_record_fallback(h3_ane *ane, h3_ane_reason reason,
     pthread_mutex_unlock(&ane->prediction_mutex);
 }
 
+void h3_ane_record_current_attempt_fallback(h3_ane *ane,
+                                            h3_ane_reason reason,
+                                            h3_ane_stats *stats) {
+    if (!ane) {
+        h3_ane_record_fallback(NULL, reason, stats);
+        return;
+    }
+    pthread_mutex_lock(&ane->prediction_mutex);
+    ane->stats.fallbacks++;
+    ane->stats.last_reason = reason;
+    if (stats) *stats = ane->stats;
+    pthread_mutex_unlock(&ane->prediction_mutex);
+}
+
 int h3_ane_is_shadow(const h3_ane *ane) {
     @autoreleasepool {
         return ane ? ane->stats.shadow : 0;
