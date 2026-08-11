@@ -9,7 +9,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c
+	h3_dit_schedule.c h3_dit.c h3_ane_receipt.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
@@ -43,6 +43,9 @@ h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_tests: tests/test_ane.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
@@ -205,6 +208,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
+		h3_ane_tests \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \
 		h3_real_video_encoder_test h3_real_qwen_vision_test \
