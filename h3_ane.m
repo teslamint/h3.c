@@ -5,6 +5,7 @@
 
 #include <dispatch/dispatch.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,8 @@ struct h3_ane {
     h3_ane_reason unavailable_reason;
     int backend_loaded;
     int real_backend;
+    int test_backend;
+    pthread_mutex_t prediction_mutex;
 };
 
 @interface H3ANERealBackend : NSObject
@@ -37,6 +40,7 @@ struct h3_ane {
 @property(nonatomic) double inputSeconds;
 @property(nonatomic) double predictionSeconds;
 @property(nonatomic) double outputSeconds;
+@property(nonatomic) h3_ane_contract contract;
 @end
 
 @implementation H3ANERealBackend
@@ -47,12 +51,14 @@ static h3_ane_test_backend h3_test_backend;
 static int h3_test_backend_set;
 
 void h3_ane_test_set_backend(const h3_ane_test_backend *backend) {
-    if (backend) {
-        h3_test_backend = *backend;
-        h3_test_backend_set = 1;
-    } else {
-        memset(&h3_test_backend, 0, sizeof(h3_test_backend));
-        h3_test_backend_set = 0;
+    @autoreleasepool {
+        if (backend) {
+            h3_test_backend = *backend;
+            h3_test_backend_set = 1;
+        } else {
+            memset(&h3_test_backend, 0, sizeof(h3_test_backend));
+            h3_test_backend_set = 0;
+        }
     }
 }
 #endif
@@ -102,6 +108,83 @@ static h3_ane_reason validate_contract(const h3_ane_contract *contract) {
     return H3_ANE_REASON_NONE;
 }
 
+static h3_ane_reason validate_metadata_values(const char *const values[8],
+                                              const h3_ane_contract *contract) {
+    if (!values || !contract) return H3_ANE_REASON_CONTRACT;
+    for (size_t index = 0; index < 8; index++)
+        if (!values[index]) return H3_ANE_REASON_CONTRACT;
+    char version[16], block_level[16], block_index[16], shape[64];
+    int written = snprintf(version, sizeof(version), "%u", contract->version);
+    if (written <= 0 || (size_t)written >= sizeof(version) ||
+        strcmp(values[0], version) != 0 ||
+        strcmp(values[1], contract->variant) != 0)
+        return H3_ANE_REASON_CONTRACT;
+    written = snprintf(block_level, sizeof(block_level), "%u",
+                       contract->block_level);
+    if (written <= 0 || (size_t)written >= sizeof(block_level) ||
+        strcmp(values[2], block_level) != 0)
+        return H3_ANE_REASON_CONTRACT;
+    written = snprintf(block_index, sizeof(block_index), "%u",
+                       contract->block_index);
+    if (written <= 0 || (size_t)written >= sizeof(block_index) ||
+        strcmp(values[3], block_index) != 0 ||
+        strcmp(values[4], contract->weight_prefix) != 0)
+        return H3_ANE_REASON_CONTRACT;
+    if (strcmp(values[5], "F32") != 0) return H3_ANE_REASON_DTYPE;
+    written = snprintf(shape, sizeof(shape), "%u,%u,%u,%u,%u",
+                       contract->shape[0], contract->shape[1],
+                       contract->shape[2], contract->shape[3],
+                       contract->shape[4]);
+    if (written <= 0 || (size_t)written >= sizeof(shape) ||
+        strcmp(values[6], shape) != 0)
+        return H3_ANE_REASON_SHAPE;
+    if (!valid_hex_digest(values[7]) ||
+        strcmp(values[7], contract->source_sha256) != 0)
+        return H3_ANE_REASON_FINGERPRINT;
+    return H3_ANE_REASON_NONE;
+}
+
+static h3_ane_reason validate_creator_metadata(id metadata,
+                                               const h3_ane_contract *contract) {
+    if (![metadata isKindOfClass:[NSDictionary class]])
+        return H3_ANE_REASON_CONTRACT;
+    NSDictionary *dictionary = metadata;
+    static NSArray<NSString *> *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = @[@"version", @"variant", @"block_level", @"block_index",
+                 @"weight_prefix", @"boundary_dtype", @"shape",
+                 @"source_sha256"];
+    });
+    const char *values[8] = {0};
+    for (size_t index = 0; index < 8; index++) {
+        id value = dictionary[keys[index]];
+        if (![value isKindOfClass:[NSString class]])
+            return H3_ANE_REASON_CONTRACT;
+        values[index] = [value UTF8String];
+    }
+    return validate_metadata_values(values, contract);
+}
+
+#ifdef H3_ANE_TESTING
+int h3_ane_test_validate_metadata(const char *const values[8],
+                                  const h3_ane_contract *contract) {
+    @autoreleasepool {
+        static NSString *const keys[8] = {
+            @"version", @"variant", @"block_level", @"block_index",
+            @"weight_prefix", @"boundary_dtype", @"shape", @"source_sha256",
+        };
+        NSMutableDictionary *dictionary = [NSMutableDictionary dictionary];
+        for (size_t index = 0; index < 8; index++) {
+            if (values[index])
+                dictionary[keys[index]] =
+                    [NSString stringWithUTF8String:values[index]];
+        }
+        return (int)validate_creator_metadata(dictionary, contract);
+    }
+}
+#endif
+
 static uint32_t device_bit(id<MLComputeDeviceProtocol> device)
     API_AVAILABLE(macos(14.4)) {
     if ([device isKindOfClass:[MLCPUComputeDevice class]])
@@ -124,6 +207,12 @@ static int real_load(void *opaque) {
                                           configuration:configuration
                                                   error:&error];
         if (!model || error) return 0;
+        h3_ane_contract contract = backend.contract;
+        h3_ane_reason metadataReason = validate_creator_metadata(
+            model.modelDescription.metadata[MLModelCreatorDefinedKey],
+            &contract);
+        if (metadataReason != H3_ANE_REASON_NONE)
+            return -(int)metadataReason;
         NSDictionary<NSString *, MLFeatureDescription *> *inputs =
             model.modelDescription.inputDescriptionsByName;
         NSDictionary<NSString *, MLFeatureDescription *> *outputs =
@@ -201,7 +290,10 @@ static int real_plan(void *opaque, h3_ane_operation_usage *operations,
                 loadedPlan = plan;
                 dispatch_semaphore_signal(semaphore);
             }];
-            dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+            long waitResult = dispatch_semaphore_wait(
+                semaphore,
+                dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+            if (waitResult != 0) return 0;
             MLModelStructureProgram *program = loadedPlan.modelStructure.program;
             MLModelStructureProgramFunction *main = program.functions[@"main"];
             if (!loadedPlan || !program || !main) return 0;
@@ -265,6 +357,7 @@ static void real_free(void *opaque) {
 static void initialize_real_backend(h3_ane *ane, const char *model_path) {
     H3ANERealBackend *backend = [[H3ANERealBackend alloc] init];
     backend.modelPath = [NSString stringWithUTF8String:model_path];
+    backend.contract = (h3_ane_contract){0};
     ane->load = real_load;
     ane->plan = real_plan;
     ane->predict = real_predict;
@@ -272,6 +365,36 @@ static void initialize_real_backend(h3_ane *ane, const char *model_path) {
     ane->opaque = (__bridge_retained void *)backend;
     ane->real_backend = 1;
 }
+
+#ifdef H3_ANE_TESTING
+static int call_test_plan_bounded(h3_ane *ane,
+                                  h3_ane_operation_usage *operations,
+                                  size_t *operation_count) {
+    h3_ane_plan_fn plan = ane->plan;
+    void *opaque = ane->opaque;
+    size_t capacity = *operation_count;
+    h3_ane_operation_usage *temporary =
+        calloc(capacity, sizeof(*temporary));
+    if (!temporary) return 0;
+    __block int result = 0;
+    __block size_t count = capacity;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            result = plan(opaque, temporary, &count);
+            dispatch_semaphore_signal(semaphore);
+        }
+    });
+    long waitResult = dispatch_semaphore_wait(
+        semaphore, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC));
+    if (waitResult != 0) return 0;
+    if (count <= capacity)
+        memcpy(operations, temporary, count * sizeof(*operations));
+    *operation_count = count;
+    free(temporary);
+    return result;
+}
+#endif
 
 static void mark_unavailable(h3_ane *ane, h3_ane_reason reason,
                              char *error, size_t error_size,
@@ -281,12 +404,17 @@ static void mark_unavailable(h3_ane *ane, h3_ane_reason reason,
     set_error(error, error_size, message);
 }
 
-h3_ane *h3_ane_create(const char *model_path,
-                      const h3_ane_contract *contract, int shadow,
-                      char *error, size_t error_size) {
+static h3_ane *create_impl(const char *model_path,
+                           const h3_ane_contract *contract, int shadow,
+                           char *error, size_t error_size) {
     h3_ane *ane = calloc(1, sizeof(*ane));
     if (!ane) {
         set_error(error, error_size, "cannot allocate ANE handle");
+        return NULL;
+    }
+    if (pthread_mutex_init(&ane->prediction_mutex, NULL) != 0) {
+        free(ane);
+        set_error(error, error_size, "cannot initialize ANE prediction lock");
         return NULL;
     }
     ane->stats.shadow = shadow != 0;
@@ -320,6 +448,7 @@ h3_ane *h3_ane_create(const char *model_path,
                               strlen(".qualification.json") + 1;
         char *receipt_path = malloc(receipt_size);
         if (!receipt_path) {
+            pthread_mutex_destroy(&ane->prediction_mutex);
             free(ane);
             set_error(error, error_size, "cannot allocate receipt path");
             return NULL;
@@ -353,10 +482,13 @@ h3_ane *h3_ane_create(const char *model_path,
         ane->predict = h3_test_backend.predict;
         ane->free_backend = h3_test_backend.free;
         ane->opaque = h3_test_backend.opaque;
+        ane->test_backend = 1;
     } else
 #endif
     {
         initialize_real_backend(ane, model_path);
+        H3ANERealBackend *backend = (__bridge H3ANERealBackend *)ane->opaque;
+        backend.contract = *contract;
     }
 
     if (!ane->load || !ane->plan || !ane->predict || !ane->free_backend) {
@@ -375,7 +507,13 @@ h3_ane *h3_ane_create(const char *model_path,
     ane->backend_loaded = 1;
     h3_ane_operation_usage operations[H3_ANE_MAX_OPERATIONS];
     size_t operation_count = H3_ANE_MAX_OPERATIONS;
-    int plan_result = ane->plan(ane->opaque, operations, &operation_count);
+    int plan_result;
+#ifdef H3_ANE_TESTING
+    if (ane->test_backend)
+        plan_result = call_test_plan_bounded(ane, operations, &operation_count);
+    else
+#endif
+        plan_result = ane->plan(ane->opaque, operations, &operation_count);
     if (plan_result <= 0 || operation_count == 0 ||
         operation_count > H3_ANE_MAX_OPERATIONS) {
         mark_unavailable(ane,
@@ -408,8 +546,18 @@ h3_ane *h3_ane_create(const char *model_path,
     return ane;
 }
 
+h3_ane *h3_ane_create(const char *model_path,
+                      const h3_ane_contract *contract, int shadow,
+                      char *error, size_t error_size) {
+    @autoreleasepool {
+        return create_impl(model_path, contract, shadow, error, error_size);
+    }
+}
+
 int h3_ane_is_shadow(const h3_ane *ane) {
-    return ane ? ane->stats.shadow : 0;
+    @autoreleasepool {
+        return ane ? ane->stats.shadow : 0;
+    }
 }
 
 static int prediction_failure(h3_ane *ane, h3_ane_reason reason,
@@ -422,13 +570,16 @@ static int prediction_failure(h3_ane *ane, h3_ane_reason reason,
     return 0;
 }
 
-int h3_ane_predict(h3_ane *ane, const float *input, size_t input_count,
-                   float *output, size_t output_count, h3_ane_stats *stats,
-                   char *error, size_t error_size) {
+static int predict_impl(h3_ane *ane, const float *input, size_t input_count,
+                        float *output, size_t output_count, h3_ane_stats *stats,
+                        char *error, size_t error_size) {
     if (!ane) {
         set_error(error, error_size, "ANE handle is null");
         return 0;
     }
+    ane->stats.input_seconds = 0.0;
+    ane->stats.prediction_seconds = 0.0;
+    ane->stats.output_seconds = 0.0;
     ane->stats.attempts++;
     if (ane->unavailable_reason != H3_ANE_REASON_NONE)
         return prediction_failure(ane, ane->unavailable_reason, stats, error,
@@ -447,11 +598,11 @@ int h3_ane_predict(h3_ane *ane, const float *input, size_t input_count,
     double elapsed = monotonic_seconds() - start;
     if (ane->real_backend) {
         H3ANERealBackend *backend = (__bridge H3ANERealBackend *)ane->opaque;
-        ane->stats.input_seconds += backend.inputSeconds;
-        ane->stats.prediction_seconds += backend.predictionSeconds;
-        ane->stats.output_seconds += backend.outputSeconds;
+        ane->stats.input_seconds = backend.inputSeconds;
+        ane->stats.prediction_seconds = backend.predictionSeconds;
+        ane->stats.output_seconds = backend.outputSeconds;
     } else {
-        ane->stats.prediction_seconds += elapsed;
+        ane->stats.prediction_seconds = elapsed;
     }
     if (result <= 0) {
         free(scratch);
@@ -476,11 +627,36 @@ int h3_ane_predict(h3_ane *ane, const float *input, size_t input_count,
     return 1;
 }
 
+int h3_ane_predict(h3_ane *ane, const float *input, size_t input_count,
+                   float *output, size_t output_count, h3_ane_stats *stats,
+                   char *error, size_t error_size) {
+    @autoreleasepool {
+        if (!ane) return predict_impl(ane, input, input_count, output,
+                                      output_count, stats, error, error_size);
+        pthread_mutex_lock(&ane->prediction_mutex);
+        if (ane->real_backend) {
+            H3ANERealBackend *backend = (__bridge H3ANERealBackend *)ane->opaque;
+            backend.inputSeconds = 0.0;
+            backend.predictionSeconds = 0.0;
+            backend.outputSeconds = 0.0;
+        }
+        int result = predict_impl(ane, input, input_count, output, output_count,
+                                  stats, error, error_size);
+        pthread_mutex_unlock(&ane->prediction_mutex);
+        return result;
+    }
+}
+
 void h3_ane_free(h3_ane *ane) {
-    if (!ane) return;
-    if (ane->backend_loaded && ane->free_backend)
-        ane->free_backend(ane->opaque);
-    else if (ane->real_backend && ane->opaque)
-        real_free(ane->opaque);
-    free(ane);
+    @autoreleasepool {
+        if (!ane) return;
+        pthread_mutex_lock(&ane->prediction_mutex);
+        if (ane->backend_loaded && ane->free_backend)
+            ane->free_backend(ane->opaque);
+        else if (ane->real_backend && ane->opaque)
+            real_free(ane->opaque);
+        pthread_mutex_unlock(&ane->prediction_mutex);
+        pthread_mutex_destroy(&ane->prediction_mutex);
+        free(ane);
+    }
 }

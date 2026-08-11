@@ -49,6 +49,10 @@ typedef struct {
 
 typedef struct h3_ane h3_ane;
 
+/*
+ * One handle has one owner. Prediction calls on that handle are serialized;
+ * h3_ane_free must be called only after all callers have returned.
+ */
 h3_ane *h3_ane_create(const char *model_path,
                       const h3_ane_contract *contract, int shadow,
                       char *error, size_t error_size);

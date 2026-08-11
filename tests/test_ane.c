@@ -3,12 +3,17 @@
 
 #include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+
+int h3_ane_test_validate_metadata(const char *const values[8],
+                                  const h3_ane_contract *contract);
 
 static void die(const char *message) {
     fprintf(stderr, "FAIL tests/test_ane.c: %s\n", message);
@@ -17,6 +22,13 @@ static void die(const char *message) {
 
 static void require(int condition, const char *message) {
     if (!condition) die(message);
+}
+
+static double test_monotonic_seconds(void) {
+    struct timespec value;
+    require(clock_gettime(CLOCK_MONOTONIC_RAW, &value) == 0,
+            "cannot read monotonic clock");
+    return (double)value.tv_sec + (double)value.tv_nsec / 1000000000.0;
 }
 
 static void write_bytes(const char *path, const void *data, size_t size) {
@@ -350,6 +362,10 @@ typedef struct {
     int predict_count;
     int free_count;
     int emit_nonfinite;
+    int plan_never_completes;
+    int predict_delay_us;
+    int active_predictions;
+    int max_active_predictions;
     h3_ane_operation_usage operations[3];
     size_t operation_count;
 } fake_ane_backend;
@@ -364,6 +380,9 @@ static int fake_plan(void *opaque, h3_ane_operation_usage *operations,
                      size_t *operation_count) {
     fake_ane_backend *fake = opaque;
     fake->plan_count++;
+    if (fake->plan_never_completes) {
+        for (;;) pause();
+    }
     if (!fake->plan_result) return 0;
     require(*operation_count >= fake->operation_count,
             "bridge did not provide enough operation storage");
@@ -377,12 +396,21 @@ static int fake_predict(void *opaque, const float *input, size_t input_count,
                         float *output, size_t output_count) {
     fake_ane_backend *fake = opaque;
     fake->predict_count++;
-    if (!fake->predict_result) return 0;
+    fake->active_predictions++;
+    if (fake->active_predictions > fake->max_active_predictions)
+        fake->max_active_predictions = fake->active_predictions;
+    if (fake->predict_delay_us > 0)
+        usleep((useconds_t)fake->predict_delay_us);
+    if (!fake->predict_result) {
+        fake->active_predictions--;
+        return 0;
+    }
     require(input != output, "prediction reused caller input storage");
     require(input_count == output_count, "fake prediction count mismatch");
     for (size_t index = 0; index < output_count; index++)
         output[index] = input[index] + 1.0f;
     if (fake->emit_nonfinite) output[output_count - 1] = NAN;
+    fake->active_predictions--;
     return fake->predict_result;
 }
 
@@ -460,6 +488,70 @@ static void require_predict_reason(h3_ane *ane, size_t count,
     require(stats.last_reason == expected, message);
 }
 
+static void test_runtime_metadata(void) {
+    static const char source[] =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    h3_ane_contract contract = valid_contract(source);
+    const char *valid[8] = {
+        "1", "FL2VA", "0", "0", "encoder.down.0.block.0", "F32",
+        "1,1,256,256,128", source,
+    };
+    require(h3_ane_test_validate_metadata(valid, &contract) ==
+                H3_ANE_REASON_NONE,
+            "matching creator-defined metadata was rejected");
+    for (size_t index = 0; index < 8; index++) {
+        const char *missing[8];
+        memcpy(missing, valid, sizeof(missing));
+        missing[index] = NULL;
+        require(h3_ane_test_validate_metadata(missing, &contract) !=
+                    H3_ANE_REASON_NONE,
+                "missing creator-defined metadata was accepted");
+    }
+    const char *malformed[8];
+    memcpy(malformed, valid, sizeof(malformed));
+    malformed[0] = "01";
+    require(h3_ane_test_validate_metadata(malformed, &contract) ==
+                H3_ANE_REASON_CONTRACT,
+            "malformed metadata version was accepted");
+    static const char *mismatches[8] = {
+        "2", "Ref2VA", "1", "1", "encoder.down.0.block.1", "F16",
+        "1,1,128,128,128",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    };
+    static const h3_ane_reason reasons[8] = {
+        H3_ANE_REASON_CONTRACT, H3_ANE_REASON_CONTRACT,
+        H3_ANE_REASON_CONTRACT, H3_ANE_REASON_CONTRACT,
+        H3_ANE_REASON_CONTRACT, H3_ANE_REASON_DTYPE,
+        H3_ANE_REASON_SHAPE, H3_ANE_REASON_FINGERPRINT,
+    };
+    for (size_t index = 0; index < 8; index++) {
+        const char *changed[8];
+        memcpy(changed, valid, sizeof(changed));
+        changed[index] = mismatches[index];
+        require(h3_ane_test_validate_metadata(changed, &contract) ==
+                    (int)reasons[index],
+                "metadata mismatch returned the wrong stable reason");
+    }
+}
+
+typedef struct {
+    h3_ane *ane;
+    const float *input;
+    float *output;
+    size_t count;
+    int result;
+} predict_thread;
+
+static void *run_prediction_thread(void *opaque) {
+    predict_thread *thread = opaque;
+    h3_ane_stats stats;
+    char error[256];
+    thread->result = h3_ane_predict(thread->ane, thread->input, thread->count,
+                                    thread->output, thread->count, &stats,
+                                    error, sizeof(error));
+    return NULL;
+}
+
 static void test_runtime_bridge(const char *root) {
     static const char source[] =
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
@@ -504,6 +596,15 @@ static void test_runtime_bridge(const char *root) {
                 stats.prediction_seconds >= 0.0 &&
                 stats.output_seconds >= 0.0,
             "timing or mode stats are incorrect");
+
+    fake.predict_result = 0;
+    memset(&stats, 0, sizeof(stats));
+    require(!h3_ane_predict(ane, input, count, output, count, &stats, error,
+                            sizeof(error)),
+            "success-then-failure prediction was accepted");
+    require(stats.input_seconds == 0.0 && stats.output_seconds == 0.0 &&
+                stats.prediction_seconds >= 0.0,
+            "failed call inherited timing from the previous prediction");
     h3_ane_free(ane);
     require(fake.free_count == 1, "loaded backend was not freed exactly once");
 
@@ -520,6 +621,45 @@ static void test_runtime_bridge(const char *root) {
     require(stats.shadow == 1, "shadow output was marked adoptable");
     h3_ane_free(ane);
 
+    const char *metadata_cases[3][8] = {
+        {"1", "FL2VA", "0", "0", "encoder.down.0.block.0", "F32",
+         "1,1,256,256,128", NULL},
+        {"01", "FL2VA", "0", "0", "encoder.down.0.block.0", "F32",
+         "1,1,256,256,128", source},
+        {"1", "Ref2VA", "0", "0", "encoder.down.0.block.0", "F32",
+         "1,1,256,256,128", source},
+    };
+    for (size_t mode = 0; mode < 2; mode++) {
+        const char *path = mode ? shadow_path : model_path;
+        for (size_t metadata_case = 0; metadata_case < 3; metadata_case++) {
+            h3_ane_reason reason = (h3_ane_reason)h3_ane_test_validate_metadata(
+                metadata_cases[metadata_case], &contract);
+            require(reason != H3_ANE_REASON_NONE,
+                    "invalid metadata case did not fail validation");
+            fake = valid_fake_backend();
+            fake.load_result = -(int)reason;
+            install_fake_backend(&fake);
+            ane = create_enabled(path, &contract, (int)mode, error);
+            require_predict_reason(
+                ane, 1, reason,
+                mode ? "shadow metadata failure was not enforced"
+                     : "qualified metadata failure was not enforced");
+            h3_ane_free(ane);
+        }
+    }
+
+    fake = valid_fake_backend();
+    fake.plan_never_completes = 1;
+    install_fake_backend(&fake);
+    double timeout_start = test_monotonic_seconds();
+    ane = create_enabled(model_path, &contract, 0, error);
+    double timeout_elapsed = test_monotonic_seconds() - timeout_start;
+    require(timeout_elapsed < 1.0,
+            "never-completing compute plan blocked create indefinitely");
+    require_predict_reason(ane, 1, H3_ANE_REASON_ELIGIBILITY,
+                           "compute-plan timeout reason was unstable");
+    h3_ane_free(ane);
+
     h3_ane_contract changed = contract;
     changed.block_index = 1;
     fake = valid_fake_backend();
@@ -527,6 +667,27 @@ static void test_runtime_bridge(const char *root) {
     ane = create_enabled(model_path, &changed, 0, error);
     require_predict_reason(ane, 1, H3_ANE_REASON_CONTRACT,
                            "contract failure reason was unstable");
+    h3_ane_free(ane);
+
+    fake = valid_fake_backend();
+    fake.predict_delay_us = 50000;
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    pthread_t first_thread, second_thread;
+    predict_thread first = {.ane = ane, .input = input, .output = output,
+                            .count = count};
+    predict_thread second = first;
+    require(pthread_create(&first_thread, NULL, run_prediction_thread, &first) ==
+                0,
+            "cannot create first prediction thread");
+    require(pthread_create(&second_thread, NULL, run_prediction_thread,
+                           &second) == 0,
+            "cannot create second prediction thread");
+    require(pthread_join(first_thread, NULL) == 0 &&
+                pthread_join(second_thread, NULL) == 0,
+            "cannot join prediction threads");
+    require(first.result && second.result && fake.max_active_predictions == 1,
+            "single-owner prediction calls were not serialized");
     h3_ane_free(ane);
 
     changed = contract;
@@ -630,6 +791,7 @@ int main(void) {
     test_receipt_load_and_validate(root);
     test_contract_is_exact();
     test_compiled_directory_receipt_integration(root);
+    test_runtime_metadata();
     test_runtime_bridge(root);
     printf("PASS tests/test_ane.c\n");
     return 0;
