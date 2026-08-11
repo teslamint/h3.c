@@ -4,7 +4,7 @@ feature: ane-acceleration
 phase: implement
 phase_status: in-progress
 started: 2026-08-11T13:46:38Z
-updated: 2026-08-11T15:47:07Z
+updated: 2026-08-11T17:00:16Z
 branch: feat/ane-acceleration
 base_branch: main
 flags: []
@@ -19,7 +19,7 @@ final_action:
   command: null
   marker: preparation-not-approval
   updated: 2026-08-11T13:46:38Z
-current_unit: U4
+current_unit: null
 ci_attempts: 0
 review_rounds: 0
 feedback_rounds: 0
@@ -51,4 +51,8 @@ blocked_reason: null
 
 - 2026-08-11T15:45:09Z implement U3 re-review round 2: added genuine receipt/fingerprint/load/plan unavailable-handle dispatch regressions and replacement-allocation fallback accounting in `396205d`; focused/full actual-Metal tests and diff checks passed; forced-failure evidence/report rewritten.
 - 2026-08-11T15:47:07Z implement: Unit U3 complete (commits `b3750c0..396205d`, spec compliance clean, quality clean, six matrix records verified).
+- 2026-08-11T16:31:22Z implement: Unit U4 complete (commits `2e2e1cd..dbf2049`, spec compliance clean, quality clean, 24 matrix records verified; real qualification failed closed without receipt).
+- 2026-08-11T16:48:49Z implement: Unit U5 complete (commits `3ddd41e..800116f`, spec compliance clean, quality clean).
+- 2026-08-11T16:48:49Z implement: final verification passed (plan seal, 16 Python tests, focused ANE tests, build, 1768-check Metal suite, 30 matrix records); final branch review started.
 - 2026-08-11T16:27:00Z implement U4 review fix: eight review findings fixed in `a113bc7`; 16 tool tests, focused/full actual-Metal regressions, pinned deterministic Core ML graph self-test, and real conversion/compile passed; 24 matrix records regenerated against the exact commit. Real qualification remains explicitly failed (`ANE backend is unavailable`) with no passing receipt; ready for re-review.
+- 2026-08-11T17:00:16Z implement final branch review fix: corrected compute-plan preference labeling, configured fallback diagnostics, explicit benchmark authorization, and stride-aware MLMultiArray transfer with noncontiguous regression; 16 Python tests, focused actual-Metal ANE tests, and diff check passed; full-suite rerun remains for the final verifier.

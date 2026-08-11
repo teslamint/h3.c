@@ -330,7 +330,8 @@ class NativeToolTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             document = json.loads(output.read_text())
             self.assertEqual(document["placement_summary"],
-                             "observed:cpu+neural-engine")
+                             "compute-plan-preference:cpu+neural-engine")
+            self.assertNotIn("observed", document["placement_summary"])
             self.assertTrue(self.analyzer_for_native().analyze(document)["claim_passed"])
 
             output.unlink()

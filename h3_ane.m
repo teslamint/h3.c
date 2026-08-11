@@ -30,6 +30,7 @@ struct h3_ane {
     int backend_loaded;
     int real_backend;
     int test_backend;
+    int configured;
     pthread_mutex_t prediction_mutex;
 };
 
@@ -75,6 +76,22 @@ static void set_error(char *error, size_t error_size, const char *message) {
     snprintf(error, error_size, "%s", message ? message : "ANE failure");
 }
 
+static int diagnostics_enabled(void) {
+    const char *trace = getenv("H3_ANE_TRACE");
+    const char *profile = getenv("H3_PROFILE");
+    return (trace && strcmp(trace, "1") == 0) ||
+           (profile && strcmp(profile, "1") == 0);
+}
+
+static const char *reason_name(h3_ane_reason reason) {
+    static const char *const names[] = {
+        "none", "disabled", "os", "contract", "fingerprint", "receipt",
+        "eligibility", "load", "prediction", "shape", "dtype", "nonfinite",
+    };
+    return reason >= H3_ANE_REASON_NONE && reason <= H3_ANE_REASON_NONFINITE ?
+        names[reason] : "unknown";
+}
+
 static h3_ane_reason callback_reason(int result, h3_ane_reason fallback) {
     if (result >= 0) return fallback;
     int reason = -result;
@@ -108,6 +125,88 @@ static h3_ane_reason validate_contract(const h3_ane_contract *contract) {
         return H3_ANE_REASON_CONTRACT;
     return H3_ANE_REASON_NONE;
 }
+
+static int canonical_strides(const ptrdiff_t strides[5],
+                             const uint32_t shape[5]) {
+    ptrdiff_t expected = 1;
+    for (size_t reverse = 5; reverse > 0; reverse--) {
+        size_t index = reverse - 1;
+        if (strides[index] != expected) return 0;
+        if (shape[index] && expected > PTRDIFF_MAX / shape[index]) return 0;
+        expected *= shape[index];
+    }
+    return 1;
+}
+
+static int copy_to_strided(float *destination, const ptrdiff_t strides[5],
+                           const uint32_t shape[5], const float *source) {
+    if (!destination || !strides || !shape || !source) return 0;
+    for (size_t index = 0; index < 5; index++)
+        if (strides[index] < 0) return 0;
+    size_t count = 1;
+    for (size_t index = 0; index < 5; index++) count *= shape[index];
+    if (canonical_strides(strides, shape)) {
+        memcpy(destination, source, count * sizeof(*source));
+        return 1;
+    }
+    size_t linear = 0;
+    for (uint32_t i0 = 0; i0 < shape[0]; i0++)
+        for (uint32_t i1 = 0; i1 < shape[1]; i1++)
+            for (uint32_t i2 = 0; i2 < shape[2]; i2++)
+                for (uint32_t i3 = 0; i3 < shape[3]; i3++)
+                    for (uint32_t i4 = 0; i4 < shape[4]; i4++, linear++) {
+                        ptrdiff_t offset = (ptrdiff_t)i0 * strides[0] +
+                            (ptrdiff_t)i1 * strides[1] +
+                            (ptrdiff_t)i2 * strides[2] +
+                            (ptrdiff_t)i3 * strides[3] +
+                            (ptrdiff_t)i4 * strides[4];
+                        destination[offset] = source[linear];
+                    }
+    return 1;
+}
+
+static int copy_from_strided(float *destination, const float *source,
+                             const ptrdiff_t strides[5],
+                             const uint32_t shape[5]) {
+    if (!destination || !strides || !shape || !source) return 0;
+    for (size_t index = 0; index < 5; index++)
+        if (strides[index] < 0) return 0;
+    size_t count = 1;
+    for (size_t index = 0; index < 5; index++) count *= shape[index];
+    if (canonical_strides(strides, shape)) {
+        memcpy(destination, source, count * sizeof(*destination));
+        return 1;
+    }
+    size_t linear = 0;
+    for (uint32_t i0 = 0; i0 < shape[0]; i0++)
+        for (uint32_t i1 = 0; i1 < shape[1]; i1++)
+            for (uint32_t i2 = 0; i2 < shape[2]; i2++)
+                for (uint32_t i3 = 0; i3 < shape[3]; i3++)
+                    for (uint32_t i4 = 0; i4 < shape[4]; i4++, linear++) {
+                        ptrdiff_t offset = (ptrdiff_t)i0 * strides[0] +
+                            (ptrdiff_t)i1 * strides[1] +
+                            (ptrdiff_t)i2 * strides[2] +
+                            (ptrdiff_t)i3 * strides[3] +
+                            (ptrdiff_t)i4 * strides[4];
+                        destination[linear] = source[offset];
+                    }
+    return 1;
+}
+
+#ifdef H3_ANE_TESTING
+int h3_ane_test_copy_to_strided(float *destination,
+                                const ptrdiff_t strides[5],
+                                const uint32_t shape[5],
+                                const float *source) {
+    return copy_to_strided(destination, strides, shape, source);
+}
+
+int h3_ane_test_copy_from_strided(float *destination, const float *source,
+                                  const ptrdiff_t strides[5],
+                                  const uint32_t shape[5]) {
+    return copy_from_strided(destination, source, strides, shape);
+}
+#endif
 
 static h3_ane_reason validate_metadata_values(const char *const values[8],
                                               const h3_ane_contract *contract) {
@@ -323,7 +422,14 @@ static int real_predict(void *opaque, const float *input, size_t input_count,
             initWithShape:shape dataType:MLMultiArrayDataTypeFloat32 error:&error];
         if (!inputArray || error || (size_t)inputArray.count != input_count)
             return -(int)H3_ANE_REASON_SHAPE;
-        memcpy(inputArray.dataPointer, input, input_count * sizeof(*input));
+        ptrdiff_t inputStrides[5];
+        if (inputArray.strides.count != 5) return -(int)H3_ANE_REASON_SHAPE;
+        for (size_t index = 0; index < 5; index++)
+            inputStrides[index] = inputArray.strides[index].longLongValue;
+        const uint32_t dimensions[5] = {1, 1, 256, 256, 128};
+        if (!copy_to_strided(inputArray.dataPointer, inputStrides, dimensions,
+                             input))
+            return -(int)H3_ANE_REASON_SHAPE;
         MLDictionaryFeatureProvider *provider = [[MLDictionaryFeatureProvider alloc]
             initWithDictionary:@{backend.inputName:
                                      [MLFeatureValue featureValueWithMultiArray:
@@ -343,7 +449,17 @@ static int real_predict(void *opaque, const float *input, size_t input_count,
             return -(int)H3_ANE_REASON_DTYPE;
         if ((size_t)array.count != output_count)
             return -(int)H3_ANE_REASON_SHAPE;
-        memcpy(output, array.dataPointer, output_count * sizeof(*output));
+        ptrdiff_t outputStrides[5];
+        if (array.shape.count != 5 || array.strides.count != 5)
+            return -(int)H3_ANE_REASON_SHAPE;
+        for (size_t index = 0; index < 5; index++) {
+            if (array.shape[index].unsignedLongLongValue != dimensions[index])
+                return -(int)H3_ANE_REASON_SHAPE;
+            outputStrides[index] = array.strides[index].longLongValue;
+        }
+        if (!copy_from_strided(output, array.dataPointer, outputStrides,
+                               dimensions))
+            return -(int)H3_ANE_REASON_SHAPE;
         backend.outputSeconds = monotonic_seconds() - start;
         return 1;
     } @catch (__unused NSException *exception) {
@@ -403,6 +519,9 @@ static void mark_unavailable(h3_ane *ane, h3_ane_reason reason,
     ane->unavailable_reason = reason;
     ane->stats.last_reason = reason;
     set_error(error, error_size, message);
+    if (ane->configured && diagnostics_enabled())
+        fprintf(stderr, "h3-ane fallback reason=%s message=%s\n",
+                reason_name(reason), message ? message : "ANE failure");
 }
 
 static h3_ane *create_impl(const char *model_path,
@@ -421,6 +540,7 @@ static h3_ane *create_impl(const char *model_path,
     }
     ane->stats.shadow = shadow != 0;
     const char *enabled_path = getenv("H3_ANE_MODEL");
+    ane->configured = authorized || (enabled_path && *enabled_path);
     if (!model_path || !*model_path ||
         (!authorized && (!enabled_path || !*enabled_path ||
                          strcmp(model_path, enabled_path) != 0))) {

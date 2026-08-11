@@ -81,10 +81,10 @@ static int test_mode_enabled(void) {
 static void placement_summary(uint32_t devices, bench_mode mode,
                               char output[96]) {
     if (mode == MODE_METAL) {
-        snprintf(output, 96, "observed:metal-only");
+        snprintf(output, 96, "backend:metal");
         return;
     }
-    snprintf(output, 96, "observed:%s%s%s",
+    snprintf(output, 96, "compute-plan-preference:%s%s%s",
              devices & H3_ANE_DEVICE_CPU ? "cpu" : "",
              devices & H3_ANE_DEVICE_GPU ?
                  (devices & H3_ANE_DEVICE_CPU ? "+gpu" : "gpu") : "",
@@ -169,7 +169,8 @@ static int initialize_context(bench_context *context, const char *weights,
         if (!h3_ane_sha256_tensors(context->store, names,
                                    sizeof(names) / sizeof(*names),
                                    contract.source_sha256, error, error_size)) return 0;
-        context->ane = h3_ane_create(model, &contract, 0, error, error_size);
+        context->ane = h3_ane_create_authorized(model, &contract, 0, error,
+                                                error_size);
         if (!context->ane) return 0;
     }
     return 1;

@@ -72,6 +72,14 @@ typedef struct {
 } h3_ane_test_backend;
 
 void h3_ane_test_set_backend(const h3_ane_test_backend *backend);
+int h3_ane_test_copy_to_strided(float *destination,
+                                const ptrdiff_t strides[5],
+                                const uint32_t shape[5],
+                                const float *source);
+int h3_ane_test_copy_from_strided(float *destination,
+                                  const float *source,
+                                  const ptrdiff_t strides[5],
+                                  const uint32_t shape[5]);
 #endif
 
 #endif

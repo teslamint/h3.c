@@ -13,6 +13,6 @@
 - Exact injection/command: `H3_ANE_TEST_METAL_SECONDS=1.0 H3_ANE_TEST_COREML_SECONDS=0.8 /Users/teslamint/workspace/h3.c/h3_ane_bench_test --backend ab --coreml-model /private/tmp/h3-u4-authoritative-uizkm1rc/benchmark/model.mlmodelc --warmup 2 --pairs 20 --output /private/tmp/h3-u4-authoritative-uizkm1rc/benchmark/ab.json`
 - Exit status: `0`
 - Sanitized output: `pair 0 metal complete pair 0 coreml complete pair 1 coreml complete pair 1 metal complete pair 2 metal complete pair 2 coreml complete pair 3 coreml complete pair 3 metal complete pair 4 metal complete pair 4 coreml complete pair 5 coreml complete pair 5 metal complete pair 6 metal complete pair 6 c`
-- Post-state: 40 ordered samples atomically published with observed placement
+- Post-state: 40 ordered samples atomically published with compute-plan preference
 - Next invocation / compensation result: production analyzer accepts claim fixture
 - Mechanism check: exit 0, exact AB/BA order, and placement derives from stats seam

@@ -34,7 +34,7 @@
 
 - Canonical runtime metadata keys, swap-preserving package publication, owned
   compile temp/publish, receipt-last commit ordering, post-receipt signal seam,
-  observed placement summaries, and compile-time-only benchmark test mode are
+  compute-plan preference summaries, and compile-time-only benchmark test mode are
   implemented.
 - Deterministic tiny Core ML graph built and executed against the NumPy
   reference: `max_abs=0.0010902881622314453`.

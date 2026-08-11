@@ -1,6 +1,7 @@
 #include "h3_ane_receipt.h"
 #include "h3_ane.h"
 #include "h3_ane_dispatch.h"
+#include "h3_ane_internal.h"
 #include "h3_video_encoder.h"
 
 #include <fcntl.h>
@@ -495,6 +496,52 @@ static void require_predict_reason(h3_ane *ane, size_t count,
     require(stats.last_reason == expected, message);
 }
 
+static void test_multiarray_stride_copy(void) {
+    const uint32_t shape[5] = {1, 1, 2, 2, 2};
+    const ptrdiff_t strides[5] = {16, 16, 8, 4, 1};
+    const float contiguous[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    float storage[14] = {0};
+    float roundtrip[8] = {0};
+    require(h3_ane_test_copy_to_strided(storage, strides, shape, contiguous),
+            "noncontiguous MLMultiArray input copy failed");
+    require(storage[0] == 1 && storage[1] == 2 &&
+                storage[4] == 3 && storage[5] == 4 &&
+                storage[8] == 5 && storage[9] == 6 &&
+                storage[12] == 7 && storage[13] == 8,
+            "noncontiguous MLMultiArray input used linear memcpy");
+    require(h3_ane_test_copy_from_strided(roundtrip, storage, strides, shape),
+            "noncontiguous MLMultiArray output copy failed");
+    require(memcmp(roundtrip, contiguous, sizeof(contiguous)) == 0,
+            "noncontiguous MLMultiArray output order changed");
+    ptrdiff_t invalid[5] = {16, 16, 8, 4, -1};
+    require(!h3_ane_test_copy_from_strided(roundtrip, storage, invalid, shape),
+            "negative MLMultiArray stride was accepted");
+}
+
+static size_t capture_create_diagnostic(const char *model_path,
+                                        const h3_ane_contract *contract,
+                                        int authorized, char output[512]) {
+    int descriptors[2];
+    require(pipe(descriptors) == 0, "cannot create diagnostic capture pipe");
+    int saved = dup(STDERR_FILENO);
+    require(saved >= 0 && dup2(descriptors[1], STDERR_FILENO) >= 0,
+            "cannot capture ANE diagnostic");
+    close(descriptors[1]);
+    char error[256];
+    h3_ane *ane = authorized ?
+        h3_ane_create_authorized(model_path, contract, 0, error, sizeof(error)) :
+        h3_ane_create(model_path, contract, 0, error, sizeof(error));
+    h3_ane_free(ane);
+    fflush(stderr);
+    require(dup2(saved, STDERR_FILENO) >= 0, "cannot restore stderr");
+    close(saved);
+    ssize_t size = read(descriptors[0], output, 511);
+    require(size >= 0, "cannot read ANE diagnostic");
+    close(descriptors[0]);
+    output[size] = '\0';
+    return (size_t)size;
+}
+
 static void test_runtime_metadata(void) {
     static const char source[] =
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
@@ -577,6 +624,38 @@ static void test_runtime_bridge(const char *root) {
     h3_ane_free(ane);
     require(fake.free_count == 0, "disabled handle freed an unloaded backend");
 
+    char diagnostic[512];
+    require(setenv("H3_ANE_TRACE", "1", 1) == 0,
+            "cannot enable default-off diagnostic capture");
+    require(capture_create_diagnostic(model_path, &contract, 0, diagnostic) == 0,
+            "default-off ANE run emitted a diagnostic");
+    require(unsetenv("H3_ANE_TRACE") == 0,
+            "cannot clear default-off diagnostic capture");
+
+    fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    ane = h3_ane_create_authorized(model_path, &contract, 0, error,
+                                   sizeof(error));
+    require(ane != NULL && fake.load_count == 1 && fake.plan_count == 1,
+            "explicit authorized creation depended on H3_ANE_MODEL");
+    h3_ane_free(ane);
+
+    fake = valid_fake_backend();
+    fake.load_result = 0;
+    install_fake_backend(&fake);
+    require(setenv("H3_ANE_MODEL", model_path, 1) == 0 &&
+                setenv("H3_PROFILE", "1", 1) == 0,
+            "cannot enable configured fallback diagnostic");
+    require(capture_create_diagnostic(model_path, &contract, 0, diagnostic) > 0,
+            "configured fallback was silent under profiling");
+    require(strcmp(diagnostic,
+                   "h3-ane fallback reason=load message=Core ML model load failed\n") == 0,
+            "configured fallback diagnostic was not concise and stable");
+    require(unsetenv("H3_PROFILE") == 0,
+            "cannot clear configured fallback profile setting");
+
+    fake = valid_fake_backend();
+    install_fake_backend(&fake);
     ane = create_enabled(model_path, &contract, 0, error);
     require(ane != NULL, error);
     require(fake.load_count == 1 && fake.plan_count == 1,
@@ -1117,6 +1196,7 @@ int main(void) {
     test_contract_is_exact();
     test_compiled_directory_receipt_integration(root);
     test_runtime_metadata();
+    test_multiarray_stride_copy();
     test_runtime_bridge(root);
     test_dispatch_fallback(root);
     test_video_encoder_ane_surface();
