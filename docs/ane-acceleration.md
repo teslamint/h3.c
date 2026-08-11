@@ -93,8 +93,8 @@ weights changes the fingerprint.
 
 The compiled-model digest is a SHA-256 over the compiled directory's regular
 files in sorted relative-path order. Unsafe paths, unsupported file types, and
-symlinks that escape the model directory are rejected. Changing compiled bytes
-invalidates the digest.
+all symlinks are rejected, including symlinks whose targets remain inside the
+model directory. Changing compiled bytes invalidates the digest.
 
 Non-shadow execution requires the fixed receipt path:
 
@@ -180,6 +180,21 @@ fixture is absent in this checkout. `make test` reports a skip when either the
 fixture or released visual-encoder weights are absent; a skip is not parity
 evidence.
 
+Prepare one real 256-by-256 conditioning image and keep its absolute path fixed
+for both the Metal baseline and shadow run:
+
+```sh
+export FIRST_FRAME=/absolute/path/to/first-frame-256.png
+test -f "$FIRST_FRAME"
+test "$(ffprobe -v error -select_streams v:0 \
+  -show_entries stream=width,height -of csv=s=x:p=0 \
+  "$FIRST_FRAME")" = "256x256"
+```
+
+Do not substitute a synthetic tensor or omit `--first-frame`: the comparison
+must execute the real visual-conditioning encoder at the experiment's fixed
+256-by-256 geometry.
+
 ## Run shadow diagnostics
 
 Shadow mode does not require a passing receipt because it always returns Metal
@@ -192,7 +207,7 @@ H3_ANE_SHADOW=1 \
 H3_ANE_TRACE=1 \
 ./h3 -d ./MiniMax-H3 \
   -p "A slow camera move around the supplied first frame." \
-  --first-frame input.png \
+  --first-frame "$FIRST_FRAME" \
   --width 256 --height 256 --frames 22 --steps 4 \
   --layers 50 --reuse 1 \
   -o outputs/ane-shadow.mp4
@@ -253,8 +268,9 @@ RSS is no more than 5% above the matched Metal value.
 
 ## Capture placement and energy with Instruments
 
-First retain a default Metal/MPSGraph generation baseline. Unset all ANE
-variables so the trace cannot accidentally opt into Core ML:
+First retain a default Metal/MPSGraph generation baseline using the same real
+256-by-256 first frame, prompt, and generation geometry as the shadow run.
+Unset all ANE variables so the trace cannot accidentally opt into Core ML:
 
 ```sh
 env -u H3_ANE_MODEL -u H3_ANE_SHADOW -u H3_ANE_TRACE \
@@ -262,7 +278,8 @@ xctrace record \
   --template 'Metal System Trace' \
   --output .release-loop/evidence/h3-metal-baseline.trace \
   --launch -- ./h3 -d ./MiniMax-H3 \
-  -p "A red fox walks through fresh snow." \
+  -p "A slow camera move around the supplied first frame." \
+  --first-frame "$FIRST_FRAME" \
   --width 256 --height 256 --frames 22 --steps 4 \
   --layers 50 --reuse 1 \
   -o outputs/h3-metal-baseline.mp4
