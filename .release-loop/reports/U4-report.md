@@ -2,7 +2,7 @@
 
 Status: DONE
 
-Final-review source commit: `fcc872f3b2459aa277b267c92ee849410025ebd9`
+Round2 source commit: `fe193e1da98e0ecade1b503991a5018ef83a1607`
 
 ## Authority boundary
 
@@ -53,7 +53,7 @@ Final-review source commit: `fcc872f3b2459aa277b267c92ee849410025ebd9`
   successful preflight. The native qualifier exits 2 before measurement,
   preserves the receipt byte-for-byte, and emits the same explicit structured
   non-started/unchanged result.
-- The diagnostic contract is cross-checked against production record sites:
+- The diagnostic contract is checked against the production `h3_ane.m` taxonomy table, native qualifier/video regressions, and coordinator validation:
   fabricated eligibility/inventory pairs are removed, replacement-output
   allocation maps to `output/output_copy_failed`, eligibility requires operation context, and compute-plan inventory
   failures require the count context that production records.
@@ -115,8 +115,16 @@ Final-review source commit: `fcc872f3b2459aa277b267c92ee849410025ebd9`
 
 ## Final review evidence
 
-- Exact source commit: `fcc872f3b2459aa277b267c92ee849410025ebd9`.
+- Exact Round2 source commit: `fe193e1da98e0ecade1b503991a5018ef83a1607`.
 - Fresh isolated synthetic integration passed `441/292/149/149/0` with null parity and receipt; `.release-loop/evidence/ane-integration.json` is the bounded summary.
 - Fresh real shadow passed non-authorizing parity with no receipt; fresh strict real exited 1 at `parity/parity_bounds_failed` with no receipt.
 - Actual disposable production-table evidence is retained in `.release-loop/evidence/U4/conversion.json`, `compile.json`, and `integration.json`.
 - Strict and shadow qualification now preflight link-safe receipt invalidation before prediction or mutation; coordinator reuse applies the same preflight before deleting an owned work tree and accepts unchanged regular or absent authority snapshots.
+
+## Round2 stateful mechanism closure
+
+- Actual pinned wrong-shape safetensors conversion failed without replacing a preseeded final or changing the source sentinel; synchronized SIGTERM removed the owned temporary sibling; canonical rerun published a complete package.
+- A fake compiler created a partial `.mlmodelc` then raised `CalledProcessError`; absent/preexisting finals were preserved and temporary output removed. Native `xcrun coremlcompiler` rejected a malformed package with no final output; valid rerun published one complete model.
+- A synchronized post-compile probe failure atomically published a complete failed integration summary, while post-compile SIGTERM preserved prior summary bytes and removed temp/child/receipt state. Rerun published a complete passed summary.
+- Creator metadata validation returns both reason and exact field. Native fixtures cover all eight missing and mismatched canonical fields; coordinator serialization covers exact nullable `contract_field` and bounded optional digest.
+- The manifest describes the actual evidence boundary: the production `h3_ane.m` table, native qualifier/video regressions, and coordinator tests. It does not claim automatic three-source record extraction.
