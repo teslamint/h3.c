@@ -40,16 +40,16 @@
       "plan_row": "Rewrite RESULT after receipt publication failure"
     },
     {
-      "exact_command": "python3 -m unittest tests.test_ane_tools.IntegrationCoordinatorTests.test_shadow_coordinator_preserves_unchanged_preflight_authority tests.test_ane_tools.IntegrationCoordinatorTests.test_shadow_coordinator_rejects_changed_unchanged_authority_claim tests.test_ane_tools.IntegrationCoordinatorTests.test_qualifier_diagnostic_taxonomy_and_context_are_closed tests.test_ane_tools.IntegrationCoordinatorTests.test_production_compute_plan_pairs_propagate_exactly",
-      "fixture": "IntegrationCoordinatorTests.test_shadow_coordinator_preserves_unchanged_preflight_authority; test_shadow_coordinator_rejects_changed_unchanged_authority_claim; canonical taxonomy/context tests",
-      "injection": "converter pre-seeds genuine receipt before qualifier launch; child either preserves or changes bytes while claiming unchanged; cross-stage inventory/eligibility/output allocation and missing context cases",
-      "mechanism": "nofollow descriptor snapshot before launch and after child; record-site-derived stage/code table with required operation and count context",
-      "next_invocation": "only verified byte/identity-equivalent authority may be reported unchanged",
-      "outcome": "unchanged accepted only when regular-file device/inode/mode/size/mtime/digest snapshot is identical; changed claim rejected and authority cleaned; canonical output/allocation and compute-plan pairs accepted, fabricated eligibility inventory and missing required contexts rejected",
+      "exact_command": "python3 -m unittest tests.test_ane_tools.IntegrationCoordinatorTests.test_qualifier_diagnostic_taxonomy_and_context_are_closed tests.test_ane_tools.IntegrationCoordinatorTests.test_production_compute_plan_pairs_propagate_exactly tests.test_ane_tools.IntegrationCoordinatorTests.test_shadow_coordinator_preserves_unchanged_preflight_authority tests.test_ane_tools.IntegrationCoordinatorTests.test_shadow_coordinator_rejects_changed_unchanged_authority_claim",
+      "fixture": "IntegrationCoordinatorTests.test_qualifier_diagnostic_taxonomy_and_context_are_closed; test_production_compute_plan_pairs_propagate_exactly; unchanged-authority snapshot tests",
+      "injection": "actual record-site tuples across h3_ane.m, h3_video_encoder.c, and tests/qualify_ane.c; receipt versus contract fingerprint; output allocation; inventory empty/limit with and without count; nesting/changed without count; fabricated cross-stage pairs",
+      "mechanism": "closed exact stage/code sets plus per-pair optional/required/forbidden operation/device/count policies cross-checked against production sources",
+      "next_invocation": "only canonical record-site pair and context policies can publish qualifier failures",
+      "outcome": "receipt/fingerprint and output/allocation accepted; contract/fingerprint rejected; empty/limit accept optional count; nesting/changed require count; fabricated eligibility inventory rejected; verified receipt snapshot behavior remains unchanged",
       "plan_row": "Publish integration summary"
     },
     {
-      "exact_command": "git diff 8d324a5..b2275a0 -- h3_ane.m h3_ane_dispatch.c h3_video_encoder.c && ANE_INTEGRATION_OUTPUT=/private/tmp/u4-strict-summary-final-authority.json ANE_INTEGRATION_WORK=/private/tmp/u4-strict-work-final-authority H3_ANE_WEIGHT_DIR=MiniMax-H3/FL2VA/video_vae/source make h3_ane_real_qualification_test",
+      "exact_command": "git diff 94d1d6e..52f4c3a -- h3_ane.m h3_ane_dispatch.c h3_video_encoder.c && ANE_INTEGRATION_OUTPUT=/private/tmp/u4-strict-summary-taxonomy.json ANE_INTEGRATION_WORK=/private/tmp/u4-strict-work-taxonomy H3_ANE_WEIGHT_DIR=MiniMax-H3/FL2VA/video_vae/source make h3_ane_real_qualification_test",
       "fixture": "scope/diff authority check plus strict real target",
       "injection": "same FP16 candidate exceeds unchanged strict max_abs bound",
       "mechanism": "shadow evidence is authority false and runtime receipt validation/adoption code is unchanged",
@@ -58,7 +58,7 @@
       "plan_row": "Adopt Core ML request output"
     }
   ],
-  "schema": "h3-release-loop-shadow-matrix/v4",
-  "source_commit": "b2275a034d80ca2d8dcd8481206c8300c9290e39",
-  "timestamp_utc": "2026-08-12T11:18:46Z"
+  "schema": "h3-release-loop-shadow-matrix/v5",
+  "source_commit": "52f4c3a8e7fa75a32c82db962d26562670ad355c",
+  "timestamp_utc": "2026-08-12T11:30:15Z"
 }

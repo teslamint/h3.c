@@ -2,7 +2,7 @@
 
 Status: DONE
 
-Review-fix source commit: `b2275a034d80ca2d8dcd8481206c8300c9290e39`
+Review-fix source commit: `52f4c3a8e7fa75a32c82db962d26562670ad355c`
 
 ## Authority boundary
 
@@ -58,6 +58,12 @@ Review-fix source commit: `b2275a034d80ca2d8dcd8481206c8300c9290e39`
   fabricated eligibility/inventory pairs are removed, output allocation is
   accepted, eligibility requires operation context, and compute-plan inventory
   failures require the count context that production records.
+- Final record-site correction places `fingerprint_mismatch` exclusively under
+  `receipt`, retains production `output/allocation_failed`, and removes
+  fabricated eligibility/inventory pairs. Compute-plan inventory empty/limit
+  accept optional count context because `create_impl` emits them without it,
+  while nesting and count/fill change require their production count context;
+  compute-plan allocation accepts optional count context.
 - Every coordinator shadow success, qualifier failure, summary-publication
   failure, and cancellation fixture independently seeds a genuine-format
   strict sidecar and proves the live authority pathname is absent afterward.
