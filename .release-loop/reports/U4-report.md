@@ -2,7 +2,7 @@
 
 Status: DONE
 
-Review-fix source commit: `fe14e88047f949d913e46cb1b017d926e0ca8c0b`
+Review-fix source commit: `2a43e5d80e6e17eee3a91e606f766fe28806e368`
 
 ## Authority boundary
 
@@ -23,6 +23,12 @@ Review-fix source commit: `fe14e88047f949d913e46cb1b017d926e0ca8c0b`
 - SIGINT and SIGTERM are blocked across the entire invalidation critical
   section. A synchronized pending-signal test proves SIGTERM is handled only
   after the live receipt pathname becomes non-authorizing.
+- Shadow now performs a side-effect-free disposable-sibling capability
+  preflight before invalidation. A synchronized writable test proves the
+  genuine receipt, model, weights, and result remain unchanged before
+  quarantine. A non-writable-parent test exits 2 without measurement,
+  preserves receipt bytes, and publishes `measurement_started: false` with
+  `authority_state: "unchanged"` to a separate writable result path.
 - Shadow failures retain the same complete structured diagnostic fields as the
   strict qualifier, and the coordinator validates and propagates
   `parity_bounds_failed` versus `parity_metrics_nonfinite` without collapsing
@@ -34,6 +40,11 @@ Review-fix source commit: `fe14e88047f949d913e46cb1b017d926e0ca8c0b`
   disjoint before any coordinator mutation. Closed production stage/code
   taxonomy and stage-specific operation/device validation preserve every
   legitimate qualifier failure while rejecting fabricated context.
+- Coordinator preflight failures preserve the explicit unchanged authority
+  state and do not delete or claim removal of the genuine-format sidecar.
+  Production-derived tests cover exact `compute_plan` pairs for allocation,
+  empty inventory, limit, nesting, and count/fill change, including nullable
+  or numeric observed-count/limit context.
 - Every coordinator shadow success, qualifier failure, summary-publication
   failure, and cancellation fixture independently seeds a genuine-format
   strict sidecar and proves the live authority pathname is absent afterward.
@@ -43,7 +54,7 @@ Review-fix source commit: `fe14e88047f949d913e46cb1b017d926e0ca8c0b`
 - Red tests first proved the qualifier rejected `--shadow-only`, the
   coordinator rejected `shadow`, and an out-of-bounds passing qualifier was
   initially accepted; the implementation then made each test pass.
-- `python3 -m unittest tests/test_ane_tools.py`: 60 passed.
+- `python3 -m unittest tests/test_ane_tools.py`: 64 passed.
 - `python3 -m py_compile scripts/run_ane_integration.py`: passed.
 - `make h3_ane_tool_tests`: passed.
 - Strict warning build (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion`) and
