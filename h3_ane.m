@@ -486,6 +486,24 @@ static int walk_plan_roots(plan_walk *walk) {
     return 1;
 }
 
+int h3_ane_walk_plan_tree(const h3_ane_plan_tree_adapter *adapter,
+                          void *context,
+                          h3_ane_operation_usage *operations,
+                          size_t *operation_count,
+                          h3_ane_diagnostic *diagnostic) {
+    if (!adapter || !operation_count) return 0;
+    size_t capacity = operations ? *operation_count : 0;
+    plan_walk walk = {.adapter = adapter, .context = context,
+                      .operations = operations, .capacity = capacity,
+                      .diagnostic = diagnostic};
+    if (!walk_plan_roots(&walk)) {
+        *operation_count = walk.count;
+        return 0;
+    }
+    *operation_count = walk.count;
+    return 1;
+}
+
 int h3_ane_collect_plan_tree(const h3_ane_plan_tree_adapter *adapter,
                              void *context,
                              h3_ane_operation_usage **operations,
@@ -497,17 +515,18 @@ int h3_ane_collect_plan_tree(const h3_ane_plan_tree_adapter *adapter,
     *operations = NULL;
     *operation_count = 0;
     memset(summary, 0, sizeof(*summary));
-    plan_walk count_walk = {.adapter = adapter, .context = context,
-                            .diagnostic = diagnostic};
-    if (!walk_plan_roots(&count_walk)) return 0;
-    if (count_walk.count > SIZE_MAX / sizeof(**operations)) {
+    size_t counted = 0;
+    if (!h3_ane_walk_plan_tree(adapter, context, NULL, &counted, diagnostic))
+        return 0;
+    if (counted > SIZE_MAX / sizeof(**operations)) {
+        plan_walk failure = {.diagnostic = diagnostic};
         return record_inventory_failure(
-            &count_walk, H3_ANE_CODE_ALLOCATION_FAILED, count_walk.count,
+            &failure, H3_ANE_CODE_ALLOCATION_FAILED, counted,
             SIZE_MAX / sizeof(**operations),
             "operation inventory allocation overflow");
     }
     h3_ane_operation_usage *inventory =
-        calloc(count_walk.count, sizeof(*inventory));
+        calloc(counted, sizeof(*inventory));
     if (!inventory) {
         h3_ane_diagnostic_record_first(
             diagnostic, H3_ANE_STAGE_COMPUTE_PLAN,
@@ -515,12 +534,10 @@ int h3_ane_collect_plan_tree(const h3_ane_plan_tree_adapter *adapter,
             "operation inventory allocation failed");
         return 0;
     }
+    size_t filled = counted;
     h3_ane_diagnostic fill_diagnostic = {0};
-    plan_walk fill_walk = {.adapter = adapter, .context = context,
-                           .operations = inventory,
-                           .capacity = count_walk.count,
-                           .diagnostic = &fill_diagnostic};
-    if (!walk_plan_roots(&fill_walk) || fill_walk.count != count_walk.count) {
+    if (!h3_ane_walk_plan_tree(adapter, context, inventory, &filled,
+                               &fill_diagnostic) || filled != counted) {
         free(inventory);
         h3_ane_diagnostic_record_first(
             diagnostic, H3_ANE_STAGE_COMPUTE_PLAN,
@@ -529,20 +546,20 @@ int h3_ane_collect_plan_tree(const h3_ane_plan_tree_adapter *adapter,
             "operation inventory changed between count and fill");
         if (diagnostic &&
             diagnostic->code == H3_ANE_CODE_OPERATION_INVENTORY_CHANGED) {
-            diagnostic->observed_count = fill_walk.count;
-            diagnostic->limit = count_walk.count;
+            diagnostic->observed_count = filled;
+            diagnostic->limit = counted;
             diagnostic->has_count = 1;
         }
         return 0;
     }
     uint32_t preferred_devices = 0;
-    if (!h3_ane_reduce_inventory(inventory, fill_walk.count, summary,
+    if (!h3_ane_reduce_inventory(inventory, filled, summary,
                                  &preferred_devices, diagnostic)) {
         free(inventory);
         return 0;
     }
     *operations = inventory;
-    *operation_count = fill_walk.count;
+    *operation_count = filled;
     return 1;
 }
 
@@ -744,30 +761,8 @@ static int real_plan(void *opaque, h3_ane_operation_usage *operations,
                 .child_count = real_child_count, .child_at = real_child_at,
                 .usage = real_usage,
             };
-            h3_ane_operation_usage *inventory = NULL;
-            size_t count = 0;
-            h3_ane_inventory_summary summary;
-            if (!h3_ane_collect_plan_tree(&adapter, &tree, &inventory, &count,
-                                          &summary, diagnostic))
-                return 0;
-            if (!operations) {
-                *operation_count = count;
-                free(inventory);
-                return 1;
-            }
-            if (*operation_count != count) {
-                free(inventory);
-                h3_ane_diagnostic_record_first(
-                    diagnostic, H3_ANE_STAGE_COMPUTE_PLAN,
-                    H3_ANE_CODE_OPERATION_INVENTORY_CHANGED,
-                    H3_ANE_REASON_ELIGIBILITY,
-                    "operation inventory changed between count and fill");
-                return 0;
-            }
-            memcpy(operations, inventory, count * sizeof(*operations));
-            free(inventory);
-            *operation_count = count;
-            return 1;
+            return h3_ane_walk_plan_tree(&adapter, &tree, operations,
+                                         operation_count, diagnostic);
         } @catch (__unused NSException *exception) {
             h3_ane_diagnostic_record_first(diagnostic,
                 H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_LOAD_FAILED,

@@ -11,6 +11,12 @@ typedef struct {
     void (*usage)(void *context, void *node, h3_ane_operation_usage *usage);
 } h3_ane_plan_tree_adapter;
 
+int h3_ane_walk_plan_tree(const h3_ane_plan_tree_adapter *adapter,
+                          void *context,
+                          h3_ane_operation_usage *operations,
+                          size_t *operation_count,
+                          h3_ane_diagnostic *diagnostic);
+
 int h3_ane_collect_plan_tree(const h3_ane_plan_tree_adapter *adapter,
                              void *context,
                              h3_ane_operation_usage **operations,
