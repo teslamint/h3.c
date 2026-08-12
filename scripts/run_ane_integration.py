@@ -13,6 +13,8 @@ import sys
 import tempfile
 import threading
 import time
+import hashlib
+import stat
 
 
 SCHEMA = "h3-ane-integration/v1"
@@ -56,15 +58,12 @@ DIAGNOSTIC_CODES = {
                      "operation_inventory_limit_exceeded",
                      "operation_nesting_limit_exceeded",
                      "operation_inventory_changed"},
-    "eligibility": {"operation_inventory_empty",
-                    "operation_inventory_limit_exceeded",
-                    "operation_nesting_limit_exceeded",
-                    "operation_inventory_changed", "operation_usage_unknown",
+    "eligibility": {"operation_usage_unknown",
                     "operation_not_neural_engine_supported", "device_unknown"},
     "input": {"input_shape_mismatch", "input_dtype_mismatch",
               "input_copy_failed"},
     "prediction": {"prediction_failed", "prediction_exception"},
-    "output": {"output_shape_mismatch", "output_dtype_mismatch",
+    "output": {"allocation_failed", "output_shape_mismatch", "output_dtype_mismatch",
                "output_copy_failed", "output_nonfinite"},
     "parity": {"parity_metrics_nonfinite", "parity_bounds_failed"},
     "publication": {"result_write_failed", "receipt_write_failed"},
@@ -311,6 +310,8 @@ def validate_qualification_diagnostic(document):
     if stage not in DIAGNOSTIC_CODES or code not in DIAGNOSTIC_CODES[stage] or \
             not isinstance(message, str) or not message or len(message) > 159:
         raise ValueError("invalid qualifier diagnostic taxonomy")
+    if stage == "eligibility" and operation is None:
+        raise ValueError("missing qualifier operation context")
     if operation is not None and (stage != "eligibility" or
                                   not isinstance(operation, str) or
                                   not operation or len(operation) > 95):
@@ -325,16 +326,23 @@ def validate_qualification_diagnostic(document):
                                   preferred not in DEVICE_LABELS or
                                   not devices or preferred not in devices):
         raise ValueError("invalid qualifier preferred device")
-    count_codes = {"allocation_failed", "operation_inventory_empty",
-                   "operation_inventory_limit_exceeded",
-                   "operation_nesting_limit_exceeded",
-                   "operation_inventory_changed"}
+    required_count_codes = {"operation_inventory_empty",
+                            "operation_inventory_limit_exceeded",
+                            "operation_nesting_limit_exceeded",
+                            "operation_inventory_changed"}
+    optional_count_codes = {"allocation_failed"}
     if observed is not None or limit is not None:
-        if stage != "compute_plan" or code not in count_codes or \
+        if stage != "compute_plan" or \
+                code not in required_count_codes | optional_count_codes or \
                 not isinstance(observed, int) or isinstance(observed, bool) or \
                 observed < 0 or not isinstance(limit, int) or \
                 isinstance(limit, bool) or limit < 0:
             raise ValueError("invalid qualifier count context")
+    elif stage == "compute_plan" and code in required_count_codes:
+        raise ValueError("missing qualifier count context")
+    elif stage != "compute_plan" or code not in optional_count_codes:
+        if observed is not None or limit is not None:
+            raise ValueError("forbidden qualifier count context")
     return {"stage": stage, "code": code, "message": message,
             "operation": operation, "supported_devices": devices,
             "preferred_device": preferred, "observed_count": observed,
@@ -379,6 +387,34 @@ def cleanup_authority():
         except FileNotFoundError:
             pass
     _authority_outputs.clear()
+
+
+def receipt_snapshot(path):
+    path = Path(path)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {"state": "absent"}
+    if not stat.S_ISREG(metadata.st_mode):
+        return {"state": "nonregular", "mode": stat.S_IFMT(metadata.st_mode),
+                "device": metadata.st_dev, "inode": metadata.st_ino}
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
+            raise OSError("receipt identity changed during snapshot")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 8192)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return {"state": "regular", "mode": metadata.st_mode,
+            "device": metadata.st_dev, "inode": metadata.st_ino,
+            "size": metadata.st_size, "mtime_ns": metadata.st_mtime_ns,
+            "sha256": digest.hexdigest()}
 
 
 def _overlaps(left, right):
@@ -466,6 +502,7 @@ def execute(args):
         qualification_output = work / "qualification.json"
         receipt_path = Path(f"{compiled}.qualification.json")
         _authority_outputs.update((qualification_output, receipt_path))
+        receipt_before = receipt_snapshot(receipt_path)
         qualifier_command = [qualifier]
         if args.mode == "shadow":
             qualifier_command.append("--shadow-only")
@@ -503,6 +540,15 @@ def execute(args):
                     inventory=inventory, stages={**stages, "qualification": 2},
                     artifacts=artifacts) from None
             if preflight_failed:
+                receipt_after = receipt_snapshot(receipt_path)
+                if receipt_after != receipt_before or \
+                        receipt_before.get("state") != "regular":
+                    raise StageFailure(
+                        "qualification", "unchanged receipt snapshot mismatch",
+                        code="invalid_result", source_sha256=source_sha,
+                        inventory=inventory,
+                        stages={**stages, "qualification": 2},
+                        artifacts=artifacts) from None
                 _authority_outputs.discard(receipt_path)
                 raise StageFailure(
                     diagnostic["stage"], diagnostic["message"],

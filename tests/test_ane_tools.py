@@ -653,6 +653,12 @@ raise SystemExit(1)
                         "preferred_device": "neural-engine"
                             if stage == "eligibility" else None,
                     }
+                    if stage == "compute_plan" and code in {
+                            "operation_inventory_empty",
+                            "operation_inventory_limit_exceeded",
+                            "operation_nesting_limit_exceeded",
+                            "operation_inventory_changed"}:
+                        document.update(observed_count=1, limit=1)
                     diagnostic = self.coordinator.validate_qualification_diagnostic(
                         document)
                     self.assertEqual(diagnostic["stage"], stage)
@@ -671,6 +677,29 @@ raise SystemExit(1)
             document[field] = value
             with self.assertRaises(ValueError):
                 self.coordinator.validate_qualification_diagnostic(document)
+        production = (ROOT / "h3_ane.m").read_text()
+        self.assertIn("H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_ALLOCATION_FAILED",
+                      production)
+        output_allocation = {
+            "failure_stage": "output", "failure_code": "allocation_failed",
+            "failure_reason": "output allocation failed",
+            "failure_operation": None, "supported_devices": None,
+            "preferred_device": None, "observed_count": None, "limit": None}
+        self.assertEqual(
+            self.coordinator.validate_qualification_diagnostic(output_allocation)[
+                "code"], "allocation_failed")
+        fabricated = dict(output_allocation, failure_stage="eligibility",
+                          failure_code="operation_inventory_empty")
+        with self.assertRaises(ValueError):
+            self.coordinator.validate_qualification_diagnostic(fabricated)
+        missing_operation = dict(output_allocation, failure_stage="eligibility",
+                                 failure_code="device_unknown")
+        with self.assertRaisesRegex(ValueError, "operation"):
+            self.coordinator.validate_qualification_diagnostic(missing_operation)
+        missing_count = dict(output_allocation, failure_stage="compute_plan",
+                             failure_code="operation_inventory_changed")
+        with self.assertRaisesRegex(ValueError, "count"):
+            self.coordinator.validate_qualification_diagnostic(missing_count)
 
     def test_shadow_propagates_nonparity_qualifier_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -723,15 +752,20 @@ raise SystemExit(1)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             converter, probe, qualifier = self.fixture_tools(root)
+            self.write_tool(converter, """
+import json, pathlib, sys
+package = pathlib.Path(sys.argv[sys.argv.index('--output') + 1]); package.mkdir()
+model = pathlib.Path(sys.argv[sys.argv.index('--compile-output') + 1]); model.mkdir()
+pathlib.Path(str(model) + '.qualification.json').write_text(json.dumps({
+    'version': 1, 'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
+    'test_vector': 'xorshift32-v1', 'qualified_at': '2026-08-12T00:00:00Z',
+    'max_abs': 0.001, 'relative_l2': 0.01, 'status': 'passed'}, sort_keys=True))
+print(json.dumps({'source_sha256': 'a' * 64}))
+""")
             self.write_tool(qualifier, """
 import json, pathlib, sys
 model = pathlib.Path(sys.argv[sys.argv.index('--coreml-model') + 1])
 receipt = pathlib.Path(str(model) + '.qualification.json')
-receipt_document = {
-    'version': 1, 'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
-    'test_vector': 'xorshift32-v1', 'qualified_at': '2026-08-12T00:00:00Z',
-    'max_abs': 0.001, 'relative_l2': 0.01, 'status': 'passed'}
-receipt.write_text(json.dumps(receipt_document, sort_keys=True))
 pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({
     'schema': 'h3-ane-qualification/v1', 'status': 'failed',
     'profile': 'shadow-measurement-v1', 'authority': False,
@@ -763,6 +797,50 @@ raise SystemExit(2)
             self.assertEqual(document["diagnostic"]["stage"], "receipt")
             receipt = Path(f"{work / 'visual-block.mlmodelc'}.qualification.json")
             self.assertEqual(json.loads(receipt.read_text())["status"], "passed")
+
+    def test_shadow_coordinator_rejects_changed_unchanged_authority_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            converter, probe, qualifier = self.fixture_tools(root)
+            self.write_tool(converter, """
+import json, pathlib, sys
+pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).mkdir()
+model = pathlib.Path(sys.argv[sys.argv.index('--compile-output') + 1]); model.mkdir()
+pathlib.Path(str(model) + '.qualification.json').write_text('original-authority')
+print(json.dumps({'source_sha256': 'a' * 64}))
+""")
+            self.write_tool(qualifier, """
+import json, pathlib, sys
+model = pathlib.Path(sys.argv[sys.argv.index('--coreml-model') + 1])
+pathlib.Path(str(model) + '.qualification.json').write_text('changed-authority')
+pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({
+    'schema': 'h3-ane-qualification/v1', 'status': 'failed',
+    'profile': 'shadow-measurement-v1', 'authority': False,
+    'measurement_started': False, 'authority_state': 'unchanged',
+    'bounds': {'max_abs': 0.25, 'relative_l2': 0.05},
+    'threshold_outcome': False, 'receipt_path': None,
+    'failure_stage': 'receipt', 'failure_code': 'receipt_invalid',
+    'failure_reason': 'receipt quarantine preflight failed',
+    'failure_operation': None, 'supported_devices': None,
+    'preferred_device': None, 'observed_count': None, 'limit': None}))
+raise SystemExit(2)
+""")
+            output = root / "summary.json"; weights = root / "weights"
+            weights.mkdir(); work = root / "work"
+            env = os.environ.copy(); env.update({
+                "H3_ANE_INTEGRATION_CONVERTER": str(converter),
+                "H3_ANE_INTEGRATION_PROBE": str(probe),
+                "H3_ANE_INTEGRATION_QUALIFIER": str(qualifier)})
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                 "shadow", "--repo", str(ROOT), "--work-dir", str(work),
+                 "--output", str(output), "--weights", str(weights)],
+                env=env, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 1)
+            document = json.loads(output.read_text())
+            self.assertEqual(document["diagnostic"]["code"], "invalid_result")
+            self.assertFalse(Path(
+                f"{work / 'visual-block.mlmodelc'}.qualification.json").exists())
 
     def test_production_compute_plan_pairs_propagate_exactly(self):
         production = (ROOT / "h3_ane.m").read_text()
@@ -1559,6 +1637,41 @@ class NativeToolTests(unittest.TestCase):
             self.assertEqual(document["failure_stage"], "receipt")
             self.assertEqual(document["failure_code"], "receipt_invalid")
             self.assertFalse(list(receipt.parent.glob(receipt.name + ".preflight-*")))
+
+    def test_shadow_post_preflight_invalidation_failure_is_structured(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); model, receipt = self.seed_valid_receipt(root)
+            original = receipt.read_bytes(); output = root / "result" / "shadow.json"
+            output.parent.mkdir(); marker = root / "preflight-complete"
+            release = output.parent / "release"; measurement = output.parent / "measured"
+            env = {**os.environ, "H3_ANE_TEST_METRICS": "0.19,0.038",
+                   "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+                   "H3_ANE_TEST_PAUSE_AFTER_PREFLIGHT": str(marker),
+                   "H3_ANE_TEST_RELEASE_PREFLIGHT": str(release),
+                   "H3_ANE_TEST_MEASUREMENT_MARKER": str(measurement)}
+            process = subprocess.Popen(
+                [str(ROOT / "h3_ane_qualification_test"), "--shadow-only",
+                 "--model", "unused", "--coreml-model", str(model),
+                 "--output", str(output)], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for _ in range(200):
+                if marker.exists(): break
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            os.chmod(model.parent, 0o555)
+            try:
+                release.write_text("continue")
+                process.wait(timeout=5); process.communicate()
+            finally:
+                os.chmod(model.parent, 0o755)
+            self.assertEqual(process.returncode, 2)
+            self.assertEqual(receipt.read_bytes(), original)
+            self.assertFalse(measurement.exists())
+            document = json.loads(output.read_text())
+            self.assertFalse(document["measurement_started"])
+            self.assertEqual(document["authority_state"], "unchanged")
+            self.assertEqual(document["failure_stage"], "receipt")
+            self.assertEqual(document["failure_code"], "receipt_invalid")
 
     def test_result_write_failure_is_stderr_only_and_leaves_no_receipt(self):
         with tempfile.TemporaryDirectory() as root:

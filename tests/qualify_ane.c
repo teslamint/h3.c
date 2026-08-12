@@ -490,6 +490,8 @@ int main(int argc, char **argv) {
     }
     if (!invalidate_receipt(receipt, invalid)) {
         sigprocmask(SIG_SETMASK, &previous_signals, NULL);
+        if (shadow_only && !write_shadow_preflight_failure(output))
+            fprintf(stderr, "h3_ane_qualification: receipt/invalidation_failed\n");
         free(receipt); free(invalid); return 2;
     }
     if (sigprocmask(SIG_SETMASK, &previous_signals, NULL) != 0) {
