@@ -411,7 +411,7 @@ class IntegrationCoordinatorTests(unittest.TestCase):
         inventory = inventory or {
             "total": 441, "constant": 292, "nonconstant": 149,
             "neural_engine_supported": 149, "cpu_only": 0, "gpu_only": 0,
-            "unknown_nonconstant": 0, "constant_nil_usage": 0,
+            "unknown_nonconstant": 0, "constant_nil_usage": 292,
         }
         self.write_tool(converter, """
 import json, pathlib, sys
@@ -463,6 +463,10 @@ assert '--shadow-only' in sys.argv
 model = pathlib.Path(sys.argv[sys.argv.index('--coreml-model') + 1])
 output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
 receipt = pathlib.Path(str(model) + '.qualification.json')
+receipt.write_text(json.dumps({
+    'version': 1, 'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
+    'test_vector': 'xorshift32-v1', 'qualified_at': '2026-08-12T00:00:00Z',
+    'max_abs': 0.001, 'relative_l2': 0.01, 'status': 'passed'}))
 receipt.unlink(missing_ok=True)
 output.write_text(json.dumps({
     'schema': 'h3-ane-qualification/v1', 'status': 'passed',
@@ -563,6 +567,62 @@ output.write_text(json.dumps({
                              "shadow_authority_violation")
             self.assertIsNone(document["receipt"])
 
+    def test_shadow_failure_preserves_diagnostic_and_removes_authority(self):
+        cases = (("parity_bounds_failed", 0.25, 0.04),
+                 ("parity_metrics_nonfinite", None, 0.04))
+        for code, max_abs, relative_l2 in cases:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                converter, probe, qualifier = self.fixture_tools(root)
+                self.write_tool(qualifier, f"""
+import json, pathlib, sys
+model = pathlib.Path(sys.argv[sys.argv.index('--coreml-model') + 1])
+receipt = pathlib.Path(str(model) + '.qualification.json')
+receipt.write_text(json.dumps({{
+    'version': 1, 'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
+    'test_vector': 'xorshift32-v1', 'qualified_at': '2026-08-12T00:00:00Z',
+    'max_abs': 0.001, 'relative_l2': 0.01, 'status': 'passed'}}))
+receipt.unlink()
+pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({{
+    'schema': 'h3-ane-qualification/v1', 'status': 'failed',
+    'profile': 'shadow-measurement-v1', 'authority': False,
+    'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
+    'max_abs': {max_abs!r}, 'relative_l2': {relative_l2!r},
+    'bounds': {{'max_abs': 0.25, 'relative_l2': 0.05}},
+    'threshold_outcome': False, 'receipt_path': None,
+    'failure_stage': 'parity', 'failure_code': {code!r},
+    'failure_reason': 'parity qualification failed',
+    'failure_operation': 'fixture-op',
+    'supported_devices': ['cpu', 'neural-engine'],
+    'preferred_device': 'neural-engine'}}))
+raise SystemExit(1)
+""")
+                output = root / "summary.json"
+                weights = root / "weights"; weights.mkdir()
+                env = os.environ.copy()
+                env.update({"H3_ANE_INTEGRATION_CONVERTER": str(converter),
+                            "H3_ANE_INTEGRATION_PROBE": str(probe),
+                            "H3_ANE_INTEGRATION_QUALIFIER": str(qualifier)})
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                     "shadow", "--repo", str(ROOT),
+                     "--work-dir", str(root / "work"), "--output", str(output),
+                     "--weights", str(weights)], env=env, text=True,
+                    capture_output=True, check=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                document = json.loads(output.read_text())
+                self.assertEqual(document["diagnostic"], {
+                    "stage": "parity", "code": code,
+                    "message": "parity qualification failed",
+                    "operation": "fixture-op",
+                    "supported_devices": ["cpu", "neural-engine"],
+                    "preferred_device": "neural-engine"})
+                self.assertEqual(document["parity"], {
+                    "max_abs": max_abs, "relative_l2": relative_l2})
+                self.assertIsNone(document["receipt"])
+                self.assertFalse(Path(
+                    f"{root / 'work' / 'visual-block.mlmodelc'}.qualification.json").exists())
+
     def test_exact_synthetic_fixture_contract_has_only_eight_pinned_tensors(self):
         self.assertEqual(len(self.coordinator.TENSOR_SHAPES), 8)
         self.assertEqual(self.coordinator.TENSOR_SHAPES[
@@ -601,7 +661,7 @@ output.write_text(json.dumps({
             root = Path(directory)
             tools = self.fixture_tools(root, dict(total=441, constant=292,
                 nonconstant=149, neural_engine_supported=148, cpu_only=1,
-                gpu_only=0, unknown_nonconstant=0, constant_nil_usage=0))
+                gpu_only=0, unknown_nonconstant=0, constant_nil_usage=292))
             result, output, _, _ = self.run_real(root, tools)
             self.assertEqual(result.returncode, 1)
             document = json.loads(output.read_text())
@@ -609,6 +669,46 @@ output.write_text(json.dumps({
             self.assertIsNone(document["receipt"])
             self.assertLessEqual(len(document["diagnostic"]["message"]), 160)
             self.assertNotIn(str(root), output.read_text())
+
+    def test_inventory_is_closed_and_summary_is_size_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = dict(self.coordinator.EXPECTED_INVENTORY, extra=0)
+            result, output, _, _ = self.run_real(
+                root, self.fixture_tools(root, inventory))
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(json.loads(output.read_text())["diagnostic"]["stage"],
+                             "eligibility")
+            oversized = root / "oversized.json"
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                self.coordinator.atomic_json(
+                    oversized, {"value": "x" * self.coordinator.SUMMARY_LIMIT})
+            self.assertFalse(oversized.exists())
+
+    def test_output_aliases_are_rejected_before_work_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            converter, probe, qualifier = self.fixture_tools(root)
+            env = os.environ.copy()
+            env.update({"H3_ANE_INTEGRATION_CONVERTER": str(converter),
+                        "H3_ANE_INTEGRATION_PROBE": str(probe),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(qualifier)})
+            weights = root / "weights"; weights.mkdir()
+            for name in (".", "work", "work/visual-block.mlpackage",
+                         "work/visual-block.mlmodelc/inside.json",
+                         "work/qualification.json",
+                         "work/visual-block.mlmodelc.qualification.json"):
+                with self.subTest(output=name):
+                    work = root / "work"
+                    output = root / name
+                    result = subprocess.run(
+                        [sys.executable,
+                         str(ROOT / "scripts/run_ane_integration.py"), "shadow",
+                         "--repo", str(ROOT), "--work-dir", str(work),
+                         "--output", str(output), "--weights", str(weights)],
+                        env=env, text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertFalse(work.exists())
 
     def test_child_failure_is_stable_and_does_not_publish_private_stderr(self):
         with tempfile.TemporaryDirectory(prefix="private-integration-") as directory:
@@ -684,7 +784,7 @@ pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({
     'source_sha256': 'd' * 64, 'inventory': {
         'total': 441, 'constant': 292, 'nonconstant': 149,
         'neural_engine_supported': 149, 'cpu_only': 0, 'gpu_only': 0,
-        'unknown_nonconstant': 0, 'constant_nil_usage': 0},
+        'unknown_nonconstant': 0, 'constant_nil_usage': 292},
     'diagnostic': None}))
 """)
             result, output, _, _ = self.run_real(root, tools)
@@ -937,11 +1037,29 @@ class NativeToolTests(unittest.TestCase):
         return subprocess.run(command, env=env, text=True,
                               capture_output=True, check=False), model, Path(output)
 
+    def seed_valid_receipt(self, root):
+        root = Path(root)
+        model = root / "model.mlmodelc"
+        model.mkdir(exist_ok=True)
+        (model / "weights.bin").write_bytes(b"model")
+        result = subprocess.run(
+            [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+             "--coreml-model", str(model), "--output", str(root / "strict.json")],
+            env={**os.environ, "H3_ANE_TEST_METRICS": "0.001,0.01",
+                 "H3_ANE_TEST_SOURCE_SHA256": "1" * 64},
+            text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = Path(f"{model}.qualification.json")
+        self.assertEqual(json.loads(receipt.read_text())["status"], "passed")
+        return model, receipt
+
     def test_shadow_bounds_profile_and_strict_threshold_preservation(self):
         cases = [("0.249999,0.049999", 0), ("0.25,0.049", 1),
-                 ("0.24,0.05", 1), ("nan,0.01", 1), ("0.1,inf", 1)]
+                 ("0.24,0.05", 1), ("nan,0.01", 1), ("0.1,inf", 1),
+                 ("-0.001,0.01", 1), ("0.01,-0.001", 1)]
         for metrics, expected in cases:
             with self.subTest(metrics=metrics), tempfile.TemporaryDirectory() as root:
+                _, receipt = self.seed_valid_receipt(root)
                 result, model, output = self.run_shadow(root, metrics)
                 self.assertEqual(result.returncode, expected, result.stderr)
                 document = json.loads(output.read_text())
@@ -950,9 +1068,18 @@ class NativeToolTests(unittest.TestCase):
                 self.assertEqual(document["bounds"], {
                     "max_abs": 0.25, "relative_l2": 0.05})
                 self.assertIsNone(document["receipt_path"])
-                self.assertFalse(Path(f"{model}.qualification.json").exists())
+                self.assertFalse(receipt.exists())
+                self.assertEqual(document["failure_stage"],
+                                 None if expected == 0 else "parity")
+                if "nan" in metrics or "inf" in metrics:
+                    self.assertEqual(document["failure_code"],
+                                     "parity_metrics_nonfinite")
+                elif expected:
+                    self.assertEqual(document["failure_code"],
+                                     "parity_bounds_failed")
         with tempfile.TemporaryDirectory() as root:
-            result, model, _ = self.run_shadow(root, "0.19,0.038")
+            model, _ = self.seed_valid_receipt(root)
+            result, model, shadow_output = self.run_shadow(root, "0.19,0.038")
             self.assertEqual(result.returncode, 0)
             strict = subprocess.run(
                 [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
@@ -962,17 +1089,24 @@ class NativeToolTests(unittest.TestCase):
                 capture_output=True, check=False)
             self.assertEqual(strict.returncode, 1)
             self.assertFalse(Path(f"{model}.qualification.json").exists())
+            strict_document = json.loads((Path(root) / "strict.json").read_text())
+            failed_shadow, _, shadow_output = self.run_shadow(root, "0.25,0.01")
+            self.assertEqual(failed_shadow.returncode, 1)
+            shadow_document = json.loads(shadow_output.read_text())
+            for field in ("failure_reason", "failure_stage", "failure_code",
+                          "failure_operation", "supported_devices",
+                          "preferred_device"):
+                self.assertEqual(shadow_document[field], strict_document[field])
 
     def test_shadow_invalidates_stale_receipt_and_cancellation_is_atomic(self):
         with tempfile.TemporaryDirectory() as root:
-            root = Path(root); model = root / "model.mlmodelc"; model.mkdir()
-            (model / "weights.bin").write_bytes(b"model")
-            receipt = Path(f"{model}.qualification.json"); receipt.write_text("stale")
+            root = Path(root); model, receipt = self.seed_valid_receipt(root)
             result, _, output = self.run_shadow(root, "0.19,0.038")
             self.assertEqual(result.returncode, 0)
             self.assertFalse(receipt.exists())
             self.assertTrue(Path(f"{receipt}.invalid").exists())
             output.unlink()
+            _, receipt = self.seed_valid_receipt(root)
             marker = root / "synced"
             process_env = {"H3_ANE_TEST_PAUSE_BEFORE_RENAME": str(marker),
                            "H3_ANE_TEST_PAUSE_SUFFIX": "shadow.json"}
@@ -994,14 +1128,23 @@ class NativeToolTests(unittest.TestCase):
 
     def test_shadow_result_write_failure_leaves_no_authority(self):
         with tempfile.TemporaryDirectory() as root:
-            root = Path(root); model = root / "model.mlmodelc"; model.mkdir()
-            (model / "weights.bin").write_bytes(b"model")
-            receipt = Path(f"{model}.qualification.json"); receipt.write_text("stale")
+            root = Path(root); _, receipt = self.seed_valid_receipt(root)
             result, _, _ = self.run_shadow(
                 root, "0.19,0.038", output=root / "absent" / "shadow.json")
             self.assertEqual(result.returncode, 2)
             self.assertFalse(receipt.exists())
             self.assertTrue(Path(f"{receipt}.invalid").exists())
+
+    def test_shadow_invalidation_rename_conflict_removes_runtime_authority(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); _, receipt = self.seed_valid_receipt(root)
+            invalid = Path(f"{receipt}.invalid")
+            invalid.mkdir()
+            result, _, output = self.run_shadow(root, "0.19,0.038")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(output.read_text())["status"], "passed")
+            self.assertFalse(receipt.exists())
+            self.assertTrue(invalid.is_dir())
 
     def test_result_write_failure_is_stderr_only_and_leaves_no_receipt(self):
         with tempfile.TemporaryDirectory() as root:

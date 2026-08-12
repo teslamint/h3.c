@@ -67,7 +67,9 @@ static int atomic_open(const char *path) {
 
 static int atomic_finish(FILE *stream, const char *path) {
     int descriptor = fileno(stream);
-    int ok = fflush(stream) == 0 && fsync(descriptor) == 0 && fclose(stream) == 0;
+    int ok = fflush(stream) == 0;
+    if (fsync(descriptor) != 0) ok = 0;
+    if (fclose(stream) != 0) ok = 0;
 #ifdef H3_ANE_TOOL_TESTING
     atomic_finish_count++;
     const char *pause_marker = getenv("H3_ANE_TEST_PAUSE_BEFORE_RENAME");
@@ -226,6 +228,9 @@ static int write_receipt(const char *path, const char *model_sha,
 static int result_write_count;
 #endif
 
+static void write_diagnostic_fields(FILE *stream, const char *failure,
+                                    const h3_ane_diagnostic *diagnostic);
+
 static int write_result(const char *path, int passed, const char *model_sha,
                         const char *source_sha, const char *qualified_at,
                         double max_abs, double relative_l2,
@@ -252,6 +257,13 @@ static int write_result(const char *path, int passed, const char *model_sha,
             max_abs, relative_l2);
     if (passed) json_string(stream, "compiled-model.qualification.json");
     else fputs("null", stream);
+    write_diagnostic_fields(stream, failure, diagnostic);
+    fputs("}\n", stream);
+    return atomic_finish(stream, path);
+}
+
+static void write_diagnostic_fields(FILE *stream, const char *failure,
+                                    const h3_ane_diagnostic *diagnostic) {
     fputs(",\"failure_reason\":", stream);
     if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE)
         json_string(stream, diagnostic->message);
@@ -292,8 +304,23 @@ static int write_result(const char *path, int passed, const char *model_sha,
             "neural-engine" : NULL;
         if (device) json_string(stream, device); else fputs("null", stream);
     } else fputs("null", stream);
-    fputs("}\n", stream);
-    return atomic_finish(stream, path);
+}
+
+static int invalidate_receipt(const char *receipt, const char *invalid) {
+    if (access(receipt, F_OK) != 0) return 1;
+    unlink(invalid);
+    if (rename(receipt, invalid) == 0) return 1;
+    int rename_error = errno;
+    if (unlink(receipt) == 0) return 1;
+    int descriptor = open(receipt, O_WRONLY | O_TRUNC);
+    if (descriptor >= 0) {
+        int ok = fsync(descriptor) == 0;
+        if (close(descriptor) != 0) ok = 0;
+        if (ok) return 1;
+    }
+    fprintf(stderr, "h3_ane_qualification: cannot invalidate old receipt: %s\n",
+            strerror(rename_error));
+    return 0;
 }
 
 static int write_shadow_result(const char *path, int passed,
@@ -318,11 +345,8 @@ static int write_shadow_result(const char *path, int passed,
     fputs(",\"bounds\":{\"max_abs\":0.25,\"relative_l2\":0.05},"
           "\"threshold_outcome\":", stream);
     fputs(passed ? "true" : "false", stream);
-    fputs(",\"receipt_path\":null,\"failure_reason\":", stream);
-    if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE)
-        json_string(stream, diagnostic->message);
-    else if (failure) json_string(stream, failure);
-    else fputs("null", stream);
+    fputs(",\"receipt_path\":null", stream);
+    write_diagnostic_fields(stream, failure, diagnostic);
     fputs("}\n", stream);
     return atomic_finish(stream, path);
 }
@@ -366,13 +390,8 @@ int main(int argc, char **argv) {
     if (!receipt || !invalid) return 2;
     snprintf(receipt, receipt_size, "%s.qualification.json", model);
     snprintf(invalid, receipt_size + sizeof(".invalid"), "%s.invalid", receipt);
-    if (access(receipt, F_OK) == 0) {
-        unlink(invalid);
-        if (rename(receipt, invalid) != 0) {
-            fprintf(stderr, "h3_ane_qualification: cannot invalidate old receipt: %s\n",
-                    strerror(errno));
-            free(receipt); free(invalid); return 2;
-        }
+    if (!invalidate_receipt(receipt, invalid)) {
+        free(receipt); free(invalid); return 2;
     }
     pause_after_invalidation_if_requested();
 
@@ -397,6 +416,7 @@ int main(int argc, char **argv) {
     double max_abs_bound = shadow_only ? 0.25 : 0.002;
     double relative_l2_bound = shadow_only ? 0.05 : 0.02;
     int passed = measured && isfinite(max_abs) && isfinite(relative_l2) &&
+                 max_abs >= 0.0 && relative_l2 >= 0.0 &&
                  max_abs < max_abs_bound && relative_l2 < relative_l2_bound;
     const char *failure = NULL;
     if (!measured) failure = error[0] ? error : "qualification execution failed";

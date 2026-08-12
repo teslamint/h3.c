@@ -17,6 +17,7 @@ import time
 
 SCHEMA = "h3-ane-integration/v1"
 CAPTURE_LIMIT = 65536
+SUMMARY_LIMIT = 16384
 PREFIX = "encoder.down.0.block.0"
 TENSOR_SHAPES = {
     f"{PREFIX}.norm1.weight": (128,),
@@ -30,10 +31,13 @@ TENSOR_SHAPES = {
 }
 EXPECTED_INVENTORY = {
     "total": 441,
+    "constant": 292,
     "nonconstant": 149,
     "neural_engine_supported": 149,
     "cpu_only": 0,
+    "gpu_only": 0,
     "unknown_nonconstant": 0,
+    "constant_nil_usage": 292,
 }
 
 _child = None
@@ -46,7 +50,8 @@ WORK_MARKER = ".h3-ane-integration-owned"
 
 class StageFailure(RuntimeError):
     def __init__(self, stage, message, *, source_sha256=None, inventory=None,
-                 code=None, parity=None, stages=None, artifacts=None):
+                 code=None, parity=None, stages=None, artifacts=None,
+                 diagnostic=None):
         super().__init__(message)
         self.stage = stage
         self.source_sha256 = source_sha256
@@ -55,6 +60,11 @@ class StageFailure(RuntimeError):
         self.parity = parity
         self.stages = stages or {}
         self.artifacts = artifacts
+        self.diagnostic = diagnostic
+
+
+class UnsafeOutput(ValueError):
+    pass
 
 
 def _cancel(signum, _frame):
@@ -139,14 +149,16 @@ def run_command(argv, stage, cwd=None, env=None, allow_failure=False):
 
 def atomic_json(path, document):
     path = Path(path)
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    if len(encoded.encode("utf-8")) > SUMMARY_LIMIT:
+        raise ValueError("integration summary exceeds size limit")
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.tmp-",
                                              dir=path.parent)
     _temporary_outputs.add(temporary)
     try:
         with os.fdopen(descriptor, "w") as stream:
-            json.dump(document, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
+            stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -192,13 +204,14 @@ def _digest(value):
 
 
 def _failed(mode, failure):
+    diagnostic = failure.diagnostic or {
+        "stage": failure.stage, "code": failure.code,
+        "message": str(failure)[:160]}
     return {"schema": SCHEMA, "status": "failed", "mode": mode,
             "profile": "shadow-measurement-v1" if mode == "shadow" else None,
             "authority": False if mode == "shadow" else None,
             "source_sha256": failure.source_sha256,
-            "inventory": failure.inventory, "diagnostic": {
-                "stage": failure.stage, "code": failure.code,
-                "message": str(failure)[:160]},
+            "inventory": failure.inventory, "diagnostic": diagnostic,
             "parity": failure.parity, "receipt": None,
             "artifacts": failure.artifacts, "stages": failure.stages}
 
@@ -226,10 +239,29 @@ def cleanup_authority():
     _authority_outputs.clear()
 
 
+def _overlaps(left, right):
+    left, right = Path(left), Path(right)
+    return left == right or left in right.parents or right in left.parents
+
+
+def validate_output_path(output, work):
+    protected = (
+        work,
+        work / "visual-block.mlpackage",
+        work / "visual-block.mlmodelc",
+        work / "probe.json",
+        work / "qualification.json",
+        Path(f"{work / 'visual-block.mlmodelc'}.qualification.json"),
+    )
+    if any(_overlaps(output, path) for path in protected):
+        raise UnsafeOutput("output path overlaps coordinator work artifacts")
+
+
 def execute(args):
     repo = Path(args.repo).resolve()
     work = Path(args.work_dir).resolve()
     output = Path(args.output).resolve()
+    validate_output_path(output, work)
     if args.mode in ("real", "shadow") and not args.weights:
         raise StageFailure("setup", "--weights is required in real or shadow mode")
     work = prepare_work_directory(work)
@@ -280,9 +312,9 @@ def execute(args):
                            code="digest_mismatch", source_sha256=source_sha,
                            inventory=inventory, stages=stages,
                            artifacts=artifacts)
-    if not isinstance(inventory, dict) or any(
-            inventory.get(key) != value for key, value in EXPECTED_INVENTORY.items()):
+    if not isinstance(inventory, dict) or inventory != EXPECTED_INVENTORY:
         raise StageFailure("eligibility", "unexpected production inventory")
+    inventory = dict(EXPECTED_INVENTORY)
     parity = receipt = None
     if args.mode in ("real", "shadow"):
         qualification_output = work / "qualification.json"
@@ -300,15 +332,63 @@ def execute(args):
             if not qualification_output.exists():
                 raise
             failed = json.loads(qualification_output.read_text())
+            diagnostic = {
+                "stage": failed.get("failure_stage"),
+                "code": failed.get("failure_code"),
+                "message": failed.get("failure_reason"),
+                "operation": failed.get("failure_operation"),
+                "supported_devices": failed.get("supported_devices"),
+                "preferred_device": failed.get("preferred_device"),
+            }
+            parity = {"max_abs": failed.get("max_abs"),
+                      "relative_l2": failed.get("relative_l2")}
+            if args.mode == "shadow":
+                code = failed.get("failure_code")
+                expected_outcome = code in (
+                    "parity_bounds_failed", "parity_metrics_nonfinite")
+                metrics_finite = all(
+                    isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) for value in parity.values())
+                code_matches_metrics = (
+                    code == "parity_bounds_failed" and metrics_finite and
+                    (parity["max_abs"] < 0 or parity["relative_l2"] < 0 or
+                     parity["max_abs"] >= 0.25 or
+                     parity["relative_l2"] >= 0.05)) or (
+                    code == "parity_metrics_nonfinite" and
+                    not metrics_finite)
+                if failed.get("status") != "failed" or \
+                        failed.get("profile") != "shadow-measurement-v1" or \
+                        failed.get("authority") is not False or \
+                        failed.get("bounds") != {
+                            "max_abs": 0.25, "relative_l2": 0.05} or \
+                        failed.get("threshold_outcome") is not False or \
+                        failed.get("receipt_path") is not None or \
+                        receipt_path.exists() or not expected_outcome:
+                    raise StageFailure(
+                        "qualification",
+                        "shadow failure authority contract failed",
+                        code="shadow_authority_violation",
+                        source_sha256=source_sha, inventory=inventory,
+                        stages={**stages, "qualification": 1},
+                        artifacts=artifacts)
+                if not code_matches_metrics or \
+                        failed.get("model_sha256") != artifacts["model_sha256"] or \
+                        failed.get("source_sha256") != source_sha:
+                    raise StageFailure(
+                        "qualification",
+                        "shadow failure diagnostic contract failed",
+                        code="shadow_authority_violation",
+                        source_sha256=source_sha, inventory=inventory,
+                        stages={**stages, "qualification": 1},
+                        artifacts=artifacts)
             raise StageFailure(
                 failed.get("failure_stage") or "qualification",
                 failed.get("failure_reason") or "qualification failed",
                 source_sha256=source_sha, inventory=inventory,
-                code=failed.get("failure_code"), parity={
-                    "max_abs": failed.get("max_abs"),
-                    "relative_l2": failed.get("relative_l2")},
+                code=failed.get("failure_code"), parity=parity,
                 stages={**stages, "qualification": 1},
-                artifacts=artifacts)
+                artifacts=artifacts,
+                diagnostic=diagnostic if args.mode == "shadow" else None)
         stages["qualification"] = 0
         qualification = json.loads(qualification_output.read_text())
         if args.mode == "shadow":
@@ -384,6 +464,9 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, _cancel)
     try:
         return execute(args)
+    except UnsafeOutput as exc:
+        print(f"run_ane_integration.py: setup: {exc}", file=sys.stderr)
+        return 2
     except StageFailure as exc:
         cleanup_authority()
         atomic_json(args.output, _failed(args.mode, exc))
