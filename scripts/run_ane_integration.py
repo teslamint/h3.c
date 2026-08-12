@@ -48,9 +48,10 @@ DIAGNOSTIC_CODES = {
     "artifact": {"compiled_model_unreadable", "compiled_model_digest_failed",
                  "source_weights_unreadable", "source_tensor_digest_failed"},
     "contract": {"metadata_missing", "metadata_mismatch",
-                 "fingerprint_mismatch", "shape_mismatch", "dtype_mismatch"},
+                 "shape_mismatch", "dtype_mismatch"},
     "receipt": {"receipt_missing", "receipt_malformed",
-                "receipt_digest_mismatch", "receipt_invalid"},
+                "fingerprint_mismatch", "receipt_digest_mismatch",
+                "receipt_invalid"},
     "load": {"model_load_failed", "model_load_exception"},
     "compute_plan": {"allocation_failed", "plan_timeout", "plan_load_failed",
                      "program_missing", "main_missing",
@@ -326,11 +327,10 @@ def validate_qualification_diagnostic(document):
                                   preferred not in DEVICE_LABELS or
                                   not devices or preferred not in devices):
         raise ValueError("invalid qualifier preferred device")
-    required_count_codes = {"operation_inventory_empty",
-                            "operation_inventory_limit_exceeded",
-                            "operation_nesting_limit_exceeded",
+    required_count_codes = {"operation_nesting_limit_exceeded",
                             "operation_inventory_changed"}
-    optional_count_codes = {"allocation_failed"}
+    optional_count_codes = {"allocation_failed", "operation_inventory_empty",
+                            "operation_inventory_limit_exceeded"}
     if observed is not None or limit is not None:
         if stage != "compute_plan" or \
                 code not in required_count_codes | optional_count_codes or \

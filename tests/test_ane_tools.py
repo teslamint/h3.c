@@ -700,6 +700,31 @@ raise SystemExit(1)
                              failure_code="operation_inventory_changed")
         with self.assertRaisesRegex(ValueError, "count"):
             self.coordinator.validate_qualification_diagnostic(missing_count)
+        receipt_fingerprint = dict(
+            output_allocation, failure_stage="receipt",
+            failure_code="fingerprint_mismatch")
+        self.assertEqual(
+            self.coordinator.validate_qualification_diagnostic(
+                receipt_fingerprint)["code"], "fingerprint_mismatch")
+        contract_fingerprint = dict(
+            output_allocation, failure_stage="contract",
+            failure_code="fingerprint_mismatch")
+        with self.assertRaisesRegex(ValueError, "taxonomy"):
+            self.coordinator.validate_qualification_diagnostic(
+                contract_fingerprint)
+        for code in ("operation_inventory_empty",
+                     "operation_inventory_limit_exceeded"):
+            optional = dict(output_allocation, failure_stage="compute_plan",
+                            failure_code=code)
+            self.coordinator.validate_qualification_diagnostic(optional)
+            optional.update(observed_count=0, limit=4096)
+            self.coordinator.validate_qualification_diagnostic(optional)
+        for code in ("operation_nesting_limit_exceeded",
+                     "operation_inventory_changed"):
+            required = dict(output_allocation, failure_stage="compute_plan",
+                            failure_code=code)
+            with self.assertRaisesRegex(ValueError, "count"):
+                self.coordinator.validate_qualification_diagnostic(required)
 
     def test_shadow_propagates_nonparity_qualifier_failure(self):
         with tempfile.TemporaryDirectory() as directory:
