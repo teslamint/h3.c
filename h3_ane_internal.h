@@ -17,6 +17,11 @@ int h3_ane_collect_plan_tree(const h3_ane_plan_tree_adapter *adapter,
                              size_t *operation_count,
                              h3_ane_inventory_summary *summary,
                              h3_ane_diagnostic *diagnostic);
+int h3_ane_reduce_inventory(const h3_ane_operation_usage *operations,
+                            size_t operation_count,
+                            h3_ane_inventory_summary *summary,
+                            uint32_t *preferred_devices,
+                            h3_ane_diagnostic *diagnostic);
 
 h3_ane *h3_ane_create_authorized(const char *model_path,
                                  const h3_ane_contract *contract, int shadow,

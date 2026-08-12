@@ -364,7 +364,6 @@ typedef struct {
     h3_ane_operation_usage *operations;
     size_t capacity;
     size_t count;
-    h3_ane_inventory_summary summary;
     h3_ane_diagnostic *diagnostic;
 } plan_walk;
 
@@ -392,58 +391,17 @@ static int walk_plan_node(plan_walk *walk, void *node, size_t depth) {
             walk, H3_ANE_CODE_OPERATION_INVENTORY_LIMIT_EXCEEDED,
             (uint64_t)walk->count + 1, H3_ANE_MAX_OPERATIONS,
             "operation inventory limit exceeded");
-    h3_ane_operation_usage usage = {0};
-    walk->adapter->usage(walk->context, node, &usage);
     if (walk->operations) {
         if (walk->count >= walk->capacity)
             return record_inventory_failure(
                 walk, H3_ANE_CODE_OPERATION_INVENTORY_CHANGED,
                 (uint64_t)walk->count + 1, walk->capacity,
                 "operation inventory changed between count and fill");
+        h3_ane_operation_usage usage = {0};
+        walk->adapter->usage(walk->context, node, &usage);
         walk->operations[walk->count] = usage;
     }
     walk->count++;
-    walk->summary.total++;
-    if (usage.is_constant) {
-        walk->summary.constant++;
-        if (usage.supported_devices == 0 && usage.preferred_device == 0)
-            walk->summary.constant_nil_usage++;
-    } else {
-        walk->summary.nonconstant++;
-        if (usage.supported_devices == 0 || usage.preferred_device == 0) {
-            walk->summary.unknown_nonconstant++;
-            h3_ane_code code = usage.supported_devices == 0 ?
-                H3_ANE_CODE_OPERATION_USAGE_UNKNOWN : H3_ANE_CODE_DEVICE_UNKNOWN;
-            h3_ane_diagnostic_record_first(
-                walk->diagnostic, H3_ANE_STAGE_ELIGIBILITY, code,
-                H3_ANE_REASON_ELIGIBILITY,
-                usage.supported_devices == 0 ?
-                    "operation device usage is unknown" :
-                    "operation preferred device is unknown");
-        } else if (usage.supported_devices & H3_ANE_DEVICE_NEURAL_ENGINE) {
-            walk->summary.neural_engine_supported++;
-        } else {
-            if (usage.supported_devices == H3_ANE_DEVICE_CPU)
-                walk->summary.cpu_only++;
-            if (usage.supported_devices == H3_ANE_DEVICE_GPU)
-                walk->summary.gpu_only++;
-            h3_ane_diagnostic_record_first(
-                walk->diagnostic, H3_ANE_STAGE_ELIGIBILITY,
-                H3_ANE_CODE_OPERATION_NOT_NEURAL_ENGINE_SUPPORTED,
-                H3_ANE_REASON_ELIGIBILITY,
-                "operation is not Neural Engine supported");
-        }
-        if (walk->diagnostic && walk->diagnostic->code != H3_ANE_CODE_NONE &&
-            !walk->diagnostic->has_operation) {
-            snprintf(walk->diagnostic->operation,
-                     sizeof(walk->diagnostic->operation), "%s", usage.name);
-            walk->diagnostic->has_operation = 1;
-            walk->diagnostic->supported_devices = usage.supported_devices;
-            walk->diagnostic->preferred_device = usage.preferred_device;
-            walk->diagnostic->has_supported_devices = 1;
-            walk->diagnostic->has_preferred_device = 1;
-        }
-    }
     size_t children = walk->adapter->child_count(walk->context, node);
     for (size_t index = 0; index < children; index++)
         if (!walk_plan_node(walk,
@@ -451,6 +409,68 @@ static int walk_plan_node(plan_walk *walk, void *node, size_t depth) {
                             depth + 1))
             return 0;
     return 1;
+}
+
+int h3_ane_reduce_inventory(const h3_ane_operation_usage *operations,
+                            size_t operation_count,
+                            h3_ane_inventory_summary *summary,
+                            uint32_t *preferred_devices,
+                            h3_ane_diagnostic *diagnostic) {
+    if (!operations || !summary) return 0;
+    memset(summary, 0, sizeof(*summary));
+    if (preferred_devices) *preferred_devices = 0;
+    for (size_t index = 0; index < operation_count; index++) {
+        const h3_ane_operation_usage *usage = &operations[index];
+        summary->total++;
+        if (preferred_devices) *preferred_devices |= usage->preferred_device;
+        if (usage->is_constant) {
+            summary->constant++;
+            if (usage->supported_devices == 0 && usage->preferred_device == 0)
+                summary->constant_nil_usage++;
+            continue;
+        }
+        summary->nonconstant++;
+        h3_ane_code code = H3_ANE_CODE_NONE;
+        const char *message = NULL;
+        if (usage->supported_devices == 0) {
+            summary->unknown_nonconstant++;
+            code = H3_ANE_CODE_OPERATION_USAGE_UNKNOWN;
+            message = "operation device usage is unknown";
+        } else if (usage->preferred_device == 0) {
+            summary->unknown_nonconstant++;
+            code = H3_ANE_CODE_DEVICE_UNKNOWN;
+            message = "operation preferred device is unknown";
+        } else if (usage->supported_devices & H3_ANE_DEVICE_NEURAL_ENGINE) {
+            summary->neural_engine_supported++;
+        } else {
+            if (usage->supported_devices == H3_ANE_DEVICE_CPU)
+                summary->cpu_only++;
+            if (usage->supported_devices == H3_ANE_DEVICE_GPU)
+                summary->gpu_only++;
+            code = H3_ANE_CODE_OPERATION_NOT_NEURAL_ENGINE_SUPPORTED;
+            message = "operation is not Neural Engine supported";
+        }
+        if (code != H3_ANE_CODE_NONE &&
+            (!diagnostic || diagnostic->code == H3_ANE_CODE_NONE)) {
+            h3_ane_diagnostic_record_first(
+                diagnostic, H3_ANE_STAGE_ELIGIBILITY, code,
+                H3_ANE_REASON_ELIGIBILITY, message);
+            if (diagnostic && diagnostic->code == code) {
+                snprintf(diagnostic->operation, sizeof(diagnostic->operation),
+                         "%s", usage->name);
+                diagnostic->has_operation = 1;
+                if (usage->supported_devices) {
+                    diagnostic->supported_devices = usage->supported_devices;
+                    diagnostic->has_supported_devices = 1;
+                }
+                if (usage->preferred_device) {
+                    diagnostic->preferred_device = usage->preferred_device;
+                    diagnostic->has_preferred_device = 1;
+                }
+            }
+        }
+    }
+    return !diagnostic || diagnostic->code == H3_ANE_CODE_NONE;
 }
 
 static int walk_plan_roots(plan_walk *walk) {
@@ -515,14 +535,14 @@ int h3_ane_collect_plan_tree(const h3_ane_plan_tree_adapter *adapter,
         }
         return 0;
     }
-    if (fill_diagnostic.code != H3_ANE_CODE_NONE) {
+    uint32_t preferred_devices = 0;
+    if (!h3_ane_reduce_inventory(inventory, fill_walk.count, summary,
+                                 &preferred_devices, diagnostic)) {
         free(inventory);
-        h3_ane_diagnostic_merge_first(diagnostic, &fill_diagnostic);
         return 0;
     }
     *operations = inventory;
     *operation_count = fill_walk.count;
-    *summary = fill_walk.summary;
     return 1;
 }
 
@@ -1197,25 +1217,14 @@ static h3_ane *create_impl(const char *model_path,
     }
     int trace = getenv("H3_ANE_TRACE") &&
                 strcmp(getenv("H3_ANE_TRACE"), "1") == 0;
+    h3_ane_diagnostic eligibility_diagnostic = {0};
+    uint32_t preferred_devices = 0;
+    int eligible = h3_ane_reduce_inventory(
+        operations, operation_count, &ane->inventory, &preferred_devices,
+        &eligibility_diagnostic);
+    ane->stats.preferred_device = preferred_devices;
     for (size_t index = 0; index < operation_count; index++) {
         h3_ane_operation_usage *usage = &operations[index];
-        ane->inventory.total++;
-        if (usage->is_constant) {
-            ane->inventory.constant++;
-            if (usage->supported_devices == 0 && usage->preferred_device == 0)
-                ane->inventory.constant_nil_usage++;
-        } else {
-            ane->inventory.nonconstant++;
-            if (usage->supported_devices == 0 || usage->preferred_device == 0)
-                ane->inventory.unknown_nonconstant++;
-            else if (usage->supported_devices & H3_ANE_DEVICE_NEURAL_ENGINE)
-                ane->inventory.neural_engine_supported++;
-            else if (usage->supported_devices == H3_ANE_DEVICE_CPU)
-                ane->inventory.cpu_only++;
-            else if (usage->supported_devices == H3_ANE_DEVICE_GPU)
-                ane->inventory.gpu_only++;
-        }
-        ane->stats.preferred_device |= usage->preferred_device;
         if (trace) {
             fprintf(stderr,
                     "h3-ane operation=%s constant=%d supported=0x%x "
@@ -1223,51 +1232,14 @@ static h3_ane *create_impl(const char *model_path,
                     usage->name, usage->is_constant, usage->supported_devices,
                     usage->preferred_device);
         }
-        if (!usage->is_constant &&
-            (usage->supported_devices == 0 || usage->preferred_device == 0)) {
-            h3_ane_code code = usage->supported_devices == 0 ?
-                H3_ANE_CODE_OPERATION_USAGE_UNKNOWN : H3_ANE_CODE_DEVICE_UNKNOWN;
-            record_first(ane, H3_ANE_STAGE_ELIGIBILITY, code,
-                         H3_ANE_REASON_ELIGIBILITY,
-                         usage->supported_devices == 0 ?
-                             "operation device usage is unknown" :
-                             "operation preferred device is unknown");
-            h3_ane_diagnostic *diagnostic = &ane->diagnostic;
-            snprintf(diagnostic->operation, sizeof(diagnostic->operation), "%s",
-                     usage->name);
-            diagnostic->has_operation = 1;
-            if (usage->supported_devices) {
-                diagnostic->supported_devices = usage->supported_devices;
-                diagnostic->has_supported_devices = 1;
-            }
-            if (usage->preferred_device) {
-                diagnostic->preferred_device = usage->preferred_device;
-                diagnostic->has_preferred_device = 1;
-            }
-            mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
-                             "Core ML operation device usage is unknown");
-            free(operations);
-            return ane;
-        }
-        if (!usage->is_constant &&
-            !(usage->supported_devices & H3_ANE_DEVICE_NEURAL_ENGINE)) {
-            record_first(ane, H3_ANE_STAGE_ELIGIBILITY,
-                         H3_ANE_CODE_OPERATION_NOT_NEURAL_ENGINE_SUPPORTED,
-                         H3_ANE_REASON_ELIGIBILITY,
-                         "operation is not Neural Engine supported");
-            h3_ane_diagnostic *diagnostic = &ane->diagnostic;
-            snprintf(diagnostic->operation, sizeof(diagnostic->operation), "%s",
-                     usage->name);
-            diagnostic->has_operation = 1;
-            diagnostic->supported_devices = usage->supported_devices;
-            diagnostic->has_supported_devices = 1;
-            diagnostic->preferred_device = usage->preferred_device;
-            diagnostic->has_preferred_device = 1;
-            mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
-                             "Core ML operation is not Neural Engine eligible");
-            free(operations);
-            return ane;
-        }
+    }
+    if (!eligible) {
+        h3_ane_diagnostic_merge_first(&ane->diagnostic,
+                                      &eligibility_diagnostic);
+        mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
+                         eligibility_diagnostic.message);
+        free(operations);
+        return ane;
     }
     free(operations);
     ane->stats.last_reason = H3_ANE_REASON_NONE;

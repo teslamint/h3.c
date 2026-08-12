@@ -734,6 +734,9 @@ static void test_large_compute_plan_inventory(void) {
     size_t operation_count = 0;
     h3_ane_inventory_summary summary;
     h3_ane_diagnostic diagnostic = {0};
+    require_plan_failure(NULL, 0, H3_ANE_CODE_OPERATION_INVENTORY_EMPTY,
+                         0, 0,
+                         "zero-operation inventory did not fail exactly");
     require(h3_ane_test_collect_plan(nodes, 441, &operations,
                                      &operation_count, &summary, &diagnostic),
             "441-operation inventory was truncated or rejected");
@@ -756,6 +759,15 @@ static void test_large_compute_plan_inventory(void) {
                 diagnostic.stage == H3_ANE_STAGE_ELIGIBILITY &&
                 diagnostic.code == H3_ANE_CODE_OPERATION_USAGE_UNKNOWN,
             "unknown nonconstant usage did not preserve first diagnostic");
+    unsupported.usage = eligible_usage(0);
+    unsupported.usage.preferred_device = 0;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(!h3_ane_test_collect_plan(&unsupported, 1, &operations,
+                                      &operation_count, &summary, &diagnostic) &&
+                diagnostic.code == H3_ANE_CODE_DEVICE_UNKNOWN &&
+                diagnostic.has_supported_devices &&
+                !diagnostic.has_preferred_device,
+            "known supported mask with unknown preferred device was accepted");
     unsupported.usage = eligible_usage(0);
     unsupported.usage.supported_devices = H3_ANE_DEVICE_CPU;
     unsupported.usage.preferred_device = H3_ANE_DEVICE_CPU;
@@ -831,6 +843,76 @@ static void test_large_compute_plan_inventory(void) {
                 summary.constant_nil_usage == 1,
             "constant nil usage was rejected or not counted");
     free(operations);
+}
+
+typedef struct {
+    h3_ane_test_plan_node nodes[2];
+    size_t pass;
+    int drift;
+} changing_plan;
+
+static size_t changing_root_count(void *opaque) {
+    changing_plan *plan = opaque;
+    plan->pass++;
+    return plan->drift && plan->pass > 1 ? 2 : 1;
+}
+
+static void *changing_root_at(void *opaque, size_t index) {
+    return &((changing_plan *)opaque)->nodes[index];
+}
+
+static size_t changing_child_count(void *opaque, void *node) {
+    (void)opaque;
+    (void)node;
+    return 0;
+}
+
+static void *changing_child_at(void *opaque, void *node, size_t index) {
+    (void)opaque;
+    (void)node;
+    (void)index;
+    return NULL;
+}
+
+static void changing_usage(void *opaque, void *node,
+                           h3_ane_operation_usage *usage) {
+    changing_plan *plan = opaque;
+    *usage = ((h3_ane_test_plan_node *)node)->usage;
+    if (plan->pass == 1) {
+        usage->supported_devices = H3_ANE_DEVICE_CPU;
+        usage->preferred_device = H3_ANE_DEVICE_CPU;
+    }
+}
+
+static void test_plan_pass_ordering(void) {
+    const h3_ane_plan_tree_adapter adapter = {
+        .root_count = changing_root_count, .root_at = changing_root_at,
+        .child_count = changing_child_count, .child_at = changing_child_at,
+        .usage = changing_usage,
+    };
+    changing_plan plan = {0};
+    plan.nodes[0].usage = eligible_usage(0);
+    plan.nodes[1].usage = eligible_usage(1);
+    h3_ane_operation_usage *operations = NULL;
+    size_t count = 0;
+    h3_ane_inventory_summary summary;
+    h3_ane_diagnostic diagnostic = {0};
+    require(h3_ane_collect_plan_tree(&adapter, &plan, &operations, &count,
+                                     &summary, &diagnostic) && count == 1,
+            "stale ineligible count-pass usage rejected eligible fill usage");
+    free(operations);
+
+    memset(&plan, 0, sizeof(plan));
+    plan.nodes[0].usage = eligible_usage(0);
+    plan.nodes[1].usage = eligible_usage(1);
+    plan.drift = 1;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(!h3_ane_collect_plan_tree(&adapter, &plan, &operations, &count,
+                                      &summary, &diagnostic) &&
+                diagnostic.stage == H3_ANE_STAGE_COMPUTE_PLAN &&
+                diagnostic.code ==
+                    H3_ANE_CODE_OPERATION_INVENTORY_CHANGED,
+            "fill drift did not precede count-pass eligibility evidence");
 }
 
 typedef struct {
@@ -1465,6 +1547,7 @@ int main(void) {
     test_compiled_directory_receipt_integration(root);
     test_runtime_metadata();
     test_large_compute_plan_inventory();
+    test_plan_pass_ordering();
     test_multiarray_stride_copy();
     test_first_diagnostic_is_immutable();
     test_complete_diagnostic_taxonomy();
