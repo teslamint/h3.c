@@ -17,6 +17,8 @@
 
 int h3_ane_test_validate_metadata(const char *const values[8],
                                   const h3_ane_contract *contract);
+int h3_ane_test_validate_metadata_field(const char *const values[8],
+                                        const h3_ane_contract *contract);
 
 static void die(const char *message) {
     fprintf(stderr, "FAIL tests/test_ane.c: %s\n", message);
@@ -696,6 +698,13 @@ static void test_runtime_metadata(void) {
         "1", "FL2VA", "0", "0", "encoder.down.0.block.0", "F32",
         "1,1,256,256,128", source,
     };
+    static const h3_ane_contract_field fields[8] = {
+        H3_ANE_CONTRACT_FIELD_VERSION, H3_ANE_CONTRACT_FIELD_VARIANT,
+        H3_ANE_CONTRACT_FIELD_BLOCK_LEVEL, H3_ANE_CONTRACT_FIELD_BLOCK_INDEX,
+        H3_ANE_CONTRACT_FIELD_WEIGHT_PREFIX,
+        H3_ANE_CONTRACT_FIELD_BOUNDARY_DTYPE, H3_ANE_CONTRACT_FIELD_SHAPE,
+        H3_ANE_CONTRACT_FIELD_SOURCE_SHA256,
+    };
     require(h3_ane_test_validate_metadata(valid, &contract) ==
                 H3_ANE_REASON_NONE,
             "matching creator-defined metadata was rejected");
@@ -706,6 +715,24 @@ static void test_runtime_metadata(void) {
         require(h3_ane_test_validate_metadata(missing, &contract) !=
                     H3_ANE_REASON_NONE,
                 "missing creator-defined metadata was accepted");
+        require(h3_ane_test_validate_metadata_field(missing, &contract) ==
+                    (int)fields[index],
+                "missing creator metadata lost its exact contract field");
+    }
+    static const char *const mismatches[8] = {
+        "01", "Ref2VA", "1", "1", "encoder.down.0.block.1", "F16",
+        "1,1,128,256,128",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    };
+    for (size_t index = 0; index < 8; index++) {
+        const char *mismatch[8];
+        memcpy(mismatch, valid, sizeof(mismatch));
+        mismatch[index] = mismatches[index];
+        require(h3_ane_test_validate_metadata(mismatch, &contract) !=
+                    H3_ANE_REASON_NONE &&
+                h3_ane_test_validate_metadata_field(mismatch, &contract) ==
+                    (int)fields[index],
+                "mismatched creator metadata lost its exact contract field");
     }
     const char *malformed[8];
     memcpy(malformed, valid, sizeof(malformed));
@@ -713,7 +740,7 @@ static void test_runtime_metadata(void) {
     require(h3_ane_test_validate_metadata(malformed, &contract) ==
                 H3_ANE_REASON_CONTRACT,
             "malformed metadata version was accepted");
-    static const char *mismatches[8] = {
+    static const char *reason_mismatches[8] = {
         "2", "Ref2VA", "1", "1", "encoder.down.0.block.1", "F16",
         "1,1,128,128,128",
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
@@ -727,7 +754,7 @@ static void test_runtime_metadata(void) {
     for (size_t index = 0; index < 8; index++) {
         const char *changed[8];
         memcpy(changed, valid, sizeof(changed));
-        changed[index] = mismatches[index];
+        changed[index] = reason_mismatches[index];
         require(h3_ane_test_validate_metadata(changed, &contract) ==
                     (int)reasons[index],
                 "metadata mismatch returned the wrong stable reason");
@@ -1141,6 +1168,12 @@ static void test_runtime_bridge(const char *root) {
     ane = create_enabled(model_path, &changed, 0, error);
     require_predict_reason(ane, 1, H3_ANE_REASON_CONTRACT,
                            "contract failure reason was unstable");
+    h3_ane_diagnostic contract_diagnostic = {0};
+    h3_ane_diagnostic_snapshot(ane, &contract_diagnostic);
+    require(contract_diagnostic.has_contract_field &&
+                contract_diagnostic.contract_field ==
+                    H3_ANE_CONTRACT_FIELD_BLOCK_INDEX,
+            "caller contract mismatch lost exact block_index field");
     h3_ane_free(ane);
 
     fake = valid_fake_backend();
@@ -1169,6 +1202,11 @@ static void test_runtime_bridge(const char *root) {
     ane = create_enabled(model_path, &changed, 0, error);
     require_predict_reason(ane, 1, H3_ANE_REASON_DTYPE,
                            "dtype failure reason was unstable");
+    memset(&contract_diagnostic, 0, sizeof(contract_diagnostic));
+    h3_ane_diagnostic_snapshot(ane, &contract_diagnostic);
+    require(contract_diagnostic.contract_field ==
+                H3_ANE_CONTRACT_FIELD_BOUNDARY_DTYPE,
+            "caller contract mismatch lost exact boundary_dtype field");
     h3_ane_free(ane);
 
     h3_ane_contract fingerprint = contract;

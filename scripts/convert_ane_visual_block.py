@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 
 WEIGHT_PREFIX = "encoder.down.0.block.0"
@@ -358,6 +359,12 @@ def atomic_save(model, destination, metadata):
     destination.parent.mkdir(parents=True, exist_ok=True)
     _ACTIVE_TEMP = Path(tempfile.mkdtemp(prefix=f".{destination.name}.tmp-",
                                         dir=destination.parent))
+    marker = os.environ.get("H3_ANE_TEST_CONVERTER_TEMP_READY")
+    release = os.environ.get("H3_ANE_TEST_CONVERTER_TEMP_RELEASE")
+    if marker and release:
+        Path(marker).write_text("temporary package created\n")
+        while not Path(release).exists():
+            time.sleep(0.001)
     package = _ACTIVE_TEMP / destination.name
     try:
         model.user_defined_metadata.update(metadata)

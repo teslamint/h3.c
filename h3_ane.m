@@ -243,18 +243,45 @@ static int valid_hex_digest(const char digest[65]) {
     return 1;
 }
 
-static h3_ane_reason validate_contract(const h3_ane_contract *contract) {
+typedef struct {
+    h3_ane_reason reason;
+    h3_ane_contract_field field;
+} contract_validation;
+
+static contract_validation contract_failure(h3_ane_reason reason,
+                                            h3_ane_contract_field field) {
+    return (contract_validation){.reason = reason, .field = field};
+}
+
+static contract_validation validate_contract(const h3_ane_contract *contract) {
     static const uint32_t shape[5] = {1, 1, 256, 256, 128};
-    if (!contract) return H3_ANE_REASON_CONTRACT;
+    if (!contract) return contract_failure(H3_ANE_REASON_CONTRACT,
+                                           H3_ANE_CONTRACT_FIELD_NONE);
     if (contract->boundary_dtype != H3_ANE_DTYPE_F32)
-        return H3_ANE_REASON_DTYPE;
-    if (contract->version != 1 || strcmp(contract->variant, "FL2VA") != 0 ||
-        contract->block_level != 0 || contract->block_index != 0 ||
-        strcmp(contract->weight_prefix, "encoder.down.0.block.0") != 0 ||
-        memcmp(contract->shape, shape, sizeof(shape)) != 0 ||
-        !valid_hex_digest(contract->source_sha256))
-        return H3_ANE_REASON_CONTRACT;
-    return H3_ANE_REASON_NONE;
+        return contract_failure(H3_ANE_REASON_DTYPE,
+                                H3_ANE_CONTRACT_FIELD_BOUNDARY_DTYPE);
+    if (contract->version != 1)
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_VERSION);
+    if (strcmp(contract->variant, "FL2VA") != 0)
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_VARIANT);
+    if (contract->block_level != 0)
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_BLOCK_LEVEL);
+    if (contract->block_index != 0)
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_BLOCK_INDEX);
+    if (strcmp(contract->weight_prefix, "encoder.down.0.block.0") != 0)
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_WEIGHT_PREFIX);
+    if (memcmp(contract->shape, shape, sizeof(shape)) != 0)
+        return contract_failure(H3_ANE_REASON_SHAPE,
+                                H3_ANE_CONTRACT_FIELD_SHAPE);
+    if (!valid_hex_digest(contract->source_sha256))
+        return contract_failure(H3_ANE_REASON_FINGERPRINT,
+                                H3_ANE_CONTRACT_FIELD_SOURCE_SHA256);
+    return contract_failure(H3_ANE_REASON_NONE, H3_ANE_CONTRACT_FIELD_NONE);
 }
 
 static int canonical_strides(const ptrdiff_t strides[5],
@@ -339,46 +366,62 @@ int h3_ane_test_copy_from_strided(float *destination, const float *source,
 }
 #endif
 
-static h3_ane_reason validate_metadata_values(const char *const values[8],
-                                              const h3_ane_contract *contract) {
-    if (!values || !contract) return H3_ANE_REASON_CONTRACT;
+static contract_validation validate_metadata_values(
+    const char *const values[8], const h3_ane_contract *contract) {
+    if (!values || !contract)
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_NONE);
     for (size_t index = 0; index < 8; index++)
-        if (!values[index]) return H3_ANE_REASON_CONTRACT;
+        if (!values[index])
+            return contract_failure(H3_ANE_REASON_CONTRACT,
+                                    (h3_ane_contract_field)(index + 1));
     char version[16], block_level[16], block_index[16], shape[64];
     int written = snprintf(version, sizeof(version), "%u", contract->version);
     if (written <= 0 || (size_t)written >= sizeof(version) ||
-        strcmp(values[0], version) != 0 ||
-        strcmp(values[1], contract->variant) != 0)
-        return H3_ANE_REASON_CONTRACT;
+        strcmp(values[0], version) != 0)
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_VERSION);
+    if (strcmp(values[1], contract->variant) != 0)
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_VARIANT);
     written = snprintf(block_level, sizeof(block_level), "%u",
                        contract->block_level);
     if (written <= 0 || (size_t)written >= sizeof(block_level) ||
         strcmp(values[2], block_level) != 0)
-        return H3_ANE_REASON_CONTRACT;
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_BLOCK_LEVEL);
     written = snprintf(block_index, sizeof(block_index), "%u",
                        contract->block_index);
     if (written <= 0 || (size_t)written >= sizeof(block_index) ||
-        strcmp(values[3], block_index) != 0 ||
-        strcmp(values[4], contract->weight_prefix) != 0)
-        return H3_ANE_REASON_CONTRACT;
-    if (strcmp(values[5], "F32") != 0) return H3_ANE_REASON_DTYPE;
+        strcmp(values[3], block_index) != 0)
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_BLOCK_INDEX);
+    if (strcmp(values[4], contract->weight_prefix) != 0)
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_WEIGHT_PREFIX);
+    if (strcmp(values[5], "F32") != 0)
+        return contract_failure(H3_ANE_REASON_DTYPE,
+                                H3_ANE_CONTRACT_FIELD_BOUNDARY_DTYPE);
     written = snprintf(shape, sizeof(shape), "%u,%u,%u,%u,%u",
                        contract->shape[0], contract->shape[1],
                        contract->shape[2], contract->shape[3],
                        contract->shape[4]);
     if (written <= 0 || (size_t)written >= sizeof(shape) ||
         strcmp(values[6], shape) != 0)
-        return H3_ANE_REASON_SHAPE;
+        return contract_failure(H3_ANE_REASON_SHAPE,
+                                H3_ANE_CONTRACT_FIELD_SHAPE);
     if (!valid_hex_digest(values[7]) ||
         strcmp(values[7], contract->source_sha256) != 0)
-        return H3_ANE_REASON_FINGERPRINT;
-    return H3_ANE_REASON_NONE;
+        return contract_failure(H3_ANE_REASON_FINGERPRINT,
+                                H3_ANE_CONTRACT_FIELD_SOURCE_SHA256);
+    return contract_failure(H3_ANE_REASON_NONE, H3_ANE_CONTRACT_FIELD_NONE);
 }
 
-static h3_ane_reason validate_creator_metadata(id metadata,
-                                               const h3_ane_contract *contract) {
+static contract_validation validate_creator_metadata(
+    id metadata, const h3_ane_contract *contract) {
     if (![metadata isKindOfClass:[NSDictionary class]])
-        return H3_ANE_REASON_CONTRACT;
+        return contract_failure(H3_ANE_REASON_CONTRACT,
+                                H3_ANE_CONTRACT_FIELD_NONE);
     NSDictionary *dictionary = metadata;
     static NSArray<NSString *> *keys;
     static dispatch_once_t once;
@@ -391,7 +434,8 @@ static h3_ane_reason validate_creator_metadata(id metadata,
     for (size_t index = 0; index < 8; index++) {
         id value = dictionary[keys[index]];
         if (![value isKindOfClass:[NSString class]])
-            return H3_ANE_REASON_CONTRACT;
+            return contract_failure(H3_ANE_REASON_CONTRACT,
+                                    (h3_ane_contract_field)(index + 1));
         values[index] = [value UTF8String];
     }
     return validate_metadata_values(values, contract);
@@ -411,7 +455,22 @@ int h3_ane_test_validate_metadata(const char *const values[8],
                 dictionary[keys[index]] =
                     [NSString stringWithUTF8String:values[index]];
         }
-        return (int)validate_creator_metadata(dictionary, contract);
+        return (int)validate_creator_metadata(dictionary, contract).reason;
+    }
+}
+
+int h3_ane_test_validate_metadata_field(const char *const values[8],
+                                        const h3_ane_contract *contract) {
+    @autoreleasepool {
+        static NSString *const keys[8] = {
+            @"version", @"variant", @"block_level", @"block_index",
+            @"weight_prefix", @"boundary_dtype", @"shape", @"source_sha256",
+        };
+        NSMutableDictionary *dictionary = [NSMutableDictionary dictionary];
+        for (size_t index = 0; index < 8; index++)
+            if (values[index]) dictionary[keys[index]] =
+                [NSString stringWithUTF8String:values[index]];
+        return (int)validate_creator_metadata(dictionary, contract).field;
     }
 }
 #endif
@@ -675,8 +734,9 @@ static int real_load(void *opaque, h3_ane_diagnostic *diagnostic) {
                 return -(int)H3_ANE_REASON_CONTRACT;
             }
         }
-        h3_ane_reason metadataReason = validate_creator_metadata(
+        contract_validation metadataValidation = validate_creator_metadata(
             creatorMetadata, &contract);
+        h3_ane_reason metadataReason = metadataValidation.reason;
         if (metadataReason != H3_ANE_REASON_NONE) {
             h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_CONTRACT,
                 metadataReason == H3_ANE_REASON_FINGERPRINT ?
@@ -693,6 +753,8 @@ static int real_load(void *opaque, h3_ane_diagnostic *diagnostic) {
             else if (metadataReason == H3_ANE_REASON_SHAPE)
                 set_contract_context(diagnostic,
                     H3_ANE_CONTRACT_FIELD_SHAPE, NULL);
+            else
+                set_contract_context(diagnostic, metadataValidation.field, NULL);
             return -(int)metadataReason;
         }
         NSDictionary<NSString *, MLFeatureDescription *> *inputs =
@@ -1131,15 +1193,16 @@ static h3_ane *create_impl(const char *model_path,
                          "ANE backend requires macOS 14.4 or later");
         return ane;
     }
-    h3_ane_reason contract_reason = validate_contract(contract);
+    contract_validation contractValidation = validate_contract(contract);
+    h3_ane_reason contract_reason = contractValidation.reason;
     if (contract_reason != H3_ANE_REASON_NONE) {
         record_first(ane, H3_ANE_STAGE_CONTRACT,
                      contract_reason == H3_ANE_REASON_DTYPE ?
                          H3_ANE_CODE_DTYPE_MISMATCH : H3_ANE_CODE_METADATA_MISMATCH,
                      contract_reason, "ANE model contract is incompatible");
-        if (contract_reason == H3_ANE_REASON_DTYPE)
-            set_contract_context(&ane->diagnostic,
-                                 H3_ANE_CONTRACT_FIELD_BOUNDARY_DTYPE, NULL);
+        set_contract_context(&ane->diagnostic, contractValidation.field,
+                             contract_reason == H3_ANE_REASON_FINGERPRINT &&
+                                     contract ? contract->source_sha256 : NULL);
         mark_unavailable(ane, contract_reason, error, error_size,
                          "ANE model contract is incompatible");
         return ane;

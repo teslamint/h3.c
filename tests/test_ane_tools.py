@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 import os
 import signal
+import shutil
 import sys
 import time
 
@@ -175,6 +176,110 @@ class ConverterTests(unittest.TestCase):
             self.converter.compile_package(package, destination, runner=runner)
             self.assertEqual((destination / "complete").read_text(), "yes")
             self.assertFalse(list(root.glob(".model.mlmodelc.compile-*")))
+
+    def test_compile_partial_failure_preserves_final_and_removes_temp(self):
+        for seeded in (False, True):
+            with self.subTest(seeded=seeded), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); package = root / "model.mlpackage"
+                package.mkdir(); destination = root / "model.mlmodelc"
+                if seeded:
+                    destination.mkdir(); (destination / "old").write_bytes(b"authority")
+                before = (destination / "old").read_bytes() if seeded else None
+                def runner(command, check):
+                    partial = Path(command[4]) / "partial.mlmodelc"
+                    partial.mkdir(parents=True); (partial / "partial").write_text("x")
+                    raise subprocess.CalledProcessError(9, command)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.converter.compile_package(package, destination, runner=runner)
+                self.assertEqual(destination.exists(), seeded)
+                if seeded:
+                    self.assertEqual((destination / "old").read_bytes(), before)
+                self.assertFalse(list(root.glob(".model.mlmodelc.compile-*")))
+
+    def test_native_coremlcompiler_rejects_malformed_package_without_final(self):
+        if sys.platform != "darwin" or shutil.which("xcrun") is None:
+            self.skipTest("native coremlcompiler is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); package = root / "malformed.mlpackage"
+            package.mkdir(); (package / "Manifest.json").write_text("not-json")
+            destination = root / "malformed.mlmodelc"
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.converter.compile_package(package, destination)
+            self.assertFalse(destination.exists())
+            self.assertFalse(list(root.glob(".malformed.mlmodelc.compile-*")))
+
+    def test_converter_temp_sigterm_preserves_final_and_canonical_reruns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); destination = root / "model.mlpackage"
+            destination.mkdir(); (destination / "old").write_bytes(b"authority")
+            before = (destination / "old").read_bytes()
+            marker = root / "ready"; release = root / "release"
+            script = f"""
+import importlib.util, os, pathlib, signal
+spec=importlib.util.spec_from_file_location('converter', {str(ROOT / 'scripts/convert_ane_visual_block.py')!r})
+c=importlib.util.module_from_spec(spec); spec.loader.exec_module(c)
+signal.signal(signal.SIGTERM, c._cleanup_temp)
+class Model:
+ user_defined_metadata={{}}
+ def save(self,path): pathlib.Path(path).mkdir()
+try: c.atomic_save(Model(), {str(destination)!r}, {{}})
+except KeyboardInterrupt: raise SystemExit(143)
+"""
+            env = {**os.environ,
+                   "H3_ANE_TEST_CONVERTER_TEMP_READY": str(marker),
+                   "H3_ANE_TEST_CONVERTER_TEMP_RELEASE": str(release)}
+            process = subprocess.Popen([sys.executable, "-c", script], env=env)
+            for _ in range(200):
+                if marker.exists(): break
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            process.terminate(); process.wait(timeout=5)
+            self.assertEqual(process.returncode, 143)
+            self.assertEqual((destination / "old").read_bytes(), before)
+            self.assertFalse(list(root.glob(".model.mlpackage.tmp-*")))
+            class Model:
+                user_defined_metadata = {}
+                def save(self, path):
+                    Path(path).mkdir(); (Path(path) / "new").write_text("complete")
+            self.converter.atomic_save(Model(), destination, {})
+            self.assertEqual((destination / "new").read_text(), "complete")
+            self.assertFalse(list(root.glob(".model.mlpackage.tmp-*")))
+
+    def test_pinned_converter_cli_wrong_shape_is_atomic_and_canonical_reruns(self):
+        try:
+            import numpy as np
+            from safetensors.numpy import save_file
+            import coremltools  # noqa: F401
+        except ImportError:
+            self.skipTest("pinned converter dependencies are unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); weights = root / "weights"; weights.mkdir()
+            sentinel = weights / "sentinel"; sentinel.write_bytes(b"source-sentinel")
+            tensors = {}
+            for name, shape in self.converter.TENSOR_SHAPES.items():
+                if name.endswith("norm1.weight"):
+                    shape = (127,)
+                tensors[name] = np.zeros(shape, dtype=np.float32)
+            save_file(tensors, weights / "model.safetensors")
+            destination = root / "model.mlpackage"; destination.mkdir()
+            (destination / "old").write_bytes(b"authority"); before = b"authority"
+            command = [sys.executable, str(ROOT / "scripts/convert_ane_visual_block.py"),
+                       "--weights", str(weights), "--output", str(destination)]
+            failed = subprocess.run(command, text=True, capture_output=True,
+                                    check=False)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual((destination / "old").read_bytes(), before)
+            self.assertEqual(sentinel.read_bytes(), b"source-sentinel")
+            self.assertFalse(list(root.glob(".model.mlpackage.tmp-*")))
+            tensors[f"{self.converter.WEIGHT_PREFIX}.norm1.weight"] = \
+                np.zeros((128,), dtype=np.float32)
+            save_file(tensors, weights / "model.safetensors")
+            passed = subprocess.run(command, text=True, capture_output=True,
+                                    check=False)
+            self.assertEqual(passed.returncode, 0, passed.stderr)
+            self.assertTrue((destination / "Manifest.json").is_file())
+            self.assertEqual(sentinel.read_bytes(), b"source-sentinel")
+            self.assertFalse(list(root.glob(".model.mlpackage.tmp-*")))
 
     def test_group_norm_uses_consecutive_four_channel_native_groups_then_affine(self):
         class Recorder:
@@ -725,6 +830,33 @@ raise SystemExit(1)
                             failure_code=code)
             with self.assertRaisesRegex(ValueError, "count"):
                 self.coordinator.validate_qualification_diagnostic(required)
+
+    def test_contract_field_context_serializes_exactly_or_null(self):
+        fields = ("version", "variant", "block_level", "block_index",
+                  "weight_prefix", "boundary_dtype", "shape", "source_sha256")
+        for field in fields:
+            with self.subTest(field=field):
+                document = {
+                    "failure_stage": "contract",
+                    "failure_code": "fingerprint_mismatch"
+                        if field == "source_sha256" else "metadata_mismatch",
+                    "failure_reason": "creator metadata is incompatible",
+                    "failure_operation": None, "supported_devices": None,
+                    "preferred_device": None, "observed_count": None,
+                    "limit": None, "artifact_role": None,
+                    "contract_field": field,
+                    "digest": "a" * 64 if field == "source_sha256" else None,
+                }
+                diagnostic = self.coordinator.validate_qualification_diagnostic(
+                    document)
+                self.assertEqual(diagnostic["contract_field"], field)
+                self.assertEqual(diagnostic["digest"],
+                                 "a" * 64 if field == "source_sha256" else None)
+                self.assertNotIn("/", diagnostic["message"])
+        document["contract_field"] = None
+        document["digest"] = None
+        self.assertIsNone(self.coordinator.validate_qualification_diagnostic(
+            document)["contract_field"])
 
     def test_shadow_propagates_nonparity_qualifier_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1368,6 +1500,64 @@ time.sleep(30)
             self.assertLess(time.monotonic() - started, 4.0)
             self.assertEqual(process.returncode, 143)
             self.assertFalse(output.exists())
+
+    def test_post_compile_child_failure_publishes_complete_atomic_failure_and_reruns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); tools = self.fixture_tools(root)
+            output = root / "summary.json"
+            output.write_bytes(b'{"schema":"prior","status":"passed"}\n')
+            self.write_tool(tools[1], "raise SystemExit(7)\n")
+            result, _, env, command = self.run_real(root, tools)
+            self.assertEqual(result.returncode, 1)
+            failed = json.loads(output.read_text())
+            self.assertEqual(failed["schema"], self.coordinator.SCHEMA)
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["diagnostic"]["stage"], "probe")
+            work = root / "work"
+            self.assertTrue((work / "visual-block.mlmodelc").is_dir())
+            self.assertFalse(Path(f"{work / 'visual-block.mlmodelc'}.qualification.json").exists())
+            self.assertFalse(list(root.glob(".summary.json.tmp-*")))
+            _, probe, qualifier = self.fixture_tools(root)
+            env.update({"H3_ANE_INTEGRATION_PROBE": str(probe),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(qualifier)})
+            rerun = subprocess.run(command, env=env, text=True,
+                                   capture_output=True, check=False)
+            self.assertEqual(rerun.returncode, 0, rerun.stderr)
+            self.assertEqual(json.loads(output.read_text())["status"], "passed")
+
+    def test_post_compile_sigterm_preserves_prior_summary_and_cleans_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); tools = self.fixture_tools(root)
+            ready = root / "probe-ready"
+            self.write_tool(tools[1], f"""
+import pathlib, signal, time
+signal.signal(signal.SIGTERM, lambda *_: raise_exit())
+def raise_exit(): raise SystemExit(143)
+pathlib.Path({str(ready)!r}).write_text('ready')
+time.sleep(30)
+""")
+            output = root / "summary.json"
+            prior = b'{"schema":"prior","status":"passed"}\n'
+            output.write_bytes(prior)
+            weights = root / "weights"; weights.mkdir()
+            env = {**os.environ,
+                   "H3_ANE_INTEGRATION_CONVERTER": str(tools[0]),
+                   "H3_ANE_INTEGRATION_PROBE": str(tools[1]),
+                   "H3_ANE_INTEGRATION_QUALIFIER": str(tools[2])}
+            work = root / "work"
+            command = [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                       "real", "--repo", str(ROOT), "--work-dir", str(work),
+                       "--output", str(output), "--weights", str(weights)]
+            process = subprocess.Popen(command, env=env)
+            for _ in range(200):
+                if ready.exists(): break
+                time.sleep(0.01)
+            self.assertTrue(ready.exists())
+            process.send_signal(signal.SIGTERM); process.wait(timeout=5)
+            self.assertEqual(process.returncode, 143)
+            self.assertEqual(output.read_bytes(), prior)
+            self.assertFalse(list(root.glob(".summary.json.tmp-*")))
+            self.assertFalse(Path(f"{work / 'visual-block.mlmodelc'}.qualification.json").exists())
 
 
     def test_reused_work_preflight_failure_preserves_regular_or_absent_authority(self):
