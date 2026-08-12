@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -192,6 +193,8 @@ def _digest(value):
 
 def _failed(mode, failure):
     return {"schema": SCHEMA, "status": "failed", "mode": mode,
+            "profile": "shadow-measurement-v1" if mode == "shadow" else None,
+            "authority": False if mode == "shadow" else None,
             "source_sha256": failure.source_sha256,
             "inventory": failure.inventory, "diagnostic": {
                 "stage": failure.stage, "code": failure.code,
@@ -227,8 +230,8 @@ def execute(args):
     repo = Path(args.repo).resolve()
     work = Path(args.work_dir).resolve()
     output = Path(args.output).resolve()
-    if args.mode == "real" and not args.weights:
-        raise StageFailure("setup", "--weights is required in real mode")
+    if args.mode in ("real", "shadow") and not args.weights:
+        raise StageFailure("setup", "--weights is required in real or shadow mode")
     work = prepare_work_directory(work)
     weights = Path(args.weights).resolve() if args.weights else work / "weights"
     if args.mode == "synthetic":
@@ -281,14 +284,18 @@ def execute(args):
             inventory.get(key) != value for key, value in EXPECTED_INVENTORY.items()):
         raise StageFailure("eligibility", "unexpected production inventory")
     parity = receipt = None
-    if args.mode == "real":
+    if args.mode in ("real", "shadow"):
         qualification_output = work / "qualification.json"
         receipt_path = Path(f"{compiled}.qualification.json")
         _authority_outputs.update((qualification_output, receipt_path))
+        qualifier_command = [qualifier]
+        if args.mode == "shadow":
+            qualifier_command.append("--shadow-only")
+        qualifier_command.extend([
+            "--model", str(weights), "--coreml-model", str(compiled),
+            "--output", str(qualification_output)])
         try:
-            run_command([qualifier, "--model", str(weights), "--coreml-model",
-                         str(compiled), "--output", str(qualification_output)],
-                        "qualification", repo)
+            run_command(qualifier_command, "qualification", repo)
         except StageFailure:
             if not qualification_output.exists():
                 raise
@@ -304,26 +311,55 @@ def execute(args):
                 artifacts=artifacts)
         stages["qualification"] = 0
         qualification = json.loads(qualification_output.read_text())
-        receipt_document = json.loads(receipt_path.read_text())
-        if qualification.get("status") != "passed" or \
-                receipt_document.get("status") != "passed" or \
-                not all(_digest(document.get(field)) for document in
-                        (qualification, receipt_document)
-                        for field in ("model_sha256", "source_sha256")) or \
-                qualification.get("model_sha256") != artifacts["model_sha256"] or \
-                receipt_document.get("model_sha256") != artifacts["model_sha256"] or \
-                qualification.get("source_sha256") != source_sha or \
-                receipt_document.get("source_sha256") != source_sha:
-            raise StageFailure("artifact", "integration stage digests do not match",
-                               code="digest_mismatch", source_sha256=source_sha,
-                               inventory=inventory, stages=stages,
-                               artifacts=artifacts)
-        parity = {"max_abs": qualification.get("max_abs"),
-                  "relative_l2": qualification.get("relative_l2")}
-        receipt = {key: receipt_document.get(key) for key in (
-            "version", "model_sha256", "source_sha256", "test_vector",
-            "qualified_at", "max_abs", "relative_l2", "status")}
+        if args.mode == "shadow":
+            max_abs = qualification.get("max_abs")
+            relative_l2 = qualification.get("relative_l2")
+            bounded = all(
+                isinstance(value, (int, float)) and not isinstance(value, bool) and
+                math.isfinite(value)
+                for value in (max_abs, relative_l2)) and \
+                0 <= max_abs < 0.25 and 0 <= relative_l2 < 0.05
+            if qualification.get("status") != "passed" or \
+                    qualification.get("profile") != "shadow-measurement-v1" or \
+                    qualification.get("authority") is not False or \
+                    qualification.get("bounds") != {
+                        "max_abs": 0.25, "relative_l2": 0.05} or \
+                    qualification.get("threshold_outcome") is not True or \
+                    not bounded or \
+                    qualification.get("receipt_path") is not None or \
+                    receipt_path.exists() or \
+                    qualification.get("model_sha256") != artifacts["model_sha256"] or \
+                    qualification.get("source_sha256") != source_sha:
+                raise StageFailure(
+                    "qualification", "shadow measurement authority contract failed",
+                    code="shadow_authority_violation", source_sha256=source_sha,
+                    inventory=inventory, stages=stages, artifacts=artifacts)
+            parity = {"max_abs": qualification.get("max_abs"),
+                      "relative_l2": qualification.get("relative_l2")}
+            receipt = None
+        else:
+            receipt_document = json.loads(receipt_path.read_text())
+            if qualification.get("status") != "passed" or \
+                    receipt_document.get("status") != "passed" or \
+                    not all(_digest(document.get(field)) for document in
+                            (qualification, receipt_document)
+                            for field in ("model_sha256", "source_sha256")) or \
+                    qualification.get("model_sha256") != artifacts["model_sha256"] or \
+                    receipt_document.get("model_sha256") != artifacts["model_sha256"] or \
+                    qualification.get("source_sha256") != source_sha or \
+                    receipt_document.get("source_sha256") != source_sha:
+                raise StageFailure("artifact", "integration stage digests do not match",
+                                   code="digest_mismatch", source_sha256=source_sha,
+                                   inventory=inventory, stages=stages,
+                                   artifacts=artifacts)
+            parity = {"max_abs": qualification.get("max_abs"),
+                      "relative_l2": qualification.get("relative_l2")}
+            receipt = {key: receipt_document.get(key) for key in (
+                "version", "model_sha256", "source_sha256", "test_vector",
+                "qualified_at", "max_abs", "relative_l2", "status")}
     document = {"schema": SCHEMA, "status": "passed", "mode": args.mode,
+                "profile": "shadow-measurement-v1" if args.mode == "shadow" else None,
+                "authority": False if args.mode == "shadow" else None,
                 "source_sha256": source_sha, "inventory": inventory,
                 "diagnostic": None, "parity": parity, "receipt": receipt,
                 "artifacts": artifacts, "stages": stages}
@@ -338,7 +374,7 @@ def execute(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("synthetic", "real"))
+    parser.add_argument("mode", choices=("synthetic", "real", "shadow"))
     parser.add_argument("--repo", required=True)
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--output", required=True)

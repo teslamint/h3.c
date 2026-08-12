@@ -29,16 +29,21 @@ static void cancelled(int signal_number) {
 }
 
 static void usage(FILE *stream) {
-    fprintf(stream, "usage: h3_ane_qualification --model WEIGHT_DIR "
+    fprintf(stream, "usage: h3_ane_qualification [--shadow-only] --model WEIGHT_DIR "
                     "--coreml-model MODEL.mlmodelc --output RESULT.json\n");
 }
 
 static int parse_args(int argc, char **argv, const char **weights,
-                      const char **model, const char **output) {
+                      const char **model, const char **output,
+                      int *shadow_only) {
     for (int index = 1; index < argc; index++) {
         if (!strcmp(argv[index], "--help")) {
             usage(stdout);
             exit(0);
+        }
+        if (!strcmp(argv[index], "--shadow-only")) {
+            *shadow_only = 1;
+            continue;
         }
         if (index + 1 >= argc) return 0;
         if (!strcmp(argv[index], "--model")) *weights = argv[++index];
@@ -47,6 +52,11 @@ static int parse_args(int argc, char **argv, const char **weights,
         else return 0;
     }
     return *weights && *model && *output;
+}
+
+static void json_number_or_null(FILE *stream, double value) {
+    if (isfinite(value)) fprintf(stream, "%.17g", value);
+    else fputs("null", stream);
 }
 
 static int atomic_open(const char *path) {
@@ -286,6 +296,37 @@ static int write_result(const char *path, int passed, const char *model_sha,
     return atomic_finish(stream, path);
 }
 
+static int write_shadow_result(const char *path, int passed,
+                               const char *model_sha, const char *source_sha,
+                               const char *qualified_at, double max_abs,
+                               double relative_l2, const char *failure,
+                               const h3_ane_diagnostic *diagnostic) {
+    int descriptor = atomic_open(path);
+    if (descriptor < 0) return 0;
+    FILE *stream = fdopen(descriptor, "w");
+    if (!stream) { close(descriptor); cleanup_temp(); return 0; }
+    fprintf(stream, "{\"schema\":\"h3-ane-qualification/v1\","
+                    "\"profile\":\"shadow-measurement-v1\","
+                    "\"status\":\"%s\",\"authority\":false,"
+                    "\"model_sha256\":\"%s\",\"source_sha256\":\"%s\","
+                    "\"test_vector\":\"xorshift32-v1\","
+                    "\"qualified_at\":\"%s\",\"max_abs\":",
+            passed ? "passed" : "failed", model_sha, source_sha, qualified_at);
+    json_number_or_null(stream, max_abs);
+    fputs(",\"relative_l2\":", stream);
+    json_number_or_null(stream, relative_l2);
+    fputs(",\"bounds\":{\"max_abs\":0.25,\"relative_l2\":0.05},"
+          "\"threshold_outcome\":", stream);
+    fputs(passed ? "true" : "false", stream);
+    fputs(",\"receipt_path\":null,\"failure_reason\":", stream);
+    if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE)
+        json_string(stream, diagnostic->message);
+    else if (failure) json_string(stream, failure);
+    else fputs("null", stream);
+    fputs("}\n", stream);
+    return atomic_finish(stream, path);
+}
+
 static void pause_after_receipt_if_requested(void) {
 #ifdef H3_ANE_TOOL_TESTING
     const char *path = getenv("H3_ANE_TEST_PAUSE_AFTER_RECEIPT");
@@ -314,7 +355,8 @@ static void pause_after_invalidation_if_requested(void) {
 
 int main(int argc, char **argv) {
     const char *weights = NULL, *model = NULL, *output = NULL;
-    if (!parse_args(argc, argv, &weights, &model, &output)) {
+    int shadow_only = 0;
+    if (!parse_args(argc, argv, &weights, &model, &output, &shadow_only)) {
         usage(stderr); return 2;
     }
     signal(SIGINT, cancelled); signal(SIGTERM, cancelled);
@@ -352,8 +394,10 @@ int main(int argc, char **argv) {
     if (measured)
         measured = qualify(weights, model, &max_abs, &relative_l2,
                            source_sha, error, sizeof(error), &diagnostic);
+    double max_abs_bound = shadow_only ? 0.25 : 0.002;
+    double relative_l2_bound = shadow_only ? 0.05 : 0.02;
     int passed = measured && isfinite(max_abs) && isfinite(relative_l2) &&
-                 max_abs < 0.002 && relative_l2 < 0.02;
+                 max_abs < max_abs_bound && relative_l2 < relative_l2_bound;
     const char *failure = NULL;
     if (!measured) failure = error[0] ? error : "qualification execution failed";
     else if (!passed) {
@@ -367,12 +411,16 @@ int main(int argc, char **argv) {
         diagnostic.relative_l2 = relative_l2;
         diagnostic.has_metrics = 1;
     }
-    if (!write_result(output, passed, model_sha, source_sha, at, max_abs,
-                      relative_l2, failure, &diagnostic)) {
+    int result_written = shadow_only ?
+        write_shadow_result(output, passed, model_sha, source_sha, at, max_abs,
+                            relative_l2, failure, &diagnostic) :
+        write_result(output, passed, model_sha, source_sha, at, max_abs,
+                     relative_l2, failure, &diagnostic);
+    if (!result_written) {
         fprintf(stderr, "h3_ane_qualification: publication/result_write_failed\n");
         unlink(receipt); free(receipt); free(invalid); return 2;
     }
-    if (passed && !write_receipt(receipt, model_sha, source_sha, at,
+    if (!shadow_only && passed && !write_receipt(receipt, model_sha, source_sha, at,
                                  max_abs, relative_l2)) {
         passed = 0; failure = "cannot atomically write passing receipt";
         memset(&diagnostic, 0, sizeof(diagnostic));
@@ -387,7 +435,7 @@ int main(int argc, char **argv) {
             free(receipt); free(invalid); return 2;
         }
     }
-    if (passed) pause_after_receipt_if_requested();
+    if (!shadow_only && passed) pause_after_receipt_if_requested();
     else unlink(receipt);
     free(receipt); free(invalid);
     return passed ? 0 : 1;

@@ -10,6 +10,8 @@ LDLIBS := $(FRAMEWORKS) -licucore -lm
 ANE_UV_CACHE ?= /private/tmp/uv-cache
 ANE_INTEGRATION_WORK ?= /private/tmp/h3-ane-integration
 ANE_INTEGRATION_OUTPUT ?= .release-loop/evidence/ane-integration.json
+ANE_SHADOW_OUTPUT ?= .release-loop/evidence/U4/shadow-measurement.json
+ANE_SHADOW_WORK ?= /private/tmp/h3-ane-shadow-measurement
 ANE_PINNED_RUN := UV_CACHE_DIR=$(ANE_UV_CACHE) uv run --python 3.12 \
 	--with coremltools==9.0 --with numpy==2.3.2 --with safetensors==0.6.2
 
@@ -23,7 +25,8 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity h3_ane_tool_tests \
-	h3_ane_integration_test h3_ane_real_qualification_test clean
+	h3_ane_integration_test h3_ane_real_qualification_test \
+	h3_ane_shadow_measurement_test clean
 
 all: h3 libh3.a
 
@@ -73,6 +76,15 @@ h3_ane_real_qualification_test: h3_ane_integration_probe h3_ane_qualification
 	fi
 	$(ANE_PINNED_RUN) scripts/run_ane_integration.py real --repo "$(CURDIR)" \
 		--work-dir "$(ANE_INTEGRATION_WORK)" --output "$(ANE_INTEGRATION_OUTPUT)" \
+		--weights "$(H3_ANE_WEIGHT_DIR)"
+
+h3_ane_shadow_measurement_test: h3_ane_integration_probe h3_ane_qualification
+	@if test -z "$(H3_ANE_WEIGHT_DIR)"; then \
+		echo "H3_ANE_WEIGHT_DIR is required for h3_ane_shadow_measurement_test" >&2; \
+		exit 2; \
+	fi
+	$(ANE_PINNED_RUN) scripts/run_ane_integration.py shadow --repo "$(CURDIR)" \
+		--work-dir "$(ANE_SHADOW_WORK)" --output "$(ANE_SHADOW_OUTPUT)" \
 		--weights "$(H3_ANE_WEIGHT_DIR)"
 
 h3_ane_bench: tests/bench_ane.o $(LIB_OBJ)

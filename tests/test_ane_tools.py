@@ -453,6 +453,116 @@ pathlib.Path(str(model) + '.qualification.json').write_text(json.dumps(receipt))
         return subprocess.run(command, env=env, text=True, capture_output=True,
                               check=False), output, env, command
 
+    def test_shadow_success_is_non_authorizing_and_cleans_stale_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            converter, probe, qualifier = self.fixture_tools(root)
+            self.write_tool(qualifier, """
+import json, pathlib, sys
+assert '--shadow-only' in sys.argv
+model = pathlib.Path(sys.argv[sys.argv.index('--coreml-model') + 1])
+output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
+receipt = pathlib.Path(str(model) + '.qualification.json')
+receipt.unlink(missing_ok=True)
+output.write_text(json.dumps({
+    'schema': 'h3-ane-qualification/v1', 'status': 'passed',
+    'profile': 'shadow-measurement-v1', 'authority': False,
+    'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
+    'max_abs': 0.19, 'relative_l2': 0.038,
+    'bounds': {'max_abs': 0.25, 'relative_l2': 0.05},
+    'threshold_outcome': True,
+    'receipt_path': None}))
+""")
+            output = root / "summary.json"
+            env = os.environ.copy()
+            env.update({"H3_ANE_INTEGRATION_CONVERTER": str(converter),
+                        "H3_ANE_INTEGRATION_PROBE": str(probe),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(qualifier)})
+            weights = root / "weights"; weights.mkdir()
+            command = [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                       "shadow", "--repo", str(ROOT), "--work-dir", str(root / "work"),
+                       "--output", str(output), "--weights", str(weights)]
+            result = subprocess.run(command, env=env, text=True,
+                                    capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            document = json.loads(output.read_text())
+            self.assertEqual(document["status"], "passed")
+            self.assertEqual(document["mode"], "shadow")
+            self.assertEqual(document["profile"], "shadow-measurement-v1")
+            self.assertFalse(document["authority"])
+            self.assertEqual(document["parity"], {"max_abs": 0.19,
+                                                   "relative_l2": 0.038})
+            self.assertIsNone(document["receipt"])
+            self.assertFalse(Path(
+                f"{root / 'work' / 'visual-block.mlmodelc'}.qualification.json").exists())
+
+    def test_shadow_summary_publication_failure_cleans_measurement_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            converter, probe, qualifier = self.fixture_tools(root)
+            self.write_tool(qualifier, """
+import json, pathlib, sys
+assert '--shadow-only' in sys.argv
+output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
+output.write_text(json.dumps({
+    'schema': 'h3-ane-qualification/v1', 'status': 'passed',
+    'profile': 'shadow-measurement-v1', 'authority': False,
+    'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
+    'max_abs': 0.19, 'relative_l2': 0.038,
+    'bounds': {'max_abs': 0.25, 'relative_l2': 0.05},
+    'threshold_outcome': True,
+    'receipt_path': None}))
+""")
+            output = root / "output-directory"; output.mkdir()
+            work = root / "work"
+            weights = root / "weights"; weights.mkdir()
+            env = os.environ.copy()
+            env.update({"H3_ANE_INTEGRATION_CONVERTER": str(converter),
+                        "H3_ANE_INTEGRATION_PROBE": str(probe),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(qualifier)})
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                 "shadow", "--repo", str(ROOT), "--work-dir", str(work),
+                 "--output", str(output), "--weights", str(weights)],
+                env=env, text=True, capture_output=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((work / "qualification.json").exists())
+            self.assertFalse(Path(
+                f"{work / 'visual-block.mlmodelc'}.qualification.json").exists())
+
+    def test_shadow_rejects_out_of_bounds_passing_qualifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            converter, probe, qualifier = self.fixture_tools(root)
+            self.write_tool(qualifier, """
+import json, pathlib, sys
+output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
+output.write_text(json.dumps({
+    'schema': 'h3-ane-qualification/v1', 'status': 'passed',
+    'profile': 'shadow-measurement-v1', 'authority': False,
+    'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
+    'max_abs': 0.25, 'relative_l2': 0.05,
+    'bounds': {'max_abs': 0.25, 'relative_l2': 0.05},
+    'threshold_outcome': True, 'receipt_path': None}))
+""")
+            output = root / "summary.json"
+            weights = root / "weights"; weights.mkdir()
+            env = os.environ.copy()
+            env.update({"H3_ANE_INTEGRATION_CONVERTER": str(converter),
+                        "H3_ANE_INTEGRATION_PROBE": str(probe),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(qualifier)})
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                 "shadow", "--repo", str(ROOT),
+                 "--work-dir", str(root / "work"), "--output", str(output),
+                 "--weights", str(weights)], env=env, text=True,
+                capture_output=True, check=False)
+            self.assertEqual(result.returncode, 1)
+            document = json.loads(output.read_text())
+            self.assertEqual(document["diagnostic"]["code"],
+                             "shadow_authority_violation")
+            self.assertIsNone(document["receipt"])
+
     def test_exact_synthetic_fixture_contract_has_only_eight_pinned_tensors(self):
         self.assertEqual(len(self.coordinator.TENSOR_SHAPES), 8)
         self.assertEqual(self.coordinator.TENSOR_SHAPES[
@@ -807,6 +917,89 @@ class NativeToolTests(unittest.TestCase):
             self.assertIsNone(second["receipt_path"])
             self.assertNotIn(str(root), json.dumps(second))
             self.assertNotEqual(first["model_sha256"], second["model_sha256"])
+            self.assertFalse(receipt.exists())
+            self.assertTrue(Path(f"{receipt}.invalid").exists())
+
+    def run_shadow(self, root, metrics, *, output=None, extra_env=None):
+        root = Path(root)
+        model = root / "model.mlmodelc"
+        model.mkdir(exist_ok=True)
+        (model / "weights.bin").write_bytes(b"model")
+        output = output or root / "shadow.json"
+        env = os.environ.copy()
+        env.update({"H3_ANE_TEST_METRICS": metrics,
+                    "H3_ANE_TEST_SOURCE_SHA256": "1" * 64})
+        if extra_env:
+            env.update(extra_env)
+        command = [str(ROOT / "h3_ane_qualification_test"), "--shadow-only",
+                   "--model", "unused", "--coreml-model", str(model),
+                   "--output", str(output)]
+        return subprocess.run(command, env=env, text=True,
+                              capture_output=True, check=False), model, Path(output)
+
+    def test_shadow_bounds_profile_and_strict_threshold_preservation(self):
+        cases = [("0.249999,0.049999", 0), ("0.25,0.049", 1),
+                 ("0.24,0.05", 1), ("nan,0.01", 1), ("0.1,inf", 1)]
+        for metrics, expected in cases:
+            with self.subTest(metrics=metrics), tempfile.TemporaryDirectory() as root:
+                result, model, output = self.run_shadow(root, metrics)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                document = json.loads(output.read_text())
+                self.assertEqual(document["profile"], "shadow-measurement-v1")
+                self.assertFalse(document["authority"])
+                self.assertEqual(document["bounds"], {
+                    "max_abs": 0.25, "relative_l2": 0.05})
+                self.assertIsNone(document["receipt_path"])
+                self.assertFalse(Path(f"{model}.qualification.json").exists())
+        with tempfile.TemporaryDirectory() as root:
+            result, model, _ = self.run_shadow(root, "0.19,0.038")
+            self.assertEqual(result.returncode, 0)
+            strict = subprocess.run(
+                [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                 "--coreml-model", str(model), "--output", str(Path(root) / "strict.json")],
+                env={**os.environ, "H3_ANE_TEST_METRICS": "0.19,0.038",
+                     "H3_ANE_TEST_SOURCE_SHA256": "1" * 64},
+                capture_output=True, check=False)
+            self.assertEqual(strict.returncode, 1)
+            self.assertFalse(Path(f"{model}.qualification.json").exists())
+
+    def test_shadow_invalidates_stale_receipt_and_cancellation_is_atomic(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); model = root / "model.mlmodelc"; model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            receipt = Path(f"{model}.qualification.json"); receipt.write_text("stale")
+            result, _, output = self.run_shadow(root, "0.19,0.038")
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(receipt.exists())
+            self.assertTrue(Path(f"{receipt}.invalid").exists())
+            output.unlink()
+            marker = root / "synced"
+            process_env = {"H3_ANE_TEST_PAUSE_BEFORE_RENAME": str(marker),
+                           "H3_ANE_TEST_PAUSE_SUFFIX": "shadow.json"}
+            env = {**os.environ, "H3_ANE_TEST_METRICS": "0.19,0.038",
+                   "H3_ANE_TEST_SOURCE_SHA256": "1" * 64, **process_env}
+            command = [str(ROOT / "h3_ane_qualification_test"), "--shadow-only",
+                       "--model", "unused", "--coreml-model", str(model),
+                       "--output", str(output)]
+            process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE)
+            for _ in range(200):
+                if marker.exists(): break
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            process.terminate(); process.wait(timeout=5); process.communicate()
+            self.assertFalse(output.exists())
+            self.assertFalse(receipt.exists())
+            self.assertFalse(list(root.glob("shadow.json.tmp-*")))
+
+    def test_shadow_result_write_failure_leaves_no_authority(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); model = root / "model.mlmodelc"; model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            receipt = Path(f"{model}.qualification.json"); receipt.write_text("stale")
+            result, _, _ = self.run_shadow(
+                root, "0.19,0.038", output=root / "absent" / "shadow.json")
+            self.assertEqual(result.returncode, 2)
             self.assertFalse(receipt.exists())
             self.assertTrue(Path(f"{receipt}.invalid").exists())
 
