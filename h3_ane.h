@@ -105,6 +105,8 @@ const char *h3_ane_stage_name(h3_ane_stage stage);
 const char *h3_ane_code_name(h3_ane_code code);
 
 enum {
+    H3_ANE_MAX_OPERATIONS = 4096,
+    H3_ANE_MAX_OPERATION_DEPTH = 64,
     H3_ANE_DEVICE_CPU = 1u << 0,
     H3_ANE_DEVICE_GPU = 1u << 1,
     H3_ANE_DEVICE_NEURAL_ENGINE = 1u << 2
@@ -116,6 +118,17 @@ typedef struct {
     uint32_t supported_devices;
     uint32_t preferred_device;
 } h3_ane_operation_usage;
+
+typedef struct {
+    uint64_t total;
+    uint64_t constant;
+    uint64_t nonconstant;
+    uint64_t neural_engine_supported;
+    uint64_t cpu_only;
+    uint64_t gpu_only;
+    uint64_t unknown_nonconstant;
+    uint64_t constant_nil_usage;
+} h3_ane_inventory_summary;
 
 typedef struct {
     double load_seconds;
@@ -145,6 +158,8 @@ int h3_ane_predict(h3_ane *ane, const float *input, size_t input_count,
                    char *error, size_t error_size);
 void h3_ane_free(h3_ane *ane);
 void h3_ane_diagnostic_snapshot(h3_ane *ane, h3_ane_diagnostic *diagnostic);
+void h3_ane_inventory_snapshot(h3_ane *ane,
+                               h3_ane_inventory_summary *summary);
 
 #ifdef H3_ANE_TESTING
 typedef struct {
@@ -156,7 +171,19 @@ typedef struct {
     void *opaque;
 } h3_ane_test_backend;
 
+typedef struct h3_ane_test_plan_node {
+    h3_ane_operation_usage usage;
+    const struct h3_ane_test_plan_node *children;
+    size_t child_count;
+} h3_ane_test_plan_node;
+
 void h3_ane_test_set_backend(const h3_ane_test_backend *backend);
+int h3_ane_test_collect_plan(const h3_ane_test_plan_node *nodes,
+                             size_t node_count,
+                             h3_ane_operation_usage **operations,
+                             size_t *operation_count,
+                             h3_ane_inventory_summary *summary,
+                             h3_ane_diagnostic *diagnostic);
 int h3_ane_test_copy_to_strided(float *destination,
                                 const ptrdiff_t strides[5],
                                 const uint32_t shape[5],

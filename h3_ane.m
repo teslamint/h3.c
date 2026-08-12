@@ -13,8 +13,6 @@
 #include <sys/stat.h>
 #include <time.h>
 
-enum { H3_ANE_MAX_OPERATIONS = 256 };
-
 typedef int (*h3_ane_load_fn)(void *, h3_ane_diagnostic *);
 typedef int (*h3_ane_plan_fn)(void *, h3_ane_operation_usage *, size_t *,
                               h3_ane_diagnostic *);
@@ -31,6 +29,7 @@ struct h3_ane {
     h3_ane_stats stats;
     h3_ane_reason unavailable_reason;
     h3_ane_diagnostic diagnostic;
+    h3_ane_inventory_summary inventory;
     int backend_loaded;
     int real_backend;
     int test_backend;
@@ -359,6 +358,174 @@ static uint32_t device_bit(id<MLComputeDeviceProtocol> device)
     return 0;
 }
 
+typedef struct {
+    const h3_ane_plan_tree_adapter *adapter;
+    void *context;
+    h3_ane_operation_usage *operations;
+    size_t capacity;
+    size_t count;
+    h3_ane_inventory_summary summary;
+    h3_ane_diagnostic *diagnostic;
+} plan_walk;
+
+static int record_inventory_failure(plan_walk *walk, h3_ane_code code,
+                                    uint64_t observed, uint64_t limit,
+                                    const char *message) {
+    h3_ane_diagnostic_record_first(walk->diagnostic,
+                                   H3_ANE_STAGE_COMPUTE_PLAN, code,
+                                   H3_ANE_REASON_ELIGIBILITY, message);
+    if (walk->diagnostic && walk->diagnostic->code == code) {
+        walk->diagnostic->observed_count = observed;
+        walk->diagnostic->limit = limit;
+        walk->diagnostic->has_count = 1;
+    }
+    return 0;
+}
+
+static int walk_plan_node(plan_walk *walk, void *node, size_t depth) {
+    if (depth > H3_ANE_MAX_OPERATION_DEPTH)
+        return record_inventory_failure(
+            walk, H3_ANE_CODE_OPERATION_NESTING_LIMIT_EXCEEDED, depth,
+            H3_ANE_MAX_OPERATION_DEPTH, "operation nesting limit exceeded");
+    if (walk->count == H3_ANE_MAX_OPERATIONS)
+        return record_inventory_failure(
+            walk, H3_ANE_CODE_OPERATION_INVENTORY_LIMIT_EXCEEDED,
+            (uint64_t)walk->count + 1, H3_ANE_MAX_OPERATIONS,
+            "operation inventory limit exceeded");
+    h3_ane_operation_usage usage = {0};
+    walk->adapter->usage(walk->context, node, &usage);
+    if (walk->operations) {
+        if (walk->count >= walk->capacity)
+            return record_inventory_failure(
+                walk, H3_ANE_CODE_OPERATION_INVENTORY_CHANGED,
+                (uint64_t)walk->count + 1, walk->capacity,
+                "operation inventory changed between count and fill");
+        walk->operations[walk->count] = usage;
+    }
+    walk->count++;
+    walk->summary.total++;
+    if (usage.is_constant) {
+        walk->summary.constant++;
+        if (usage.supported_devices == 0 && usage.preferred_device == 0)
+            walk->summary.constant_nil_usage++;
+    } else {
+        walk->summary.nonconstant++;
+        if (usage.supported_devices == 0 || usage.preferred_device == 0) {
+            walk->summary.unknown_nonconstant++;
+            h3_ane_code code = usage.supported_devices == 0 ?
+                H3_ANE_CODE_OPERATION_USAGE_UNKNOWN : H3_ANE_CODE_DEVICE_UNKNOWN;
+            h3_ane_diagnostic_record_first(
+                walk->diagnostic, H3_ANE_STAGE_ELIGIBILITY, code,
+                H3_ANE_REASON_ELIGIBILITY,
+                usage.supported_devices == 0 ?
+                    "operation device usage is unknown" :
+                    "operation preferred device is unknown");
+        } else if (usage.supported_devices & H3_ANE_DEVICE_NEURAL_ENGINE) {
+            walk->summary.neural_engine_supported++;
+        } else {
+            if (usage.supported_devices == H3_ANE_DEVICE_CPU)
+                walk->summary.cpu_only++;
+            if (usage.supported_devices == H3_ANE_DEVICE_GPU)
+                walk->summary.gpu_only++;
+            h3_ane_diagnostic_record_first(
+                walk->diagnostic, H3_ANE_STAGE_ELIGIBILITY,
+                H3_ANE_CODE_OPERATION_NOT_NEURAL_ENGINE_SUPPORTED,
+                H3_ANE_REASON_ELIGIBILITY,
+                "operation is not Neural Engine supported");
+        }
+        if (walk->diagnostic && walk->diagnostic->code != H3_ANE_CODE_NONE &&
+            !walk->diagnostic->has_operation) {
+            snprintf(walk->diagnostic->operation,
+                     sizeof(walk->diagnostic->operation), "%s", usage.name);
+            walk->diagnostic->has_operation = 1;
+            walk->diagnostic->supported_devices = usage.supported_devices;
+            walk->diagnostic->preferred_device = usage.preferred_device;
+            walk->diagnostic->has_supported_devices = 1;
+            walk->diagnostic->has_preferred_device = 1;
+        }
+    }
+    size_t children = walk->adapter->child_count(walk->context, node);
+    for (size_t index = 0; index < children; index++)
+        if (!walk_plan_node(walk,
+                            walk->adapter->child_at(walk->context, node, index),
+                            depth + 1))
+            return 0;
+    return 1;
+}
+
+static int walk_plan_roots(plan_walk *walk) {
+    size_t roots = walk->adapter->root_count(walk->context);
+    for (size_t index = 0; index < roots; index++)
+        if (!walk_plan_node(walk,
+                            walk->adapter->root_at(walk->context, index), 0))
+            return 0;
+    if (walk->count == 0)
+        return record_inventory_failure(
+            walk, H3_ANE_CODE_OPERATION_INVENTORY_EMPTY, 0, 0,
+            "operation inventory is empty");
+    return 1;
+}
+
+int h3_ane_collect_plan_tree(const h3_ane_plan_tree_adapter *adapter,
+                             void *context,
+                             h3_ane_operation_usage **operations,
+                             size_t *operation_count,
+                             h3_ane_inventory_summary *summary,
+                             h3_ane_diagnostic *diagnostic) {
+    if (!adapter || !operations || !operation_count || !summary)
+        return 0;
+    *operations = NULL;
+    *operation_count = 0;
+    memset(summary, 0, sizeof(*summary));
+    plan_walk count_walk = {.adapter = adapter, .context = context,
+                            .diagnostic = diagnostic};
+    if (!walk_plan_roots(&count_walk)) return 0;
+    if (count_walk.count > SIZE_MAX / sizeof(**operations)) {
+        return record_inventory_failure(
+            &count_walk, H3_ANE_CODE_ALLOCATION_FAILED, count_walk.count,
+            SIZE_MAX / sizeof(**operations),
+            "operation inventory allocation overflow");
+    }
+    h3_ane_operation_usage *inventory =
+        calloc(count_walk.count, sizeof(*inventory));
+    if (!inventory) {
+        h3_ane_diagnostic_record_first(
+            diagnostic, H3_ANE_STAGE_COMPUTE_PLAN,
+            H3_ANE_CODE_ALLOCATION_FAILED, H3_ANE_REASON_ELIGIBILITY,
+            "operation inventory allocation failed");
+        return 0;
+    }
+    h3_ane_diagnostic fill_diagnostic = {0};
+    plan_walk fill_walk = {.adapter = adapter, .context = context,
+                           .operations = inventory,
+                           .capacity = count_walk.count,
+                           .diagnostic = &fill_diagnostic};
+    if (!walk_plan_roots(&fill_walk) || fill_walk.count != count_walk.count) {
+        free(inventory);
+        h3_ane_diagnostic_record_first(
+            diagnostic, H3_ANE_STAGE_COMPUTE_PLAN,
+            H3_ANE_CODE_OPERATION_INVENTORY_CHANGED,
+            H3_ANE_REASON_ELIGIBILITY,
+            "operation inventory changed between count and fill");
+        if (diagnostic &&
+            diagnostic->code == H3_ANE_CODE_OPERATION_INVENTORY_CHANGED) {
+            diagnostic->observed_count = fill_walk.count;
+            diagnostic->limit = count_walk.count;
+            diagnostic->has_count = 1;
+        }
+        return 0;
+    }
+    if (fill_diagnostic.code != H3_ANE_CODE_NONE) {
+        free(inventory);
+        h3_ane_diagnostic_merge_first(diagnostic, &fill_diagnostic);
+        return 0;
+    }
+    *operations = inventory;
+    *operation_count = fill_walk.count;
+    *summary = fill_walk.summary;
+    return 1;
+}
+
 static int real_load(void *opaque, h3_ane_diagnostic *diagnostic) {
     H3ANERealBackend *backend = (__bridge H3ANERealBackend *)opaque;
     @try {
@@ -456,33 +623,52 @@ static int real_load(void *opaque, h3_ane_diagnostic *diagnostic) {
     }
 }
 
-static int append_operations(MLComputePlan *plan,
-                             NSArray<MLModelStructureProgramOperation *> *source,
-                             h3_ane_operation_usage *operations,
-                             size_t capacity, size_t *count)
-    API_AVAILABLE(macos(14.4)) {
-    for (MLModelStructureProgramOperation *operation in source) {
-        if (*count >= capacity) return 0;
-        h3_ane_operation_usage *usage = &operations[*count];
-        memset(usage, 0, sizeof(*usage));
-        const char *name = operation.operatorName.UTF8String;
-        snprintf(usage->name, sizeof(usage->name), "%s",
-                 name ? name : "unknown");
-        usage->is_constant = [operation.operatorName isEqualToString:@"const"];
-        MLComputePlanDeviceUsage *deviceUsage =
-            [plan computeDeviceUsageForMLProgramOperation:operation];
-        for (id<MLComputeDeviceProtocol> device in
-             deviceUsage.supportedComputeDevices)
-            usage->supported_devices |= device_bit(device);
-        usage->preferred_device = device_bit(deviceUsage.preferredComputeDevice);
-        (*count)++;
-        for (MLModelStructureProgramBlock *block in operation.blocks) {
-            if (!append_operations(plan, block.operations, operations, capacity,
-                                   count))
-                return 0;
-        }
+typedef struct {
+    MLComputePlan *plan;
+    NSArray<MLModelStructureProgramOperation *> *roots;
+} real_plan_tree;
+
+static size_t real_root_count(void *context) {
+    return (size_t)((real_plan_tree *)context)->roots.count;
+}
+
+static void *real_root_at(void *context, size_t index) {
+    return (__bridge void *)((real_plan_tree *)context)->roots[index];
+}
+
+static size_t real_child_count(void *context, void *node) {
+    (void)context;
+    MLModelStructureProgramOperation *operation = (__bridge id)node;
+    size_t count = 0;
+    for (MLModelStructureProgramBlock *block in operation.blocks)
+        count += (size_t)block.operations.count;
+    return count;
+}
+
+static void *real_child_at(void *context, void *node, size_t index) {
+    (void)context;
+    MLModelStructureProgramOperation *operation = (__bridge id)node;
+    for (MLModelStructureProgramBlock *block in operation.blocks) {
+        size_t count = (size_t)block.operations.count;
+        if (index < count) return (__bridge void *)block.operations[index];
+        index -= count;
     }
-    return 1;
+    return NULL;
+}
+
+static void real_usage(void *context, void *node,
+                       h3_ane_operation_usage *usage)
+    API_AVAILABLE(macos(14.4)) {
+    real_plan_tree *tree = context;
+    MLModelStructureProgramOperation *operation = (__bridge id)node;
+    const char *name = operation.operatorName.UTF8String;
+    snprintf(usage->name, sizeof(usage->name), "%s", name ? name : "unknown");
+    usage->is_constant = [operation.operatorName isEqualToString:@"const"];
+    MLComputePlanDeviceUsage *deviceUsage =
+        [tree->plan computeDeviceUsageForMLProgramOperation:operation];
+    for (id<MLComputeDeviceProtocol> device in deviceUsage.supportedComputeDevices)
+        usage->supported_devices |= device_bit(device);
+    usage->preferred_device = device_bit(deviceUsage.preferredComputeDevice);
 }
 
 static int real_plan(void *opaque, h3_ane_operation_usage *operations,
@@ -531,13 +717,37 @@ static int real_plan(void *opaque, h3_ane_operation_usage *operations,
                     H3_ANE_REASON_ELIGIBILITY, "ML Program main function is missing");
                 return 0;
             }
-            size_t capacity = *operation_count;
+            real_plan_tree tree = {.plan = loadedPlan,
+                                   .roots = main.block.operations};
+            const h3_ane_plan_tree_adapter adapter = {
+                .root_count = real_root_count, .root_at = real_root_at,
+                .child_count = real_child_count, .child_at = real_child_at,
+                .usage = real_usage,
+            };
+            h3_ane_operation_usage *inventory = NULL;
             size_t count = 0;
-            if (!append_operations(loadedPlan, main.block.operations, operations,
-                                   capacity, &count))
+            h3_ane_inventory_summary summary;
+            if (!h3_ane_collect_plan_tree(&adapter, &tree, &inventory, &count,
+                                          &summary, diagnostic))
                 return 0;
+            if (!operations) {
+                *operation_count = count;
+                free(inventory);
+                return 1;
+            }
+            if (*operation_count != count) {
+                free(inventory);
+                h3_ane_diagnostic_record_first(
+                    diagnostic, H3_ANE_STAGE_COMPUTE_PLAN,
+                    H3_ANE_CODE_OPERATION_INVENTORY_CHANGED,
+                    H3_ANE_REASON_ELIGIBILITY,
+                    "operation inventory changed between count and fill");
+                return 0;
+            }
+            memcpy(operations, inventory, count * sizeof(*operations));
+            free(inventory);
             *operation_count = count;
-            return count > 0;
+            return 1;
         } @catch (__unused NSException *exception) {
             h3_ane_diagnostic_record_first(diagnostic,
                 H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_LOAD_FAILED,
@@ -674,15 +884,60 @@ static void initialize_real_backend(h3_ane *ane, const char *model_path) {
 }
 
 #ifdef H3_ANE_TESTING
+typedef struct {
+    const h3_ane_test_plan_node *nodes;
+    size_t count;
+} test_plan_tree;
+
+static size_t test_root_count(void *context) {
+    return ((test_plan_tree *)context)->count;
+}
+
+static void *test_root_at(void *context, size_t index) {
+    return (void *)&((test_plan_tree *)context)->nodes[index];
+}
+
+static size_t test_child_count(void *context, void *node) {
+    (void)context;
+    return ((h3_ane_test_plan_node *)node)->child_count;
+}
+
+static void *test_child_at(void *context, void *node, size_t index) {
+    (void)context;
+    return (void *)&((h3_ane_test_plan_node *)node)->children[index];
+}
+
+static void test_usage(void *context, void *node,
+                       h3_ane_operation_usage *usage) {
+    (void)context;
+    *usage = ((h3_ane_test_plan_node *)node)->usage;
+}
+
+int h3_ane_test_collect_plan(const h3_ane_test_plan_node *nodes,
+                             size_t node_count,
+                             h3_ane_operation_usage **operations,
+                             size_t *operation_count,
+                             h3_ane_inventory_summary *summary,
+                             h3_ane_diagnostic *diagnostic) {
+    test_plan_tree tree = {.nodes = nodes, .count = node_count};
+    const h3_ane_plan_tree_adapter adapter = {
+        .root_count = test_root_count, .root_at = test_root_at,
+        .child_count = test_child_count, .child_at = test_child_at,
+        .usage = test_usage,
+    };
+    return h3_ane_collect_plan_tree(&adapter, &tree, operations,
+                                    operation_count, summary, diagnostic);
+}
+
 static int call_test_plan_bounded(h3_ane *ane,
                                   h3_ane_operation_usage *operations,
                                   size_t *operation_count) {
     h3_ane_plan_fn plan = ane->plan;
     void *opaque = ane->opaque;
-    size_t capacity = *operation_count;
-    h3_ane_operation_usage *temporary =
-        calloc(capacity, sizeof(*temporary));
-    if (!temporary) return 0;
+    size_t capacity = operations ? *operation_count : 0;
+    h3_ane_operation_usage *temporary = operations ?
+        calloc(capacity, sizeof(*temporary)) : NULL;
+    if (operations && !temporary) return 0;
     __block int result = 0;
     __block size_t count = capacity;
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
@@ -695,7 +950,7 @@ static int call_test_plan_bounded(h3_ane *ane,
     long waitResult = dispatch_semaphore_wait(
         semaphore, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC));
     if (waitResult != 0) return 0;
-    if (count <= capacity)
+    if (operations && count <= capacity)
         memcpy(operations, temporary, count * sizeof(*operations));
     *operation_count = count;
     free(temporary);
@@ -871,15 +1126,15 @@ static h3_ane *create_impl(const char *model_path,
         return ane;
     }
     ane->backend_loaded = 1;
-    h3_ane_operation_usage operations[H3_ANE_MAX_OPERATIONS];
-    size_t operation_count = H3_ANE_MAX_OPERATIONS;
+    h3_ane_operation_usage *operations = NULL;
+    size_t operation_count = 0;
     int plan_result;
 #ifdef H3_ANE_TESTING
     if (ane->test_backend)
-        plan_result = call_test_plan_bounded(ane, operations, &operation_count);
+        plan_result = call_test_plan_bounded(ane, NULL, &operation_count);
     else
 #endif
-        plan_result = ane->plan(ane->opaque, operations, &operation_count,
+        plan_result = ane->plan(ane->opaque, NULL, &operation_count,
                                 &ane->diagnostic);
     if (plan_result <= 0 || operation_count == 0 ||
         operation_count > H3_ANE_MAX_OPERATIONS) {
@@ -897,10 +1152,69 @@ static h3_ane *create_impl(const char *model_path,
                          error, error_size, "Core ML compute plan is unavailable");
         return ane;
     }
+    if (operation_count > SIZE_MAX / sizeof(*operations)) {
+        record_first(ane, H3_ANE_STAGE_COMPUTE_PLAN,
+                     H3_ANE_CODE_ALLOCATION_FAILED,
+                     H3_ANE_REASON_ELIGIBILITY,
+                     "operation inventory allocation overflow");
+        mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
+                         "Core ML compute plan is unavailable");
+        return ane;
+    }
+    operations = calloc(operation_count, sizeof(*operations));
+    if (!operations) {
+        record_first(ane, H3_ANE_STAGE_COMPUTE_PLAN,
+                     H3_ANE_CODE_ALLOCATION_FAILED,
+                     H3_ANE_REASON_ELIGIBILITY,
+                     "operation inventory allocation failed");
+        mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
+                         "Core ML compute plan is unavailable");
+        return ane;
+    }
+    size_t fill_count = operation_count;
+#ifdef H3_ANE_TESTING
+    if (ane->test_backend)
+        plan_result = call_test_plan_bounded(ane, operations, &fill_count);
+    else
+#endif
+        plan_result = ane->plan(ane->opaque, operations, &fill_count,
+                                &ane->diagnostic);
+    if (plan_result <= 0 || fill_count != operation_count) {
+        free(operations);
+        record_first(ane, H3_ANE_STAGE_COMPUTE_PLAN,
+                     H3_ANE_CODE_OPERATION_INVENTORY_CHANGED,
+                     H3_ANE_REASON_ELIGIBILITY,
+                     "operation inventory changed between count and fill");
+        if (ane->diagnostic.code ==
+            H3_ANE_CODE_OPERATION_INVENTORY_CHANGED) {
+            ane->diagnostic.observed_count = fill_count;
+            ane->diagnostic.limit = operation_count;
+            ane->diagnostic.has_count = 1;
+        }
+        mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
+                         "Core ML compute plan is unavailable");
+        return ane;
+    }
     int trace = getenv("H3_ANE_TRACE") &&
                 strcmp(getenv("H3_ANE_TRACE"), "1") == 0;
     for (size_t index = 0; index < operation_count; index++) {
         h3_ane_operation_usage *usage = &operations[index];
+        ane->inventory.total++;
+        if (usage->is_constant) {
+            ane->inventory.constant++;
+            if (usage->supported_devices == 0 && usage->preferred_device == 0)
+                ane->inventory.constant_nil_usage++;
+        } else {
+            ane->inventory.nonconstant++;
+            if (usage->supported_devices == 0 || usage->preferred_device == 0)
+                ane->inventory.unknown_nonconstant++;
+            else if (usage->supported_devices & H3_ANE_DEVICE_NEURAL_ENGINE)
+                ane->inventory.neural_engine_supported++;
+            else if (usage->supported_devices == H3_ANE_DEVICE_CPU)
+                ane->inventory.cpu_only++;
+            else if (usage->supported_devices == H3_ANE_DEVICE_GPU)
+                ane->inventory.gpu_only++;
+        }
         ane->stats.preferred_device |= usage->preferred_device;
         if (trace) {
             fprintf(stderr,
@@ -932,6 +1246,7 @@ static h3_ane *create_impl(const char *model_path,
             }
             mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
                              "Core ML operation device usage is unknown");
+            free(operations);
             return ane;
         }
         if (!usage->is_constant &&
@@ -950,9 +1265,11 @@ static h3_ane *create_impl(const char *model_path,
             diagnostic->has_preferred_device = 1;
             mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
                              "Core ML operation is not Neural Engine eligible");
+            free(operations);
             return ane;
         }
     }
+    free(operations);
     ane->stats.last_reason = H3_ANE_REASON_NONE;
     set_error(error, error_size, "");
     return ane;
@@ -995,6 +1312,18 @@ void h3_ane_diagnostic_snapshot(h3_ane *ane,
     }
     pthread_mutex_lock(&ane->prediction_mutex);
     *diagnostic = ane->diagnostic;
+    pthread_mutex_unlock(&ane->prediction_mutex);
+}
+
+void h3_ane_inventory_snapshot(h3_ane *ane,
+                               h3_ane_inventory_summary *summary) {
+    if (!summary) return;
+    if (!ane) {
+        memset(summary, 0, sizeof(*summary));
+        return;
+    }
+    pthread_mutex_lock(&ane->prediction_mutex);
+    *summary = ane->inventory;
     pthread_mutex_unlock(&ane->prediction_mutex);
 }
 

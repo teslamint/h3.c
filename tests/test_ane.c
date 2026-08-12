@@ -370,6 +370,7 @@ typedef struct {
     const char *predict_block_ready_path;
     int active_predictions;
     int max_active_predictions;
+    size_t fill_operation_count;
     h3_ane_operation_usage operations[3];
     size_t operation_count;
 } fake_ane_backend;
@@ -399,11 +400,21 @@ static int fake_plan(void *opaque, h3_ane_operation_usage *operations,
                                        "Core ML compute plan load failed");
         return 0;
     }
+    if (!operations) {
+        *operation_count = fake->operation_count;
+        return fake->plan_result;
+    }
+    size_t fill_count = fake->fill_operation_count ?
+        fake->fill_operation_count : fake->operation_count;
+    if (*operation_count != fill_count) {
+        *operation_count = fill_count;
+        return fake->plan_result;
+    }
     require(*operation_count >= fake->operation_count,
             "bridge did not provide enough operation storage");
     memcpy(operations, fake->operations,
            fake->operation_count * sizeof(*operations));
-    *operation_count = fake->operation_count;
+    *operation_count = fill_count;
     return fake->plan_result;
 }
 
@@ -684,6 +695,144 @@ static void test_runtime_metadata(void) {
     }
 }
 
+static h3_ane_operation_usage eligible_usage(size_t index) {
+    h3_ane_operation_usage usage = {
+        .supported_devices = H3_ANE_DEVICE_CPU |
+                             H3_ANE_DEVICE_NEURAL_ENGINE,
+        .preferred_device = H3_ANE_DEVICE_NEURAL_ENGINE,
+    };
+    snprintf(usage.name, sizeof(usage.name), "operation-%zu", index);
+    return usage;
+}
+
+static void require_plan_failure(const h3_ane_test_plan_node *nodes,
+                                 size_t count, h3_ane_code code,
+                                 uint64_t observed, uint64_t limit,
+                                 const char *message) {
+    h3_ane_operation_usage *operations = NULL;
+    size_t operation_count = 0;
+    h3_ane_inventory_summary summary;
+    h3_ane_diagnostic diagnostic = {0};
+    require(!h3_ane_test_collect_plan(nodes, count, &operations,
+                                      &operation_count, &summary, &diagnostic),
+            message);
+    require(operations == NULL &&
+                diagnostic.stage == H3_ANE_STAGE_COMPUTE_PLAN &&
+                diagnostic.code == code && diagnostic.has_count &&
+                diagnostic.observed_count == observed &&
+                diagnostic.limit == limit,
+            message);
+}
+
+static void test_large_compute_plan_inventory(void) {
+    h3_ane_test_plan_node nodes[441] = {0};
+    for (size_t index = 0; index < 441; index++) {
+        nodes[index].usage = eligible_usage(index);
+        if (index >= 149) nodes[index].usage.is_constant = 1;
+    }
+    h3_ane_operation_usage *operations = NULL;
+    size_t operation_count = 0;
+    h3_ane_inventory_summary summary;
+    h3_ane_diagnostic diagnostic = {0};
+    require(h3_ane_test_collect_plan(nodes, 441, &operations,
+                                     &operation_count, &summary, &diagnostic),
+            "441-operation inventory was truncated or rejected");
+    require(operation_count == 441 && summary.total == 441 &&
+                summary.nonconstant == 149 && summary.constant == 292 &&
+                summary.neural_engine_supported == 149,
+            "441-operation inventory summary is incorrect");
+    free(operations);
+
+    h3_ane_test_plan_node unsupported = {
+        .usage = eligible_usage(0),
+    };
+    unsupported.usage.supported_devices = 0;
+    unsupported.usage.preferred_device = 0;
+    operations = NULL;
+    operation_count = 0;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(!h3_ane_test_collect_plan(&unsupported, 1, &operations,
+                                      &operation_count, &summary, &diagnostic) &&
+                diagnostic.stage == H3_ANE_STAGE_ELIGIBILITY &&
+                diagnostic.code == H3_ANE_CODE_OPERATION_USAGE_UNKNOWN,
+            "unknown nonconstant usage did not preserve first diagnostic");
+    unsupported.usage = eligible_usage(0);
+    unsupported.usage.supported_devices = H3_ANE_DEVICE_CPU;
+    unsupported.usage.preferred_device = H3_ANE_DEVICE_CPU;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(!h3_ane_test_collect_plan(&unsupported, 1, &operations,
+                                      &operation_count, &summary, &diagnostic) &&
+                diagnostic.code ==
+                    H3_ANE_CODE_OPERATION_NOT_NEURAL_ENGINE_SUPPORTED,
+            "CPU-only operation was accepted");
+    unsupported.usage.supported_devices = H3_ANE_DEVICE_GPU;
+    unsupported.usage.preferred_device = H3_ANE_DEVICE_GPU;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(!h3_ane_test_collect_plan(&unsupported, 1, &operations,
+                                      &operation_count, &summary, &diagnostic) &&
+                diagnostic.code ==
+                    H3_ANE_CODE_OPERATION_NOT_NEURAL_ENGINE_SUPPORTED,
+            "GPU-only operation was accepted");
+
+    h3_ane_test_plan_node *limit_nodes =
+        calloc(H3_ANE_MAX_OPERATIONS + 1, sizeof(*limit_nodes));
+    require(limit_nodes != NULL, "cannot allocate plan limit fixture");
+    for (size_t index = 0; index <= H3_ANE_MAX_OPERATIONS; index++)
+        limit_nodes[index].usage = eligible_usage(index);
+    operations = NULL;
+    operation_count = 0;
+    memset(&summary, 0, sizeof(summary));
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(h3_ane_test_collect_plan(limit_nodes, H3_ANE_MAX_OPERATIONS,
+                                     &operations, &operation_count, &summary,
+                                     &diagnostic) &&
+                operation_count == H3_ANE_MAX_OPERATIONS,
+            "4096-operation inventory was rejected");
+    free(operations);
+    require_plan_failure(limit_nodes, H3_ANE_MAX_OPERATIONS + 1,
+                         H3_ANE_CODE_OPERATION_INVENTORY_LIMIT_EXCEEDED,
+                         H3_ANE_MAX_OPERATIONS + 1, H3_ANE_MAX_OPERATIONS,
+                         "4097-operation inventory did not fail at limit");
+    free(limit_nodes);
+
+    h3_ane_test_plan_node depth[65] = {0};
+    for (size_t index = 0; index < 65; index++) {
+        depth[index].usage = eligible_usage(index);
+        if (index + 1 < 65) {
+            depth[index].children = &depth[index + 1];
+            depth[index].child_count = 1;
+        }
+    }
+    operations = NULL;
+    operation_count = 0;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(h3_ane_test_collect_plan(depth, 1, &operations, &operation_count,
+                                     &summary, &diagnostic) &&
+                operation_count == 65,
+            "depth-64 nested inventory was rejected");
+    free(operations);
+    depth[64].children = &depth[64];
+    depth[64].child_count = 1;
+    require_plan_failure(depth, 1,
+                         H3_ANE_CODE_OPERATION_NESTING_LIMIT_EXCEEDED,
+                         H3_ANE_MAX_OPERATION_DEPTH + 1,
+                         H3_ANE_MAX_OPERATION_DEPTH,
+                         "depth-65 inventory did not fail at nesting limit");
+
+    h3_ane_test_plan_node constant_nil = {
+        .usage = {.name = "constant-nil", .is_constant = 1},
+    };
+    operations = NULL;
+    operation_count = 0;
+    memset(&summary, 0, sizeof(summary));
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(h3_ane_test_collect_plan(&constant_nil, 1, &operations,
+                                     &operation_count, &summary, &diagnostic) &&
+                summary.constant_nil_usage == 1,
+            "constant nil usage was rejected or not counted");
+    free(operations);
+}
+
 typedef struct {
     h3_ane *ane;
     const float *input;
@@ -732,7 +881,7 @@ static void test_runtime_bridge(const char *root) {
     install_fake_backend(&fake);
     ane = h3_ane_create_authorized(model_path, &contract, 0, error,
                                    sizeof(error));
-    require(ane != NULL && fake.load_count == 1 && fake.plan_count == 1,
+    require(ane != NULL && fake.load_count == 1 && fake.plan_count == 2,
             "explicit authorized creation depended on H3_ANE_MODEL");
     h3_ane_free(ane);
 
@@ -754,9 +903,16 @@ static void test_runtime_bridge(const char *root) {
     install_fake_backend(&fake);
     ane = create_enabled(model_path, &contract, 0, error);
     require(ane != NULL, error);
-    require(fake.load_count == 1 && fake.plan_count == 1,
-            "qualified fake backend did not load and plan exactly once");
+    require(fake.load_count == 1 && fake.plan_count == 2,
+            "qualified fake backend did not complete count and fill planning");
     require(!h3_ane_is_shadow(ane), "qualified handle became shadow");
+    h3_ane_inventory_summary runtime_inventory;
+    h3_ane_inventory_snapshot(ane, &runtime_inventory);
+    require(runtime_inventory.total == 3 &&
+                runtime_inventory.constant == 1 &&
+                runtime_inventory.nonconstant == 2 &&
+                runtime_inventory.neural_engine_supported == 2,
+            "runtime inventory snapshot is incorrect");
     const size_t count = (size_t)1 * 1 * 256 * 256 * 128;
     float *input = calloc(count, sizeof(*input));
     float *output = calloc(count, sizeof(*output));
@@ -789,6 +945,21 @@ static void test_runtime_bridge(const char *root) {
             "failed call inherited timing from the previous prediction");
     h3_ane_free(ane);
     require(fake.free_count == 1, "loaded backend was not freed exactly once");
+
+    fake = valid_fake_backend();
+    fake.fill_operation_count = fake.operation_count + 1;
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    h3_ane_diagnostic drift_diagnostic;
+    h3_ane_diagnostic_snapshot(ane, &drift_diagnostic);
+    require(drift_diagnostic.stage == H3_ANE_STAGE_COMPUTE_PLAN &&
+                drift_diagnostic.code ==
+                    H3_ANE_CODE_OPERATION_INVENTORY_CHANGED &&
+                drift_diagnostic.has_count &&
+                drift_diagnostic.observed_count == 4 &&
+                drift_diagnostic.limit == 3,
+            "count/fill drift lost its exact first diagnostic context");
+    h3_ane_free(ane);
 
     char shadow_path[512];
     make_directory(shadow_path, root, "shadow-model");
@@ -1293,6 +1464,7 @@ int main(void) {
     test_contract_is_exact();
     test_compiled_directory_receipt_integration(root);
     test_runtime_metadata();
+    test_large_compute_plan_inventory();
     test_multiarray_stride_copy();
     test_first_diagnostic_is_immutable();
     test_complete_diagnostic_taxonomy();
