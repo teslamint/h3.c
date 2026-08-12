@@ -79,7 +79,8 @@ static int timestamp(char value[32]) {
 }
 
 static int source_digest(const char *directory, char digest[65],
-                         char *error, size_t error_size) {
+                         char *error, size_t error_size,
+                         h3_ane_diagnostic *diagnostic) {
     static const char *const names[] = {
         "encoder.down.0.block.0.norm1.weight",
         "encoder.down.0.block.0.norm1.bias",
@@ -91,8 +92,18 @@ static int source_digest(const char *directory, char digest[65],
         "encoder.down.0.block.0.conv2.bias",
     };
     h3_weight_store *store = h3_weight_store_open(directory, error, error_size);
-    int ok = store && h3_ane_sha256_tensors(
+    if (!store) {
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_ARTIFACT,
+            H3_ANE_CODE_SOURCE_WEIGHTS_UNREADABLE, H3_ANE_REASON_FINGERPRINT,
+            "source weights are unreadable");
+        return 0;
+    }
+    int ok = h3_ane_sha256_tensors(
         store, names, sizeof(names) / sizeof(*names), digest, error, error_size);
+    if (!ok)
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_ARTIFACT,
+            H3_ANE_CODE_SOURCE_TENSOR_DIGEST_FAILED,
+            H3_ANE_REASON_FINGERPRINT, "source tensor digest failed");
     h3_weight_store_free(store);
     return ok;
 }
@@ -118,14 +129,17 @@ static int parse_test_metrics(double *max_abs, double *relative_l2,
 
 static int qualify(const char *weights, const char *model, double *max_abs,
                    double *relative_l2, char source[65], char *error,
-                   size_t error_size) {
+                   size_t error_size, h3_ane_diagnostic *diagnostic) {
     if (parse_test_metrics(max_abs, relative_l2, source)) return 1;
-    if (!source_digest(weights, source, error, error_size)) return 0;
+    if (!source_digest(weights, source, error, error_size, diagnostic)) return 0;
     const size_t count = (size_t)1 * 1 * 256 * 256 * 128;
     float *input = malloc(count * sizeof(*input));
     float *metal = malloc(count * sizeof(*metal));
     float *coreml = malloc(count * sizeof(*coreml));
     if (!input || !metal || !coreml) {
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_SETUP,
+            H3_ANE_CODE_ALLOCATION_FAILED, H3_ANE_REASON_LOAD,
+            "qualification vector allocation failed");
         snprintf(error, error_size, "out of memory allocating qualification vectors");
         free(input); free(metal); free(coreml);
         return 0;
@@ -136,7 +150,8 @@ static int qualify(const char *weights, const char *model, double *max_abs,
         input[index] = ((float)(state & UINT32_C(0xffff)) / 32767.5f) - 1.0f;
     }
     int ok = h3_video_encoder_block0_qualification(
-        weights, model, input, count, metal, coreml, count, error, error_size);
+        weights, model, input, count, metal, coreml, count, diagnostic,
+        error, error_size);
     double maximum = 0.0, squared_error = 0.0, squared_reference = 0.0;
     for (size_t index = 0; ok && index < count; index++) {
         double difference = (double)metal[index] - coreml[index];
@@ -157,6 +172,13 @@ static int qualify(const char *weights, const char *model, double *max_abs,
 static int write_receipt(const char *path, const char *model_sha,
                          const char *source_sha, const char *qualified_at,
                          double max_abs, double relative_l2) {
+#ifdef H3_ANE_TOOL_TESTING
+    const char *fail_write = getenv("H3_ANE_TEST_FAIL_RECEIPT_WRITE");
+    if (fail_write && strcmp(fail_write, "1") == 0) {
+        errno = EIO;
+        return 0;
+    }
+#endif
     int descriptor = atomic_open(path);
     if (descriptor < 0) return 0;
     FILE *stream = fdopen(descriptor, "w");
@@ -173,7 +195,8 @@ static int write_receipt(const char *path, const char *model_sha,
 static int write_result(const char *path, int passed, const char *model_sha,
                         const char *source_sha, const char *qualified_at,
                         double max_abs, double relative_l2,
-                        const char *receipt_path, const char *failure) {
+                        const char *receipt_path, const char *failure,
+                        const h3_ane_diagnostic *diagnostic) {
     int descriptor = atomic_open(path);
     if (descriptor < 0) return 0;
     FILE *stream = fdopen(descriptor, "w");
@@ -187,6 +210,64 @@ static int write_result(const char *path, int passed, const char *model_sha,
     json_string(stream, receipt_path);
     fputs(",\"failure_reason\":", stream);
     if (failure) json_string(stream, failure); else fputs("null", stream);
+    fputs(",\"failure_stage\":", stream);
+    if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE) {
+        static const char *const stages[] = {
+            "none", "setup", "artifact", "contract", "receipt", "load",
+            "compute_plan", "eligibility", "input", "prediction", "output",
+            "parity", "publication",
+        };
+        json_string(stream, stages[diagnostic->stage]);
+    } else fputs("null", stream);
+    fputs(",\"failure_code\":", stream);
+    if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE) {
+        static const char *const codes[] = {
+            "none", "disabled", "os_unsupported", "allocation_failed",
+            "compiled_model_unreadable", "compiled_model_digest_failed",
+            "source_weights_unreadable", "source_tensor_digest_failed",
+            "metadata_missing", "metadata_mismatch", "fingerprint_mismatch",
+            "shape_mismatch", "dtype_mismatch", "receipt_missing",
+            "receipt_malformed", "receipt_digest_mismatch", "receipt_invalid",
+            "model_load_failed", "model_load_exception", "plan_timeout",
+            "plan_load_failed", "program_missing", "main_missing",
+            "operation_inventory_empty", "operation_inventory_limit_exceeded",
+            "operation_nesting_limit_exceeded", "operation_inventory_changed",
+            "operation_usage_unknown", "operation_not_neural_engine_supported",
+            "device_unknown", "input_shape_mismatch", "input_dtype_mismatch",
+            "input_copy_failed", "prediction_failed", "prediction_exception",
+            "output_shape_mismatch", "output_dtype_mismatch", "output_copy_failed",
+            "output_nonfinite", "parity_metrics_nonfinite", "parity_bounds_failed",
+            "result_write_failed", "receipt_write_failed",
+        };
+        json_string(stream, codes[diagnostic->code]);
+    } else fputs("null", stream);
+    fputs(",\"failure_operation\":", stream);
+    if (diagnostic && diagnostic->has_operation)
+        json_string(stream, diagnostic->operation);
+    else fputs("null", stream);
+    fputs(",\"supported_devices\":", stream);
+    if (diagnostic && diagnostic->has_supported_devices) {
+        fputc('[', stream);
+        int separator = 0;
+        if (diagnostic->supported_devices & H3_ANE_DEVICE_CPU) {
+            json_string(stream, "cpu"); separator = 1;
+        }
+        if (diagnostic->supported_devices & H3_ANE_DEVICE_GPU) {
+            if (separator) fputc(',', stream); json_string(stream, "gpu"); separator = 1;
+        }
+        if (diagnostic->supported_devices & H3_ANE_DEVICE_NEURAL_ENGINE) {
+            if (separator) fputc(',', stream); json_string(stream, "neural-engine");
+        }
+        fputc(']', stream);
+    } else fputs("null", stream);
+    fputs(",\"preferred_device\":", stream);
+    if (diagnostic && diagnostic->has_preferred_device) {
+        const char *device = diagnostic->preferred_device == H3_ANE_DEVICE_CPU ?
+            "cpu" : diagnostic->preferred_device == H3_ANE_DEVICE_GPU ? "gpu" :
+            diagnostic->preferred_device == H3_ANE_DEVICE_NEURAL_ENGINE ?
+            "neural-engine" : NULL;
+        if (device) json_string(stream, device); else fputs("null", stream);
+    } else fputs("null", stream);
     fputs("}\n", stream);
     return atomic_finish(stream, path);
 }
@@ -241,27 +322,52 @@ int main(int argc, char **argv) {
 
     char model_sha[65] = "", source_sha[65] = "", at[32] = "";
     char error[512] = "";
+    h3_ane_diagnostic diagnostic = {0};
     double max_abs = 0.0, relative_l2 = 0.0;
-    int measured = h3_ane_sha256_directory(model, model_sha, error, sizeof(error)) &&
-                   timestamp(at) && qualify(weights, model, &max_abs, &relative_l2,
-                                            source_sha, error, sizeof(error));
+    int measured = h3_ane_sha256_directory(model, model_sha, error, sizeof(error));
+    if (!measured)
+        h3_ane_diagnostic_record_first(&diagnostic, H3_ANE_STAGE_ARTIFACT,
+            H3_ANE_CODE_COMPILED_MODEL_DIGEST_FAILED,
+            H3_ANE_REASON_FINGERPRINT, "compiled model digest failed");
+    if (measured && !timestamp(at)) {
+        measured = 0;
+        h3_ane_diagnostic_record_first(&diagnostic, H3_ANE_STAGE_SETUP,
+            H3_ANE_CODE_ALLOCATION_FAILED, H3_ANE_REASON_LOAD,
+            "qualification timestamp failed");
+    }
+    if (measured)
+        measured = qualify(weights, model, &max_abs, &relative_l2,
+                           source_sha, error, sizeof(error), &diagnostic);
     int passed = measured && isfinite(max_abs) && isfinite(relative_l2) &&
                  max_abs < 0.002 && relative_l2 < 0.02;
     const char *failure = NULL;
     if (!measured) failure = error[0] ? error : "qualification execution failed";
-    else if (!passed) failure = "parity bounds failed";
+    else if (!passed) {
+        failure = "parity bounds failed";
+        h3_ane_diagnostic_record_first(&diagnostic, H3_ANE_STAGE_PARITY,
+            (!isfinite(max_abs) || !isfinite(relative_l2)) ?
+                H3_ANE_CODE_PARITY_METRICS_NONFINITE :
+                H3_ANE_CODE_PARITY_BOUNDS_FAILED,
+            H3_ANE_REASON_PREDICTION, "parity qualification failed");
+        diagnostic.max_abs = max_abs;
+        diagnostic.relative_l2 = relative_l2;
+        diagnostic.has_metrics = 1;
+    }
     if (!write_result(output, passed, model_sha, source_sha, at, max_abs,
-                      relative_l2, receipt, failure)) {
-        fprintf(stderr, "h3_ane_qualification: cannot write result: %s\n",
-                strerror(errno));
+                      relative_l2, receipt, failure, &diagnostic)) {
+        fprintf(stderr, "h3_ane_qualification: publication/result_write_failed\n");
         unlink(receipt); free(receipt); free(invalid); return 2;
     }
     if (passed && !write_receipt(receipt, model_sha, source_sha, at,
                                  max_abs, relative_l2)) {
         passed = 0; failure = "cannot atomically write passing receipt";
+        memset(&diagnostic, 0, sizeof(diagnostic));
+        h3_ane_diagnostic_record_first(&diagnostic, H3_ANE_STAGE_PUBLICATION,
+            H3_ANE_CODE_RECEIPT_WRITE_FAILED, H3_ANE_REASON_RECEIPT,
+            "qualification receipt publication failed");
         unlink(receipt);
         (void)write_result(output, 0, model_sha, source_sha, at, max_abs,
-                           relative_l2, receipt, failure);
+                           relative_l2, receipt, failure, &diagnostic);
     }
     if (passed) pause_after_receipt_if_requested();
     else unlink(receipt);

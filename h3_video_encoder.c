@@ -928,6 +928,7 @@ int h3_video_encoder_block0_qualification(
     const char *weight_directory, const char *model_path,
     const float *input, size_t input_count, float *metal_output,
     float *coreml_output, size_t output_count,
+    h3_ane_diagnostic *diagnostic,
     char *error, size_t error_size) {
     const size_t expected = (size_t)1 * 1 * 256 * 256 * 128;
     if (error && error_size) error[0] = '\0';
@@ -963,6 +964,7 @@ int h3_video_encoder_block0_qualification(
     if (ok) ok = h3_ane_predict(encoder.ane, input, input_count,
                                 coreml_output, output_count,
                                 &encoder.ane_stats, error, error_size);
+    h3_ane_diagnostic_snapshot(encoder.ane, diagnostic);
     h3_gpu_tensor_free(metal);
     h3_gpu_tensor_free(original);
     cleanup(&encoder);

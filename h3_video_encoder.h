@@ -31,6 +31,7 @@ int h3_video_encoder_block0_qualification(
     const char *weight_directory, const char *model_path,
     const float *input, size_t input_count, float *metal_output,
     float *coreml_output, size_t output_count,
+    h3_ane_diagnostic *diagnostic,
     char *error, size_t error_size);
 #ifdef H3_ANE_TESTING
 int h3_video_encoder_test_ane_candidate(

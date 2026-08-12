@@ -234,6 +234,10 @@ class NativeToolTests(unittest.TestCase):
             self.assertEqual(passed.returncode, 0, passed.stderr)
             first = json.loads(result_path.read_text())
             self.assertEqual(first["status"], "passed")
+            for field in ("failure_reason", "failure_stage", "failure_code",
+                          "failure_operation", "supported_devices",
+                          "preferred_device"):
+                self.assertIsNone(first[field])
             self.assertTrue(receipt.exists())
 
             (model / "weights.bin").write_bytes(b"changed")
@@ -243,9 +247,62 @@ class NativeToolTests(unittest.TestCase):
             self.assertNotEqual(failed.returncode, 0)
             second = json.loads(result_path.read_text())
             self.assertEqual(second["status"], "failed")
+            self.assertEqual(second["failure_stage"], "parity")
+            self.assertEqual(second["failure_code"], "parity_bounds_failed")
+            self.assertIsNone(second["failure_operation"])
+            self.assertIsNone(second["supported_devices"])
+            self.assertIsNone(second["preferred_device"])
             self.assertNotEqual(first["model_sha256"], second["model_sha256"])
             self.assertFalse(receipt.exists())
             self.assertTrue(Path(f"{receipt}.invalid").exists())
+
+    def test_result_write_failure_is_stderr_only_and_leaves_no_receipt(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            model = root / "model.mlmodelc"
+            model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            receipt = Path(f"{model}.qualification.json")
+            env = os.environ.copy()
+            env.update({
+                "H3_ANE_TEST_METRICS": "0.001,0.01",
+                "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+            })
+            result = subprocess.run(
+                [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                 "--coreml-model", str(model), "--output", str(root / "absent" / "result.json")],
+                env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("publication/result_write_failed", result.stderr)
+            self.assertNotIn(str(root), result.stderr)
+            self.assertFalse(receipt.exists())
+
+    def test_receipt_write_failure_rewrites_result_without_authority(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            model = root / "model.mlmodelc"
+            model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            output = root / "result.json"
+            receipt = Path(f"{model}.qualification.json")
+            env = os.environ.copy()
+            env.update({
+                "H3_ANE_TEST_METRICS": "0.001,0.01",
+                "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+                "H3_ANE_TEST_FAIL_RECEIPT_WRITE": "1",
+            })
+            result = subprocess.run(
+                [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                 "--coreml-model", str(model), "--output", str(output)],
+                env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            document = json.loads(output.read_text())
+            self.assertEqual(document["status"], "failed")
+            self.assertEqual(document["failure_stage"], "publication")
+            self.assertEqual(document["failure_code"], "receipt_write_failed")
+            self.assertFalse(receipt.exists())
 
     def test_receipt_is_final_commit_point_under_post_receipt_signal(self):
         with tempfile.TemporaryDirectory() as root:

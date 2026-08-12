@@ -374,20 +374,31 @@ typedef struct {
     size_t operation_count;
 } fake_ane_backend;
 
-static int fake_load(void *opaque) {
+static int fake_load(void *opaque, h3_ane_diagnostic *diagnostic) {
     fake_ane_backend *fake = opaque;
     fake->load_count++;
+    if (!fake->load_result)
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_LOAD,
+                                       H3_ANE_CODE_MODEL_LOAD_FAILED,
+                                       H3_ANE_REASON_LOAD,
+                                       "Core ML model load failed");
     return fake->load_result;
 }
 
 static int fake_plan(void *opaque, h3_ane_operation_usage *operations,
-                     size_t *operation_count) {
+                     size_t *operation_count, h3_ane_diagnostic *diagnostic) {
     fake_ane_backend *fake = opaque;
     fake->plan_count++;
     if (fake->plan_never_completes) {
         for (;;) pause();
     }
-    if (!fake->plan_result) return 0;
+    if (!fake->plan_result) {
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_COMPUTE_PLAN,
+                                       H3_ANE_CODE_PLAN_LOAD_FAILED,
+                                       H3_ANE_REASON_ELIGIBILITY,
+                                       "Core ML compute plan load failed");
+        return 0;
+    }
     require(*operation_count >= fake->operation_count,
             "bridge did not provide enough operation storage");
     memcpy(operations, fake->operations,
@@ -397,7 +408,8 @@ static int fake_plan(void *opaque, h3_ane_operation_usage *operations,
 }
 
 static int fake_predict(void *opaque, const float *input, size_t input_count,
-                        float *output, size_t output_count) {
+                        float *output, size_t output_count,
+                        h3_ane_diagnostic *diagnostic) {
     fake_ane_backend *fake = opaque;
     fake->predict_count++;
     fake->active_predictions++;
@@ -410,6 +422,10 @@ static int fake_predict(void *opaque, const float *input, size_t input_count,
         for (;;) pause();
     }
     if (!fake->predict_result) {
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_PREDICTION,
+                                       H3_ANE_CODE_PREDICTION_FAILED,
+                                       H3_ANE_REASON_PREDICTION,
+                                       "Core ML prediction failed");
         fake->active_predictions--;
         return 0;
     }
@@ -516,6 +532,42 @@ static void test_multiarray_stride_copy(void) {
     ptrdiff_t invalid[5] = {16, 16, 8, 4, -1};
     require(!h3_ane_test_copy_from_strided(roundtrip, storage, invalid, shape),
             "negative MLMultiArray stride was accepted");
+}
+
+static void test_first_diagnostic_is_immutable(void) {
+    h3_ane_diagnostic diagnostic = {0};
+    h3_ane_diagnostic_record_first(
+        &diagnostic, H3_ANE_STAGE_CONTRACT, H3_ANE_CODE_METADATA_MISSING,
+        H3_ANE_REASON_CONTRACT, "creator metadata is missing");
+    h3_ane_diagnostic_record_first(
+        &diagnostic, H3_ANE_STAGE_PREDICTION, H3_ANE_CODE_PREDICTION_FAILED,
+        H3_ANE_REASON_PREDICTION, "later prediction failed");
+    require(diagnostic.stage == H3_ANE_STAGE_CONTRACT &&
+                diagnostic.code == H3_ANE_CODE_METADATA_MISSING &&
+                diagnostic.reason == H3_ANE_REASON_CONTRACT &&
+                strcmp(diagnostic.message, "creator metadata is missing") == 0,
+            "later failure replaced the first diagnostic");
+    h3_ane_diagnostic source = {0};
+    h3_ane_diagnostic_record_first(
+        &source, H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_OUTPUT_NONFINITE,
+        H3_ANE_REASON_NONFINITE, "Core ML output is non-finite");
+    h3_ane_diagnostic_merge_first(&diagnostic, &source);
+    require(diagnostic.code == H3_ANE_CODE_METADATA_MISSING,
+            "merge replaced an existing diagnostic");
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    h3_ane_diagnostic_merge_first(&diagnostic, &source);
+    require(diagnostic.code == H3_ANE_CODE_OUTPUT_NONFINITE,
+            "merge did not preserve a source diagnostic");
+
+    char long_message[400];
+    memset(long_message, 'x', sizeof(long_message));
+    long_message[sizeof(long_message) - 1] = '\0';
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    h3_ane_diagnostic_record_first(
+        &diagnostic, H3_ANE_STAGE_SETUP, H3_ANE_CODE_ALLOCATION_FAILED,
+        H3_ANE_REASON_LOAD, long_message);
+    require(diagnostic.message[sizeof(diagnostic.message) - 1] == '\0',
+            "diagnostic message is not bounded and terminated");
 }
 
 static size_t capture_create_diagnostic(const char *model_path,
@@ -1120,7 +1172,8 @@ static void test_video_encoder_ane_surface(void) {
     require(latent.ane_stats.attempts == 0,
             "video latent ANE stats do not initialize to zero");
     int (*qualification)(const char *, const char *, const float *, size_t,
-                         float *, float *, size_t, char *, size_t) =
+                         float *, float *, size_t, h3_ane_diagnostic *,
+                         char *, size_t) =
         h3_video_encoder_block0_qualification;
     require(qualification != NULL,
             "video encoder qualification surface is unavailable");
@@ -1197,6 +1250,7 @@ int main(void) {
     test_compiled_directory_receipt_integration(root);
     test_runtime_metadata();
     test_multiarray_stride_copy();
+    test_first_diagnostic_is_immutable();
     test_runtime_bridge(root);
     test_dispatch_fallback(root);
     test_video_encoder_ane_surface();

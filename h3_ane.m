@@ -14,9 +14,11 @@
 
 enum { H3_ANE_MAX_OPERATIONS = 256 };
 
-typedef int (*h3_ane_load_fn)(void *);
-typedef int (*h3_ane_plan_fn)(void *, h3_ane_operation_usage *, size_t *);
-typedef int (*h3_ane_predict_fn)(void *, const float *, size_t, float *, size_t);
+typedef int (*h3_ane_load_fn)(void *, h3_ane_diagnostic *);
+typedef int (*h3_ane_plan_fn)(void *, h3_ane_operation_usage *, size_t *,
+                              h3_ane_diagnostic *);
+typedef int (*h3_ane_predict_fn)(void *, const float *, size_t, float *, size_t,
+                                 h3_ane_diagnostic *);
 typedef void (*h3_ane_free_fn)(void *);
 
 struct h3_ane {
@@ -27,6 +29,7 @@ struct h3_ane {
     void *opaque;
     h3_ane_stats stats;
     h3_ane_reason unavailable_reason;
+    h3_ane_diagnostic diagnostic;
     int backend_loaded;
     int real_backend;
     int test_backend;
@@ -74,6 +77,32 @@ static double monotonic_seconds(void) {
 static void set_error(char *error, size_t error_size, const char *message) {
     if (!error || error_size == 0) return;
     snprintf(error, error_size, "%s", message ? message : "ANE failure");
+}
+
+void h3_ane_diagnostic_record_first(h3_ane_diagnostic *diagnostic,
+                                    h3_ane_stage stage, h3_ane_code code,
+                                    h3_ane_reason reason,
+                                    const char *message) {
+    if (!diagnostic || diagnostic->code != H3_ANE_CODE_NONE ||
+        code == H3_ANE_CODE_NONE) return;
+    diagnostic->stage = stage;
+    diagnostic->code = code;
+    diagnostic->reason = reason;
+    snprintf(diagnostic->message, sizeof(diagnostic->message), "%s",
+             message ? message : "ANE failure");
+}
+
+void h3_ane_diagnostic_merge_first(h3_ane_diagnostic *destination,
+                                   const h3_ane_diagnostic *source) {
+    if (!destination || destination->code != H3_ANE_CODE_NONE || !source ||
+        source->code == H3_ANE_CODE_NONE) return;
+    *destination = *source;
+}
+
+static void record_first(h3_ane *ane, h3_ane_stage stage, h3_ane_code code,
+                         h3_ane_reason reason, const char *message) {
+    if (ane) h3_ane_diagnostic_record_first(&ane->diagnostic, stage, code,
+                                            reason, message);
 }
 
 static int diagnostics_enabled(void) {
@@ -296,7 +325,7 @@ static uint32_t device_bit(id<MLComputeDeviceProtocol> device)
     return 0;
 }
 
-static int real_load(void *opaque) {
+static int real_load(void *opaque, h3_ane_diagnostic *diagnostic) {
     H3ANERealBackend *backend = (__bridge H3ANERealBackend *)opaque;
     @try {
         NSURL *url = [NSURL fileURLWithPath:backend.modelPath];
@@ -306,13 +335,43 @@ static int real_load(void *opaque) {
         MLModel *model = [MLModel modelWithContentsOfURL:url
                                           configuration:configuration
                                                   error:&error];
-        if (!model || error) return 0;
+        if (!model || error) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_LOAD,
+                H3_ANE_CODE_MODEL_LOAD_FAILED, H3_ANE_REASON_LOAD,
+                "Core ML model load failed");
+            return 0;
+        }
         h3_ane_contract contract = backend.contract;
+        id creatorMetadata = model.modelDescription.metadata[MLModelCreatorDefinedKey];
+        if (![creatorMetadata isKindOfClass:[NSDictionary class]]) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_CONTRACT,
+                H3_ANE_CODE_METADATA_MISSING, H3_ANE_REASON_CONTRACT,
+                "creator metadata is missing");
+            return -(int)H3_ANE_REASON_CONTRACT;
+        }
+        static NSArray<NSString *> *requiredKeys;
+        static dispatch_once_t metadataOnce;
+        dispatch_once(&metadataOnce, ^{
+            requiredKeys = @[@"version", @"variant", @"block_level",
+                @"block_index", @"weight_prefix", @"boundary_dtype",
+                @"shape", @"source_sha256"];
+        });
+        for (NSString *key in requiredKeys) {
+            if (![creatorMetadata[key] isKindOfClass:[NSString class]]) {
+                h3_ane_diagnostic_record_first(diagnostic,
+                    H3_ANE_STAGE_CONTRACT, H3_ANE_CODE_METADATA_MISSING,
+                    H3_ANE_REASON_CONTRACT, "creator metadata is missing");
+                return -(int)H3_ANE_REASON_CONTRACT;
+            }
+        }
         h3_ane_reason metadataReason = validate_creator_metadata(
-            model.modelDescription.metadata[MLModelCreatorDefinedKey],
-            &contract);
-        if (metadataReason != H3_ANE_REASON_NONE)
+            creatorMetadata, &contract);
+        if (metadataReason != H3_ANE_REASON_NONE) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_CONTRACT,
+                H3_ANE_CODE_METADATA_MISMATCH, metadataReason,
+                "creator metadata is missing or incompatible");
             return -(int)metadataReason;
+        }
         NSDictionary<NSString *, MLFeatureDescription *> *inputs =
             model.modelDescription.inputDescriptionsByName;
         NSDictionary<NSString *, MLFeatureDescription *> *outputs =
@@ -340,6 +399,9 @@ static int real_load(void *opaque) {
         backend.outputName = outputName;
         return 1;
     } @catch (__unused NSException *exception) {
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_LOAD,
+            H3_ANE_CODE_MODEL_LOAD_EXCEPTION, H3_ANE_REASON_LOAD,
+            "Core ML model load raised an exception");
         return 0;
     }
 }
@@ -374,7 +436,7 @@ static int append_operations(MLComputePlan *plan,
 }
 
 static int real_plan(void *opaque, h3_ane_operation_usage *operations,
-                     size_t *operation_count) {
+                     size_t *operation_count, h3_ane_diagnostic *diagnostic) {
     if (@available(macOS 14.4, *)) {
         H3ANERealBackend *backend = (__bridge H3ANERealBackend *)opaque;
         @try {
@@ -393,10 +455,32 @@ static int real_plan(void *opaque, h3_ane_operation_usage *operations,
             long waitResult = dispatch_semaphore_wait(
                 semaphore,
                 dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
-            if (waitResult != 0) return 0;
+            if (waitResult != 0) {
+                h3_ane_diagnostic_record_first(diagnostic,
+                    H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_TIMEOUT,
+                    H3_ANE_REASON_ELIGIBILITY, "Core ML compute plan timed out");
+                return 0;
+            }
             MLModelStructureProgram *program = loadedPlan.modelStructure.program;
             MLModelStructureProgramFunction *main = program.functions[@"main"];
-            if (!loadedPlan || !program || !main) return 0;
+            if (!loadedPlan) {
+                h3_ane_diagnostic_record_first(diagnostic,
+                    H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_LOAD_FAILED,
+                    H3_ANE_REASON_ELIGIBILITY, "Core ML compute plan load failed");
+                return 0;
+            }
+            if (!program) {
+                h3_ane_diagnostic_record_first(diagnostic,
+                    H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PROGRAM_MISSING,
+                    H3_ANE_REASON_ELIGIBILITY, "ML Program is missing");
+                return 0;
+            }
+            if (!main) {
+                h3_ane_diagnostic_record_first(diagnostic,
+                    H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_MAIN_MISSING,
+                    H3_ANE_REASON_ELIGIBILITY, "ML Program main function is missing");
+                return 0;
+            }
             size_t capacity = *operation_count;
             size_t count = 0;
             if (!append_operations(loadedPlan, main.block.operations, operations,
@@ -405,6 +489,9 @@ static int real_plan(void *opaque, h3_ane_operation_usage *operations,
             *operation_count = count;
             return count > 0;
         } @catch (__unused NSException *exception) {
+            h3_ane_diagnostic_record_first(diagnostic,
+                H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_LOAD_FAILED,
+                H3_ANE_REASON_ELIGIBILITY, "Core ML compute plan load failed");
             return 0;
         }
     }
@@ -412,7 +499,8 @@ static int real_plan(void *opaque, h3_ane_operation_usage *operations,
 }
 
 static int real_predict(void *opaque, const float *input, size_t input_count,
-                        float *output, size_t output_count) {
+                        float *output, size_t output_count,
+                        h3_ane_diagnostic *diagnostic) {
     H3ANERealBackend *backend = (__bridge H3ANERealBackend *)opaque;
     @try {
         NSError *error = nil;
@@ -441,7 +529,12 @@ static int real_predict(void *opaque, const float *input, size_t input_count,
         id<MLFeatureProvider> prediction =
             [backend.model predictionFromFeatures:provider error:&error];
         backend.predictionSeconds = monotonic_seconds() - start;
-        if (!prediction || error) return 0;
+        if (!prediction || error) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_PREDICTION,
+                H3_ANE_CODE_PREDICTION_FAILED, H3_ANE_REASON_PREDICTION,
+                "Core ML prediction failed");
+            return 0;
+        }
         start = monotonic_seconds();
         MLFeatureValue *value = [prediction featureValueForName:backend.outputName];
         MLMultiArray *array = value.multiArrayValue;
@@ -463,6 +556,9 @@ static int real_predict(void *opaque, const float *input, size_t input_count,
         backend.outputSeconds = monotonic_seconds() - start;
         return 1;
     } @catch (__unused NSException *exception) {
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_PREDICTION,
+            H3_ANE_CODE_PREDICTION_EXCEPTION, H3_ANE_REASON_PREDICTION,
+            "Core ML prediction raised an exception");
         return 0;
     }
 }
@@ -498,7 +594,7 @@ static int call_test_plan_bounded(h3_ane *ane,
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @autoreleasepool {
-            result = plan(opaque, temporary, &count);
+            result = plan(opaque, temporary, &count, &ane->diagnostic);
             dispatch_semaphore_signal(semaphore);
         }
     });
@@ -544,18 +640,26 @@ static h3_ane *create_impl(const char *model_path,
     if (!model_path || !*model_path ||
         (!authorized && (!enabled_path || !*enabled_path ||
                          strcmp(model_path, enabled_path) != 0))) {
+        record_first(ane, H3_ANE_STAGE_SETUP, H3_ANE_CODE_DISABLED,
+                     H3_ANE_REASON_DISABLED, "ANE backend is disabled");
         mark_unavailable(ane, H3_ANE_REASON_DISABLED, error, error_size,
                          "ANE backend is disabled");
         return ane;
     }
     if (![[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:
             (NSOperatingSystemVersion){14, 4, 0}]) {
+        record_first(ane, H3_ANE_STAGE_SETUP, H3_ANE_CODE_OS_UNSUPPORTED,
+                     H3_ANE_REASON_OS, "ANE backend requires macOS 14.4 or later");
         mark_unavailable(ane, H3_ANE_REASON_OS, error, error_size,
                          "ANE backend requires macOS 14.4 or later");
         return ane;
     }
     h3_ane_reason contract_reason = validate_contract(contract);
     if (contract_reason != H3_ANE_REASON_NONE) {
+        record_first(ane, H3_ANE_STAGE_CONTRACT,
+                     contract_reason == H3_ANE_REASON_DTYPE ?
+                         H3_ANE_CODE_DTYPE_MISMATCH : H3_ANE_CODE_METADATA_MISMATCH,
+                     contract_reason, "ANE model contract is incompatible");
         mark_unavailable(ane, contract_reason, error, error_size,
                          "ANE model contract is incompatible");
         return ane;
@@ -563,6 +667,10 @@ static h3_ane *create_impl(const char *model_path,
     if (!shadow) {
         char digest[65];
         if (!h3_ane_sha256_directory(model_path, digest, error, error_size)) {
+            record_first(ane, H3_ANE_STAGE_ARTIFACT,
+                         H3_ANE_CODE_COMPILED_MODEL_DIGEST_FAILED,
+                         H3_ANE_REASON_FINGERPRINT,
+                         "compiled model digest failed");
             mark_unavailable(ane, H3_ANE_REASON_FINGERPRINT, error, error_size,
                              "cannot fingerprint compiled ANE model");
             return ane;
@@ -571,6 +679,8 @@ static h3_ane *create_impl(const char *model_path,
                               strlen(".qualification.json") + 1;
         char *receipt_path = malloc(receipt_size);
         if (!receipt_path) {
+            record_first(ane, H3_ANE_STAGE_SETUP, H3_ANE_CODE_ALLOCATION_FAILED,
+                         H3_ANE_REASON_LOAD, "receipt path allocation failed");
             pthread_mutex_destroy(&ane->prediction_mutex);
             free(ane);
             set_error(error, error_size, "cannot allocate receipt path");
@@ -581,17 +691,29 @@ static h3_ane *create_impl(const char *model_path,
         int loaded = h3_ane_receipt_load(receipt_path, &receipt, error, error_size);
         free(receipt_path);
         if (!loaded) {
+            record_first(ane, H3_ANE_STAGE_RECEIPT,
+                         H3_ANE_CODE_RECEIPT_MALFORMED,
+                         H3_ANE_REASON_RECEIPT,
+                         "qualification receipt is missing or malformed");
             mark_unavailable(ane, H3_ANE_REASON_RECEIPT, error, error_size,
                              "ANE qualification receipt is missing or invalid");
             return ane;
         }
         if (strcmp(receipt.source_sha256, contract->source_sha256) != 0) {
+            record_first(ane, H3_ANE_STAGE_RECEIPT,
+                         H3_ANE_CODE_FINGERPRINT_MISMATCH,
+                         H3_ANE_REASON_FINGERPRINT,
+                         "source fingerprint does not match");
             mark_unavailable(ane, H3_ANE_REASON_FINGERPRINT, error, error_size,
                              "ANE source fingerprint does not match");
             return ane;
         }
         if (!h3_ane_receipt_validate(contract, &receipt, digest, error,
                                      error_size)) {
+            record_first(ane, H3_ANE_STAGE_RECEIPT,
+                         H3_ANE_CODE_RECEIPT_INVALID,
+                         H3_ANE_REASON_RECEIPT,
+                         "qualification receipt is invalid");
             mark_unavailable(ane, H3_ANE_REASON_RECEIPT, error, error_size,
                              "ANE qualification receipt does not match");
             return ane;
@@ -615,14 +737,18 @@ static h3_ane *create_impl(const char *model_path,
     }
 
     if (!ane->load || !ane->plan || !ane->predict || !ane->free_backend) {
+        record_first(ane, H3_ANE_STAGE_LOAD, H3_ANE_CODE_MODEL_LOAD_FAILED,
+                     H3_ANE_REASON_LOAD, "ANE backend is incomplete");
         mark_unavailable(ane, H3_ANE_REASON_LOAD, error, error_size,
                          "ANE backend is incomplete");
         return ane;
     }
     double start = monotonic_seconds();
-    int load_result = ane->load(ane->opaque);
+    int load_result = ane->load(ane->opaque, &ane->diagnostic);
     ane->stats.load_seconds = monotonic_seconds() - start;
     if (load_result <= 0) {
+        record_first(ane, H3_ANE_STAGE_LOAD, H3_ANE_CODE_MODEL_LOAD_FAILED,
+                     H3_ANE_REASON_LOAD, "Core ML model load failed");
         mark_unavailable(ane, callback_reason(load_result, H3_ANE_REASON_LOAD),
                          error, error_size, "Core ML model load failed");
         return ane;
@@ -636,9 +762,18 @@ static h3_ane *create_impl(const char *model_path,
         plan_result = call_test_plan_bounded(ane, operations, &operation_count);
     else
 #endif
-        plan_result = ane->plan(ane->opaque, operations, &operation_count);
+        plan_result = ane->plan(ane->opaque, operations, &operation_count,
+                                &ane->diagnostic);
     if (plan_result <= 0 || operation_count == 0 ||
         operation_count > H3_ANE_MAX_OPERATIONS) {
+        h3_ane_code plan_code = H3_ANE_CODE_PLAN_LOAD_FAILED;
+        if (plan_result > 0 && operation_count == 0)
+            plan_code = H3_ANE_CODE_OPERATION_INVENTORY_EMPTY;
+        else if (operation_count > H3_ANE_MAX_OPERATIONS)
+            plan_code = H3_ANE_CODE_OPERATION_INVENTORY_LIMIT_EXCEEDED;
+        record_first(ane, H3_ANE_STAGE_COMPUTE_PLAN, plan_code,
+                     H3_ANE_REASON_ELIGIBILITY,
+                     "Core ML compute plan is unavailable");
         mark_unavailable(ane,
                          callback_reason(plan_result,
                                          H3_ANE_REASON_ELIGIBILITY),
@@ -659,6 +794,18 @@ static h3_ane *create_impl(const char *model_path,
         }
         if (!usage->is_constant &&
             !(usage->supported_devices & H3_ANE_DEVICE_NEURAL_ENGINE)) {
+            record_first(ane, H3_ANE_STAGE_ELIGIBILITY,
+                         H3_ANE_CODE_OPERATION_NOT_NEURAL_ENGINE_SUPPORTED,
+                         H3_ANE_REASON_ELIGIBILITY,
+                         "operation is not Neural Engine supported");
+            h3_ane_diagnostic *diagnostic = &ane->diagnostic;
+            snprintf(diagnostic->operation, sizeof(diagnostic->operation), "%s",
+                     usage->name);
+            diagnostic->has_operation = 1;
+            diagnostic->supported_devices = usage->supported_devices;
+            diagnostic->has_supported_devices = 1;
+            diagnostic->preferred_device = usage->preferred_device;
+            diagnostic->has_preferred_device = 1;
             mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
                              "Core ML operation is not Neural Engine eligible");
             return ane;
@@ -694,6 +841,18 @@ void h3_ane_stats_snapshot(h3_ane *ane, h3_ane_stats *stats) {
     }
     pthread_mutex_lock(&ane->prediction_mutex);
     *stats = ane->stats;
+    pthread_mutex_unlock(&ane->prediction_mutex);
+}
+
+void h3_ane_diagnostic_snapshot(h3_ane *ane,
+                                h3_ane_diagnostic *diagnostic) {
+    if (!diagnostic) return;
+    if (!ane) {
+        memset(diagnostic, 0, sizeof(*diagnostic));
+        return;
+    }
+    pthread_mutex_lock(&ane->prediction_mutex);
+    *diagnostic = ane->diagnostic;
     pthread_mutex_unlock(&ane->prediction_mutex);
 }
 
@@ -765,15 +924,21 @@ static int predict_impl(h3_ane *ane, const float *input, size_t input_count,
                                   error_size, "ANE backend is unavailable");
     const size_t expected = (size_t)1 * 1 * 256 * 256 * 128;
     if (!input || !output || input_count != expected || output_count != expected)
+        record_first(ane, H3_ANE_STAGE_INPUT, H3_ANE_CODE_INPUT_SHAPE_MISMATCH,
+                     H3_ANE_REASON_SHAPE, "ANE boundary shape is invalid");
+    if (!input || !output || input_count != expected || output_count != expected)
         return prediction_failure(ane, H3_ANE_REASON_SHAPE, stats, error,
                                   error_size, "ANE boundary shape is invalid");
     float *scratch = malloc(output_count * sizeof(*scratch));
+    if (!scratch)
+        record_first(ane, H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_ALLOCATION_FAILED,
+                     H3_ANE_REASON_PREDICTION, "ANE output allocation failed");
     if (!scratch)
         return prediction_failure(ane, H3_ANE_REASON_PREDICTION, stats, error,
                                   error_size, "cannot allocate ANE output");
     double start = monotonic_seconds();
     int result = ane->predict(ane->opaque, input, input_count, scratch,
-                              output_count);
+                              output_count, &ane->diagnostic);
     double elapsed = monotonic_seconds() - start;
     if (ane->real_backend) {
         H3ANERealBackend *backend = (__bridge H3ANERealBackend *)ane->opaque;
@@ -784,6 +949,9 @@ static int predict_impl(h3_ane *ane, const float *input, size_t input_count,
         ane->stats.prediction_seconds = elapsed;
     }
     if (result <= 0) {
+        record_first(ane, H3_ANE_STAGE_PREDICTION,
+                     H3_ANE_CODE_PREDICTION_FAILED,
+                     H3_ANE_REASON_PREDICTION, "Core ML prediction failed");
         free(scratch);
         return prediction_failure(
             ane, callback_reason(result, H3_ANE_REASON_PREDICTION), stats,
@@ -791,6 +959,10 @@ static int predict_impl(h3_ane *ane, const float *input, size_t input_count,
     }
     for (size_t index = 0; index < output_count; index++) {
         if (!isfinite(scratch[index])) {
+            record_first(ane, H3_ANE_STAGE_OUTPUT,
+                         H3_ANE_CODE_OUTPUT_NONFINITE,
+                         H3_ANE_REASON_NONFINITE,
+                         "Core ML output is non-finite");
             free(scratch);
             return prediction_failure(ane, H3_ANE_REASON_NONFINITE, stats,
                                       error, error_size,
