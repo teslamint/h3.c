@@ -1,0 +1,66 @@
+{
+  "schema": "h3-ane-design-probe/v2",
+  "observed_at": "2026-08-12T01:31:31Z",
+  "environment": {
+    "chip_class": "Apple M4 Max",
+    "macos": "26.6.1",
+    "clang": "Apple clang 21.0.0",
+    "python": "3.12",
+    "coremltools": "9.0",
+    "numpy": "2.3.2",
+    "safetensors": "0.6.2",
+    "compute_units": "CPUAndNeuralEngine",
+    "minimum_deployment_target": "macOS 14"
+  },
+  "source": {
+    "graph_probe": "design-real-5d-probe.py",
+    "graph_probe_sha256": "d10cc6135639dfee4500c0b08e7f663a836e95d8e5ad80e5348f58307e195610",
+    "plan_probe": "design-plan-probe.m",
+    "plan_probe_sha256": "0c4ee35839676308952919a104798a20c32d5f998992dbf1a56196f1d88588ec",
+    "source_tensor_sha256": "ad7b9b6432fc3c31c095bd6918c47ea5d6d0f145f4fae33fd46e0fc2738ce163"
+  },
+  "commands": [
+    "UV_CACHE_DIR=/private/tmp/uv-cache uv run --python 3.12 --with coremltools==9.0 --with numpy==2.3.2 --with safetensors==0.6.2 python docs/evidence/ane-eligibility/design-real-5d-probe.py --repo . --weights MiniMax-H3/FL2VA/video_vae/source --package /private/tmp/ane-real-5d.mlpackage --compiled /private/tmp/ane-real-5d.mlmodelc",
+    "xcrun clang -fobjc-arc -fblocks -mmacosx-version-min=14.4 -framework Foundation -framework CoreML docs/evidence/ane-eligibility/design-plan-probe.m -o /private/tmp/ane-design-plan-probe",
+    "/private/tmp/ane-design-plan-probe /private/tmp/ane-real-5d.mlmodelc > /private/tmp/ane-design-plan.txt",
+    "H3_ANE_TRACE=1 ./h3_ane_qualification --model MiniMax-H3/FL2VA/video_vae/source --coreml-model /private/tmp/ane-real-5d.mlmodelc --output /private/tmp/ane-real-5d-result.json"
+  ],
+  "compiled_artifact": {
+    "boundary": "F32 NDHWC [1,1,256,256,128]",
+    "metadata_json_sha256": "1496fcebd454b1e3ca68a4f5b2b734fea78ee796478ef0a635500f679462c714",
+    "model_mil_sha256": "911ebad1754a9eeb8259379c1d4e1e58fdfdd38f7d8b24f409674585ecb70a4a",
+    "plan_output_sha256": "01c8ddd2e6394ac224de310828ada12c83b98b0ec1a74ccf41e4f92876c20510"
+  },
+  "unbounded_plan_inventory": {
+    "total_operations": 441,
+    "nonconstant_operations": 149,
+    "neural_engine_supported_nonconstant_operations": 149,
+    "cpu_only_nonconstant_operations": 0,
+    "unknown_nonconstant_operations": 0,
+    "constant_operations_without_usage": 292,
+    "nonconstant_inventory": [
+      {"name": "ios16.silu", "count": 2, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "ios17.add", "count": 3, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "ios17.cast", "count": 2, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "ios17.concat", "count": 2, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "ios17.conv", "count": 2, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "ios17.expand_dims", "count": 1, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "ios17.layer_norm", "count": 64, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "ios17.mul", "count": 2, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "ios17.slice_by_index", "count": 64, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "ios17.squeeze", "count": 1, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "ios17.transpose", "count": 4, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"},
+      {"name": "pad", "count": 2, "supported": ["cpu", "neural-engine"], "preferred": "neural-engine"}
+    ]
+  },
+  "production_runtime_probe": {
+    "status": "failed",
+    "failure_stage": "compute_plan",
+    "failure_code": "operation_inventory_limit_exceeded",
+    "current_limit": 256,
+    "required_operations": 441,
+    "qualification_result_sha256": "76bb7379576fb62a7a1ff58c199a1f6b336a081b84b8f8ad1b821b801782eabc",
+    "receipt_written": false
+  },
+  "interpretation": "The exact 5D real-weight candidate is mathematically and compute-plan promising, but it is not production-loadable until the bounded operation-inventory collector supports 441 operations. Eligibility is preflight evidence only and does not prove observed Neural Engine execution."
+}
