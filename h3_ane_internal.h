@@ -39,4 +39,8 @@ void h3_ane_record_current_attempt_fallback(h3_ane *ane,
                                             h3_ane_reason reason,
                                             h3_ane_stats *stats);
 
+#ifdef H3_ANE_TESTING
+int64_t h3_ane_test_plan_wait_nanoseconds(double deadline, double now);
+#endif
+
 #endif

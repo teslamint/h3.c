@@ -42,6 +42,8 @@ struct h3_ane {
 @property(nonatomic, strong) MLModel *model;
 @property(nonatomic, copy) NSString *inputName;
 @property(nonatomic, copy) NSString *outputName;
+@property(nonatomic, strong) MLComputePlan *computePlan;
+@property(nonatomic) double computePlanDeadline;
 @property(nonatomic) double inputSeconds;
 @property(nonatomic) double predictionSeconds;
 @property(nonatomic) double outputSeconds;
@@ -73,6 +75,19 @@ static double monotonic_seconds(void) {
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &value) != 0) return 0.0;
     return (double)value.tv_sec + (double)value.tv_nsec / 1000000000.0;
 }
+
+static int64_t plan_wait_nanoseconds(double deadline, double now) {
+    double remaining = deadline - now;
+    if (remaining <= 0.0) return 0;
+    if (remaining >= 5.0) return 5LL * NSEC_PER_SEC;
+    return (int64_t)(remaining * (double)NSEC_PER_SEC);
+}
+
+#ifdef H3_ANE_TESTING
+int64_t h3_ane_test_plan_wait_nanoseconds(double deadline, double now) {
+    return plan_wait_nanoseconds(deadline, now);
+}
+#endif
 
 static void set_error(char *error, size_t error_size, const char *message) {
     if (!error || error_size == 0) return;
@@ -713,26 +728,45 @@ static int real_plan(void *opaque, h3_ane_operation_usage *operations,
     if (@available(macOS 14.4, *)) {
         H3ANERealBackend *backend = (__bridge H3ANERealBackend *)opaque;
         @try {
-            MLModelConfiguration *configuration = [[MLModelConfiguration alloc] init];
-            configuration.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
-            __block MLComputePlan *loadedPlan = nil;
-            dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-            [MLComputePlan loadContentsOfURL:
-                               [NSURL fileURLWithPath:backend.modelPath]
-                                configuration:configuration
-                            completionHandler:^(MLComputePlan *plan,
-                                                __unused NSError *error) {
-                loadedPlan = plan;
-                dispatch_semaphore_signal(semaphore);
-            }];
-            long waitResult = dispatch_semaphore_wait(
-                semaphore,
-                dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
-            if (waitResult != 0) {
-                h3_ane_diagnostic_record_first(diagnostic,
-                    H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_TIMEOUT,
-                    H3_ANE_REASON_ELIGIBILITY, "Core ML compute plan timed out");
-                return 0;
+            MLComputePlan *loadedPlan = backend.computePlan;
+            if (!loadedPlan) {
+                double now = monotonic_seconds();
+                if (backend.computePlanDeadline <= 0.0)
+                    backend.computePlanDeadline = now + 5.0;
+                int64_t waitNanoseconds = plan_wait_nanoseconds(
+                    backend.computePlanDeadline, now);
+                if (waitNanoseconds == 0) {
+                    h3_ane_diagnostic_record_first(diagnostic,
+                        H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_TIMEOUT,
+                        H3_ANE_REASON_ELIGIBILITY,
+                        "Core ML compute plan timed out");
+                    return 0;
+                }
+                MLModelConfiguration *configuration =
+                    [[MLModelConfiguration alloc] init];
+                configuration.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+                __block MLComputePlan *completedPlan = nil;
+                dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+                [MLComputePlan loadContentsOfURL:
+                                   [NSURL fileURLWithPath:backend.modelPath]
+                                    configuration:configuration
+                                completionHandler:^(MLComputePlan *plan,
+                                                    __unused NSError *error) {
+                    completedPlan = plan;
+                    dispatch_semaphore_signal(semaphore);
+                }];
+                long waitResult = dispatch_semaphore_wait(
+                    semaphore,
+                    dispatch_time(DISPATCH_TIME_NOW, waitNanoseconds));
+                if (waitResult != 0) {
+                    h3_ane_diagnostic_record_first(diagnostic,
+                        H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_TIMEOUT,
+                        H3_ANE_REASON_ELIGIBILITY,
+                        "Core ML compute plan timed out");
+                    return 0;
+                }
+                loadedPlan = completedPlan;
+                backend.computePlan = loadedPlan;
             }
             MLModelStructureProgram *program = loadedPlan.modelStructure.program;
             MLModelStructureProgramFunction *main = program.functions[@"main"];

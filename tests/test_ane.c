@@ -488,6 +488,18 @@ static void install_fake_backend(fake_ane_backend *fake) {
     h3_ane_test_set_backend(&backend);
 }
 
+static void test_shared_plan_deadline(void) {
+    require(h3_ane_test_plan_wait_nanoseconds(105.0, 100.0) ==
+                5LL * 1000 * 1000 * 1000,
+            "compute-plan deadline did not allow the initial five seconds");
+    require(h3_ane_test_plan_wait_nanoseconds(105.0, 102.25) ==
+                2750LL * 1000 * 1000,
+            "compute-plan fill pass received a fresh timeout");
+    require(h3_ane_test_plan_wait_nanoseconds(105.0, 105.0) == 0 &&
+                h3_ane_test_plan_wait_nanoseconds(105.0, 106.0) == 0,
+            "expired compute-plan deadline still allowed a wait");
+}
+
 static void make_qualified_model(const char *root, const char *name,
                                  const char *source, char model_path[512]) {
     char artifact[512], receipt_path[512], digest[65], error[256];
@@ -1546,6 +1558,7 @@ int main(void) {
     test_contract_is_exact();
     test_compiled_directory_receipt_integration(root);
     test_runtime_metadata();
+    test_shared_plan_deadline();
     test_large_compute_plan_inventory();
     test_plan_pass_ordering();
     test_multiarray_stride_copy();
