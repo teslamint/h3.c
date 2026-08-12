@@ -2,7 +2,7 @@
 
 Status: DONE
 
-Review-fix source commit: `52f4c3a8e7fa75a32c82db962d26562670ad355c`
+Final-review source commit: `17ef0f1dc8436de56c689cd2f3b5f9445ee738af`
 
 ## Authority boundary
 
@@ -17,8 +17,7 @@ Review-fix source commit: `52f4c3a8e7fa75a32c82db962d26562670ad355c`
   threshold outcome, finite metrics, digests, and absence of a receipt before
   atomically publishing a passed non-authorizing summary.
 - Receipt invalidation atomically renames only the receipt pathname to a unique
-  sibling quarantine, with pathname unlink as the only fallback. It never
-  opens or truncates a receipt target. Symlink and hardlink adversarial tests
+  sibling quarantine, without a pathname-unlink fallback. It never opens, truncates, or follows a receipt target. Symlink and hardlink adversarial tests
   prove an external sentinel remains byte-for-byte unchanged.
 - SIGINT and SIGTERM are blocked across the entire invalidation critical
   section. A synchronized pending-signal test proves SIGTERM is handled only
@@ -55,11 +54,12 @@ Review-fix source commit: `52f4c3a8e7fa75a32c82db962d26562670ad355c`
   preserves the receipt byte-for-byte, and emits the same explicit structured
   non-started/unchanged result.
 - The diagnostic contract is cross-checked against production record sites:
-  fabricated eligibility/inventory pairs are removed, output allocation is
-  accepted, eligibility requires operation context, and compute-plan inventory
+  fabricated eligibility/inventory pairs are removed, replacement-output
+  allocation maps to `output/output_copy_failed`, eligibility requires operation context, and compute-plan inventory
   failures require the count context that production records.
-- Final record-site correction places `fingerprint_mismatch` exclusively under
-  `receipt`, retains production `output/allocation_failed`, and removes
+- Final record-site correction places creator source SHA mismatch under
+  `contract/fingerprint_mismatch`, receipt digest mismatch under
+  `receipt/receipt_digest_mismatch`, and removes
   fabricated eligibility/inventory pairs. Compute-plan inventory empty/limit
   accept optional count context because `create_impl` emits them without it,
   while nesting and count/fill change require their production count context;
@@ -73,7 +73,7 @@ Review-fix source commit: `52f4c3a8e7fa75a32c82db962d26562670ad355c`
 - Red tests first proved the qualifier rejected `--shadow-only`, the
   coordinator rejected `shadow`, and an out-of-bounds passing qualifier was
   initially accepted; the implementation then made each test pass.
-- `python3 -m unittest tests/test_ane_tools.py`: 66 passed.
+- `python3 -m unittest discover -s tests -p 'test_ane_tools.py'`: 69 passed.
 - `python3 -m py_compile scripts/run_ane_integration.py`: passed.
 - `make h3_ane_tool_tests`: passed.
 - Strict warning build (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion`) and
@@ -112,3 +112,11 @@ Review-fix source commit: `52f4c3a8e7fa75a32c82db962d26562670ad355c`
   `receipt: null`; the compiled-model qualification sidecar was absent.
 - No shadow result can authorize runtime adoption; strict qualification and
   receipt validation remain the exclusive authority path.
+
+## Final review evidence
+
+- Exact source commit: `17ef0f1dc8436de56c689cd2f3b5f9445ee738af`.
+- Fresh isolated synthetic integration passed `441/292/149/149/0` with null parity and receipt; `.release-loop/evidence/ane-integration.json` is the bounded summary.
+- Fresh real shadow passed non-authorizing parity with no receipt; fresh strict real exited 1 at `parity/parity_bounds_failed` with no receipt.
+- Actual disposable production-table evidence is retained in `.release-loop/evidence/U4/conversion.json`, `compile.json`, and `integration.json`.
+- Strict and shadow qualification now preflight link-safe receipt invalidation before prediction or mutation; coordinator reuse applies the same preflight before deleting an owned work tree and accepts unchanged regular or absent authority snapshots.
