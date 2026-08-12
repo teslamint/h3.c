@@ -992,7 +992,7 @@ int h3_video_encoder_block0_qualification(
     if (ok) ok = h3_ane_predict(encoder.ane, input, input_count,
                                 coreml_output, output_count,
                                 &encoder.ane_stats, error, error_size);
-    h3_ane_diagnostic_snapshot(encoder.ane, diagnostic);
+    if (encoder.ane) h3_ane_diagnostic_snapshot(encoder.ane, diagnostic);
     h3_gpu_tensor_free(metal);
     h3_gpu_tensor_free(original);
     cleanup(&encoder);

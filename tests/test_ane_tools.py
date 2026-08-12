@@ -356,6 +356,26 @@ class NativeToolTests(unittest.TestCase):
             self.assertNotIn("PRIVATE-SENTINEL", encoded)
             self.assertNotIn(str(root), encoded)
 
+    def test_prehandle_source_failure_survives_null_handle_snapshot(self):
+        with tempfile.TemporaryDirectory(prefix="private-source-sentinel-") as root:
+            root = Path(root)
+            model = root / "model.mlmodelc"
+            model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            output = root / "result.json"
+            result = subprocess.run(
+                [str(ROOT / "h3_ane_qualification_test"), "--model",
+                 str(root / "PRIVATE-SOURCE-SENTINEL"), "--coreml-model",
+                 str(model), "--output", str(output)],
+                text=True, capture_output=True, check=False,
+            )
+            document = json.loads(output.read_text())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(document["failure_stage"], "artifact")
+            self.assertEqual(document["failure_code"], "source_weights_unreadable")
+            self.assertEqual(document["failure_reason"], "source weights are unreadable")
+            self.assertNotIn("PRIVATE-SOURCE-SENTINEL", json.dumps(document))
+
     def test_signal_before_result_rename_removes_temporary_and_authority(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -386,6 +406,68 @@ class NativeToolTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertFalse(receipt.exists())
             self.assertFalse(list(root.glob("result.json.tmp-*")))
+
+    def test_signal_before_receipt_rename_removes_temporary_and_reruns(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); model = root / "model.mlmodelc"; model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            output = root / "result.json"; marker = root / "receipt-synced"
+            receipt = Path(f"{model}.qualification.json")
+            env = os.environ.copy(); env.update({
+                "H3_ANE_TEST_METRICS": "0.001,0.01",
+                "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+                "H3_ANE_TEST_PAUSE_BEFORE_RENAME": str(marker),
+                "H3_ANE_TEST_PAUSE_SUFFIX": ".qualification.json",
+            })
+            command = [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                       "--coreml-model", str(model), "--output", str(output)]
+            process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE)
+            import time
+            for _ in range(200):
+                if marker.exists(): break
+                time.sleep(0.01)
+            self.assertTrue(marker.exists()); process.terminate(); process.wait(timeout=5)
+            process.communicate()
+            self.assertTrue(output.exists()); self.assertFalse(receipt.exists())
+            self.assertFalse(list(root.glob("*.qualification.json.tmp-*")))
+            env.pop("H3_ANE_TEST_PAUSE_BEFORE_RENAME"); env.pop("H3_ANE_TEST_PAUSE_SUFFIX")
+            rerun = subprocess.run(command, env=env, capture_output=True, check=False)
+            self.assertEqual(rerun.returncode, 0); self.assertTrue(receipt.exists())
+
+    def test_signal_before_result_rewrite_rename_removes_temp_and_reruns(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); model = root / "model.mlmodelc"; model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            output = root / "result.json"; marker = root / "rewrite-synced"
+            receipt = Path(f"{model}.qualification.json")
+            env = os.environ.copy(); env.update({
+                "H3_ANE_TEST_METRICS": "0.001,0.01",
+                "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+                "H3_ANE_TEST_FAIL_RECEIPT_WRITE": "1",
+                "H3_ANE_TEST_PAUSE_BEFORE_RENAME": str(marker),
+                "H3_ANE_TEST_PAUSE_SUFFIX": "result.json",
+                "H3_ANE_TEST_PAUSE_OCCURRENCE": "2",
+            })
+            command = [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                       "--coreml-model", str(model), "--output", str(output)]
+            process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE)
+            import time
+            for _ in range(200):
+                if marker.exists(): break
+                time.sleep(0.01)
+            self.assertTrue(marker.exists()); process.terminate(); process.wait(timeout=5)
+            process.communicate()
+            self.assertFalse(receipt.exists()); self.assertFalse(list(root.glob("result.json.tmp-*")))
+            self.assertEqual(json.loads(output.read_text())["status"], "passed")
+            for key in ("H3_ANE_TEST_PAUSE_BEFORE_RENAME", "H3_ANE_TEST_PAUSE_SUFFIX",
+                        "H3_ANE_TEST_PAUSE_OCCURRENCE"):
+                env.pop(key)
+            rerun = subprocess.run(command, env=env, capture_output=True, check=False)
+            self.assertEqual(rerun.returncode, 1)
+            self.assertEqual(json.loads(output.read_text())["failure_code"],
+                             "receipt_write_failed")
 
     def test_receipt_is_final_commit_point_under_post_receipt_signal(self):
         with tempfile.TemporaryDirectory() as root:

@@ -14,6 +14,9 @@
 #include <unistd.h>
 
 static char active_temp[4096];
+#ifdef H3_ANE_TOOL_TESTING
+static int atomic_finish_count;
+#endif
 
 static void cleanup_temp(void) {
     if (active_temp[0]) unlink(active_temp);
@@ -56,11 +59,15 @@ static int atomic_finish(FILE *stream, const char *path) {
     int descriptor = fileno(stream);
     int ok = fflush(stream) == 0 && fsync(descriptor) == 0 && fclose(stream) == 0;
 #ifdef H3_ANE_TOOL_TESTING
+    atomic_finish_count++;
     const char *pause_marker = getenv("H3_ANE_TEST_PAUSE_BEFORE_RENAME");
     const char *pause_suffix = getenv("H3_ANE_TEST_PAUSE_SUFFIX");
+    const char *pause_occurrence = getenv("H3_ANE_TEST_PAUSE_OCCURRENCE");
+    int expected_occurrence = pause_occurrence ? atoi(pause_occurrence) : 0;
     size_t path_size = strlen(path);
     size_t suffix_size = pause_suffix ? strlen(pause_suffix) : 0;
     if (ok && pause_marker && *pause_marker && pause_suffix &&
+        (!expected_occurrence || expected_occurrence == atomic_finish_count) &&
         path_size >= suffix_size &&
         strcmp(path + path_size - suffix_size, pause_suffix) == 0) {
         FILE *marker = fopen(pause_marker, "w");
