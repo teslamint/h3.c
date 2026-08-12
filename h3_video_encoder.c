@@ -421,8 +421,8 @@ static void prepare_ane(encoder_context *encoder, int frames,
         encoder->ane_stats.last_reason = H3_ANE_REASON_FINGERPRINT;
         return;
     }
-    int shadow = getenv("H3_ANE_SHADOW") &&
-                 strcmp(getenv("H3_ANE_SHADOW"), "1") == 0;
+    const char *shadow_environment = getenv("H3_ANE_SHADOW");
+    int shadow = shadow_environment && strcmp(shadow_environment, "1") == 0;
     encoder->ane = h3_ane_create(model_path, &contract, shadow,
                                  error, sizeof(error));
     if (!encoder->ane) {
@@ -767,7 +767,7 @@ static int tile_axis_build(int extent, tile_axis *axis, char *error,
     while (TILE_PIXELS * count - TILE_OVERLAP_MIN * (count - 1) < extent)
         count++;
     axis->starts = calloc((size_t)count, sizeof(*axis->starts));
-    axis->overlaps = malloc((size_t)(count - 1) * sizeof(*axis->overlaps));
+    axis->overlaps = calloc((size_t)(count - 1), sizeof(*axis->overlaps));
     if (!axis->starts || !axis->overlaps) {
         tile_axis_free(axis);
         fail(error, error_size, "out of memory constructing encoder tiles");
@@ -893,7 +893,7 @@ int h3_video_vae_encode(const char *weight_directory,
         fail(error, error_size, "invalid visual encoder arguments");
         return 0;
     }
-    tile_axis y_axis, x_axis;
+    tile_axis y_axis = {0}, x_axis = {0};
     int ok = tile_axis_build(height, &y_axis, error, error_size) &&
              tile_axis_build(width, &x_axis, error, error_size);
     if (!ok) {
