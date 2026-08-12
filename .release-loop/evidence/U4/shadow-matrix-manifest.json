@@ -4,12 +4,12 @@
   "plan": "docs/plans/2026-08-12-001-feat-ane-eligibility-fix-plan.md",
   "records": [
     {
-      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_receipt_preflight_is_side_effect_free_before_quarantine tests.test_ane_tools.NativeToolTests.test_shadow_preflight_failure_preserves_receipt_and_never_measures tests.test_ane_tools.NativeToolTests.test_shadow_invalidation_never_modifies_link_targets tests.test_ane_tools.NativeToolTests.test_signal_pending_during_invalidation_runs_after_path_is_safe",
-      "fixture": "NativeToolTests.test_shadow_receipt_preflight_is_side_effect_free_before_quarantine; test_shadow_preflight_failure_preserves_receipt_and_never_measures; prior link/signal tests",
-      "injection": "pause after writable disposable-sibling rename/unlink preflight; chmod receipt parent non-writable with genuine strict receipt and separate writable result; retain symlink/hardlink and pending-SIGTERM adversaries",
-      "mechanism": "two disposable sibling entries prove create/rename/unlink capability then are removed; no authority or result path is touched until preflight succeeds or a structured failure is published",
-      "next_invocation": "only a newly successful capability preflight permits quarantine and measurement; failed preflight preserves strict authority unchanged",
-      "outcome": "writable preflight leaves receipt/result/model/weights unchanged before quarantine; failed preflight exits 2, never starts measurement, preserves receipt bytes and reports authority_state unchanged; successful invalidation remains link-safe and signal-atomic",
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_post_preflight_invalidation_failure_is_structured tests.test_ane_tools.NativeToolTests.test_shadow_receipt_preflight_is_side_effect_free_before_quarantine tests.test_ane_tools.NativeToolTests.test_shadow_invalidation_never_modifies_link_targets tests.test_ane_tools.NativeToolTests.test_signal_pending_during_invalidation_runs_after_path_is_safe",
+      "fixture": "NativeToolTests.test_shadow_post_preflight_invalidation_failure_is_structured plus prior preflight/link/signal fixtures",
+      "injection": "directory changes from writable to non-writable after successful capability preflight and before quarantine; genuine receipt and separate writable result; retained link and pending-signal adversaries",
+      "mechanism": "all native failures before measurement use the same structured receipt/preflight result; no unchanged claim follows a receipt mutation",
+      "next_invocation": "a later invocation must repeat capability preflight and only then attempt invalidation",
+      "outcome": "invalidation failure exits 2, measurement marker absent, receipt byte-identical, structured measurement_started false and authority_state unchanged; successful paths remain link-safe and signal-atomic",
       "plan_row": "Invalidate prior receipt"
     },
     {
@@ -40,16 +40,16 @@
       "plan_row": "Rewrite RESULT after receipt publication failure"
     },
     {
-      "exact_command": "python3 -m unittest tests.test_ane_tools.IntegrationCoordinatorTests.test_shadow_coordinator_preserves_unchanged_preflight_authority tests.test_ane_tools.IntegrationCoordinatorTests.test_production_compute_plan_pairs_propagate_exactly tests.test_ane_tools.IntegrationCoordinatorTests.test_oversized_failure_falls_back_to_minimal_atomic_summary",
-      "fixture": "IntegrationCoordinatorTests.test_shadow_coordinator_preserves_unchanged_preflight_authority; test_production_compute_plan_pairs_propagate_exactly; bounded/path/prior outcome tests",
-      "injection": "qualifier emits explicit receipt/preflight failure while genuine-format sidecar remains; five production compute-plan allocation/empty/limit/nesting/changed diagnostics with count context",
-      "mechanism": "receipt removed from cleanup set only for validated non-started/unchanged preflight result; canonical stage/code and observed_count/limit validation mirrors production h3_ane.m record sites",
-      "next_invocation": "coordinator makes no removal claim for preflight failure; later invocation repeats preflight before any authority mutation",
-      "outcome": "summary preserves measurement_started false and authority_state unchanged without deleting sidecar; all five production pairs and contexts propagate exactly; bounded failure fallback remains atomic",
+      "exact_command": "python3 -m unittest tests.test_ane_tools.IntegrationCoordinatorTests.test_shadow_coordinator_preserves_unchanged_preflight_authority tests.test_ane_tools.IntegrationCoordinatorTests.test_shadow_coordinator_rejects_changed_unchanged_authority_claim tests.test_ane_tools.IntegrationCoordinatorTests.test_qualifier_diagnostic_taxonomy_and_context_are_closed tests.test_ane_tools.IntegrationCoordinatorTests.test_production_compute_plan_pairs_propagate_exactly",
+      "fixture": "IntegrationCoordinatorTests.test_shadow_coordinator_preserves_unchanged_preflight_authority; test_shadow_coordinator_rejects_changed_unchanged_authority_claim; canonical taxonomy/context tests",
+      "injection": "converter pre-seeds genuine receipt before qualifier launch; child either preserves or changes bytes while claiming unchanged; cross-stage inventory/eligibility/output allocation and missing context cases",
+      "mechanism": "nofollow descriptor snapshot before launch and after child; record-site-derived stage/code table with required operation and count context",
+      "next_invocation": "only verified byte/identity-equivalent authority may be reported unchanged",
+      "outcome": "unchanged accepted only when regular-file device/inode/mode/size/mtime/digest snapshot is identical; changed claim rejected and authority cleaned; canonical output/allocation and compute-plan pairs accepted, fabricated eligibility inventory and missing required contexts rejected",
       "plan_row": "Publish integration summary"
     },
     {
-      "exact_command": "git diff 28a918b..2a43e5d -- h3_ane.m h3_ane_dispatch.c h3_video_encoder.c && ANE_INTEGRATION_OUTPUT=/private/tmp/u4-strict-summary-preflight.json ANE_INTEGRATION_WORK=/private/tmp/u4-strict-work-preflight H3_ANE_WEIGHT_DIR=MiniMax-H3/FL2VA/video_vae/source make h3_ane_real_qualification_test",
+      "exact_command": "git diff 8d324a5..b2275a0 -- h3_ane.m h3_ane_dispatch.c h3_video_encoder.c && ANE_INTEGRATION_OUTPUT=/private/tmp/u4-strict-summary-final-authority.json ANE_INTEGRATION_WORK=/private/tmp/u4-strict-work-final-authority H3_ANE_WEIGHT_DIR=MiniMax-H3/FL2VA/video_vae/source make h3_ane_real_qualification_test",
       "fixture": "scope/diff authority check plus strict real target",
       "injection": "same FP16 candidate exceeds unchanged strict max_abs bound",
       "mechanism": "shadow evidence is authority false and runtime receipt validation/adoption code is unchanged",
@@ -58,7 +58,7 @@
       "plan_row": "Adopt Core ML request output"
     }
   ],
-  "schema": "h3-release-loop-shadow-matrix/v3",
-  "source_commit": "2a43e5d80e6e17eee3a91e606f766fe28806e368",
-  "timestamp_utc": "2026-08-12T09:44:14Z"
+  "schema": "h3-release-loop-shadow-matrix/v4",
+  "source_commit": "b2275a034d80ca2d8dcd8481206c8300c9290e39",
+  "timestamp_utc": "2026-08-12T11:18:46Z"
 }

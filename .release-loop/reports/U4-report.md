@@ -2,7 +2,7 @@
 
 Status: DONE
 
-Review-fix source commit: `2a43e5d80e6e17eee3a91e606f766fe28806e368`
+Review-fix source commit: `b2275a034d80ca2d8dcd8481206c8300c9290e39`
 
 ## Authority boundary
 
@@ -45,6 +45,19 @@ Review-fix source commit: `2a43e5d80e6e17eee3a91e606f766fe28806e368`
   Production-derived tests cover exact `compute_plan` pairs for allocation,
   empty inventory, limit, nesting, and count/fill change, including nullable
   or numeric observed-count/limit context.
+- `authority_state: "unchanged"` is now grounded in nofollow regular-file
+  snapshots taken after conversion and immediately after the qualifier child.
+  Device, inode, mode, size, modification time, and SHA-256 must all match.
+  A pre-seeded genuine receipt is accepted unchanged; a child that creates or
+  changes authority while claiming unchanged is rejected and cleaned up.
+- A synchronized writability TOCTOU test changes the receipt directory after a
+  successful preflight. The native qualifier exits 2 before measurement,
+  preserves the receipt byte-for-byte, and emits the same explicit structured
+  non-started/unchanged result.
+- The diagnostic contract is cross-checked against production record sites:
+  fabricated eligibility/inventory pairs are removed, output allocation is
+  accepted, eligibility requires operation context, and compute-plan inventory
+  failures require the count context that production records.
 - Every coordinator shadow success, qualifier failure, summary-publication
   failure, and cancellation fixture independently seeds a genuine-format
   strict sidecar and proves the live authority pathname is absent afterward.
@@ -54,7 +67,7 @@ Review-fix source commit: `2a43e5d80e6e17eee3a91e606f766fe28806e368`
 - Red tests first proved the qualifier rejected `--shadow-only`, the
   coordinator rejected `shadow`, and an out-of-bounds passing qualifier was
   initially accepted; the implementation then made each test pass.
-- `python3 -m unittest tests/test_ane_tools.py`: 64 passed.
+- `python3 -m unittest tests/test_ane_tools.py`: 66 passed.
 - `python3 -m py_compile scripts/run_ane_integration.py`: passed.
 - `make h3_ane_tool_tests`: passed.
 - Strict warning build (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion`) and
