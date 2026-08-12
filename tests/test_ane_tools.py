@@ -844,14 +844,12 @@ raise SystemExit(1)
                     "failure_operation": None, "supported_devices": None,
                     "preferred_device": None, "observed_count": None,
                     "limit": None, "artifact_role": None,
-                    "contract_field": field,
-                    "digest": "a" * 64 if field == "source_sha256" else None,
+                    "contract_field": field, "digest": None,
                 }
                 diagnostic = self.coordinator.validate_qualification_diagnostic(
                     document)
                 self.assertEqual(diagnostic["contract_field"], field)
-                self.assertEqual(diagnostic["digest"],
-                                 "a" * 64 if field == "source_sha256" else None)
+                self.assertIsNone(diagnostic["digest"])
                 self.assertNotIn("/", diagnostic["message"])
         document["contract_field"] = None
         document["digest"] = None

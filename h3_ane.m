@@ -253,6 +253,17 @@ static contract_validation contract_failure(h3_ane_reason reason,
     return (contract_validation){.reason = reason, .field = field};
 }
 
+static h3_ane_code contract_code(h3_ane_reason reason, int missing) {
+    if (missing) return H3_ANE_CODE_METADATA_MISSING;
+    switch (reason) {
+        case H3_ANE_REASON_DTYPE: return H3_ANE_CODE_DTYPE_MISMATCH;
+        case H3_ANE_REASON_SHAPE: return H3_ANE_CODE_SHAPE_MISMATCH;
+        case H3_ANE_REASON_FINGERPRINT:
+            return H3_ANE_CODE_FINGERPRINT_MISMATCH;
+        default: return H3_ANE_CODE_METADATA_MISMATCH;
+    }
+}
+
 static contract_validation validate_contract(const h3_ane_contract *contract) {
     static const uint32_t shape[5] = {1, 1, 256, 256, 128};
     if (!contract) return contract_failure(H3_ANE_REASON_CONTRACT,
@@ -472,6 +483,10 @@ int h3_ane_test_validate_metadata_field(const char *const values[8],
                 [NSString stringWithUTF8String:values[index]];
         return (int)validate_creator_metadata(dictionary, contract).field;
     }
+}
+
+int h3_ane_test_contract_code(int reason, int missing) {
+    return (int)contract_code((h3_ane_reason)reason, missing);
 }
 #endif
 
@@ -739,22 +754,9 @@ static int real_load(void *opaque, h3_ane_diagnostic *diagnostic) {
         h3_ane_reason metadataReason = metadataValidation.reason;
         if (metadataReason != H3_ANE_REASON_NONE) {
             h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_CONTRACT,
-                metadataReason == H3_ANE_REASON_FINGERPRINT ?
-                    H3_ANE_CODE_FINGERPRINT_MISMATCH :
-                    H3_ANE_CODE_METADATA_MISMATCH, metadataReason,
+                contract_code(metadataReason, 0), metadataReason,
                 "creator metadata is missing or incompatible");
-            if (metadataReason == H3_ANE_REASON_FINGERPRINT)
-                set_contract_context(diagnostic,
-                    H3_ANE_CONTRACT_FIELD_SOURCE_SHA256,
-                    [creatorMetadata[@"source_sha256"] UTF8String]);
-            else if (metadataReason == H3_ANE_REASON_DTYPE)
-                set_contract_context(diagnostic,
-                    H3_ANE_CONTRACT_FIELD_BOUNDARY_DTYPE, NULL);
-            else if (metadataReason == H3_ANE_REASON_SHAPE)
-                set_contract_context(diagnostic,
-                    H3_ANE_CONTRACT_FIELD_SHAPE, NULL);
-            else
-                set_contract_context(diagnostic, metadataValidation.field, NULL);
+            set_contract_context(diagnostic, metadataValidation.field, NULL);
             return -(int)metadataReason;
         }
         NSDictionary<NSString *, MLFeatureDescription *> *inputs =
@@ -1197,12 +1199,9 @@ static h3_ane *create_impl(const char *model_path,
     h3_ane_reason contract_reason = contractValidation.reason;
     if (contract_reason != H3_ANE_REASON_NONE) {
         record_first(ane, H3_ANE_STAGE_CONTRACT,
-                     contract_reason == H3_ANE_REASON_DTYPE ?
-                         H3_ANE_CODE_DTYPE_MISMATCH : H3_ANE_CODE_METADATA_MISMATCH,
+                     contract_code(contract_reason, 0),
                      contract_reason, "ANE model contract is incompatible");
-        set_contract_context(&ane->diagnostic, contractValidation.field,
-                             contract_reason == H3_ANE_REASON_FINGERPRINT &&
-                                     contract ? contract->source_sha256 : NULL);
+        set_contract_context(&ane->diagnostic, contractValidation.field, NULL);
         mark_unavailable(ane, contract_reason, error, error_size,
                          "ANE model contract is incompatible");
         return ane;
