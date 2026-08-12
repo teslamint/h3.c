@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 
 WEIGHT_PREFIX = "encoder.down.0.block.0"
@@ -144,33 +145,64 @@ def _load_weights_and_digest(directory):
 
 
 def _group_norm(mb, value, weight, bias, name, channels=128, groups=32,
-                depth=1, height=256, width=256):
-    grouped = mb.reshape(
-        x=value, shape=[1, groups, channels // groups, depth * height * width],
-        name=f"{name}_reshape")
-    mean = mb.reduce_mean(x=grouped, axes=[2, 3], keep_dims=True,
-                          name=f"{name}_mean")
-    centered = mb.sub(x=grouped, y=mean, name=f"{name}_center")
-    variance = mb.reduce_mean(x=mb.square(x=centered), axes=[2, 3],
-                              keep_dims=True, name=f"{name}_variance")
-    normalized = mb.real_div(
-        x=centered,
-        y=mb.sqrt(x=mb.add(x=variance, y=1e-6)), name=f"{name}_normalize")
-    restored = mb.reshape(x=normalized,
-                          shape=[1, channels, depth, height, width])
-    scale = weight.reshape((1, channels, 1, 1, 1))
-    offset = bias.reshape((1, channels, 1, 1, 1))
-    return mb.add(x=mb.mul(x=restored, y=scale), y=offset, name=name)
+                height=256, width=256):
+    if channels % groups:
+        raise ValueError("group count must divide channel count")
+    group_channels = channels // groups
+    parts = []
+    for group in range(groups):
+        begin = group * group_channels
+        part = mb.slice_by_index(
+            x=value, begin=[0, 0, 0, begin],
+            end=[1, height, width, begin + group_channels],
+            name=f"{name}_slice_{group}")
+        parts.append(mb.layer_norm(
+            x=part, axes=[1, 2, 3], epsilon=1e-6,
+            name=f"{name}_group_{group}"))
+    normalized = mb.concat(values=parts, axis=3, name=f"{name}_concat")
+    scale = weight.reshape((1, 1, 1, channels))
+    offset = bias.reshape((1, 1, 1, channels))
+    return mb.add(
+        x=mb.mul(x=normalized, y=scale, name=f"{name}_scale"),
+        y=offset, name=name)
 
 
 def _padded_conv(mb, value, weight, bias, name):
-    spatial = mb.pad(x=value, pad=[0, 0, 0, 0, 0, 0, 1, 1, 1, 1],
+    nchw = mb.transpose(x=value, perm=[0, 3, 1, 2],
+                        name=f"{name}_to_nchw")
+    spatial = mb.pad(x=nchw, pad=[0, 0, 0, 0, 1, 1, 1, 1],
                      mode="reflect", name=f"{name}_spatial_reflect")
-    temporal = mb.pad(x=spatial, pad=[0, 0, 0, 0, 2, 0, 0, 0, 0, 0],
-                      mode="constant", constant_val=0.0,
-                      name=f"{name}_temporal_front_zero")
-    return mb.conv(x=temporal, weight=weight, bias=bias,
-                   strides=[1, 1, 1], pad_type="valid", name=name)
+    result = mb.conv(x=spatial, weight=weight[:, :, 2, :, :], bias=bias,
+                     pad_type="valid", name=name)
+    return mb.transpose(x=result, perm=[0, 2, 3, 1],
+                        name=f"{name}_to_nhwc")
+
+
+def _fixed_graph(mb, input_value, weights, boundary_shape=BOUNDARY_SHAPE,
+                 groups=32):
+    channels = boundary_shape[4]
+    depth, height, width = boundary_shape[1:4]
+    if depth != 1:
+        raise ValueError("fixed graph requires singleton depth")
+    value = mb.squeeze(x=input_value, axes=[1], name="remove_depth")
+    norm1 = _group_norm(
+        mb, value, weights[f"{WEIGHT_PREFIX}.norm1.weight"],
+        weights[f"{WEIGHT_PREFIX}.norm1.bias"], "norm1", channels,
+        groups, height, width)
+    hidden = _padded_conv(
+        mb, mb.silu(x=norm1, name="silu1"),
+        weights[f"{WEIGHT_PREFIX}.conv1.weight"],
+        weights[f"{WEIGHT_PREFIX}.conv1.bias"], "conv1")
+    norm2 = _group_norm(
+        mb, hidden, weights[f"{WEIGHT_PREFIX}.norm2.weight"],
+        weights[f"{WEIGHT_PREFIX}.norm2.bias"], "norm2", channels,
+        groups, height, width)
+    output = _padded_conv(
+        mb, mb.silu(x=norm2, name="silu2"),
+        weights[f"{WEIGHT_PREFIX}.conv2.weight"],
+        weights[f"{WEIGHT_PREFIX}.conv2.bias"], "conv2")
+    residual = mb.add(x=value, y=output, name="residual")
+    return mb.expand_dims(x=residual, axes=[1], name="restore_depth")
 
 
 def build_program(weights, boundary_shape=BOUNDARY_SHAPE, groups=32):
@@ -178,31 +210,10 @@ def build_program(weights, boundary_shape=BOUNDARY_SHAPE, groups=32):
     import numpy as np
     from coremltools.converters.mil import Builder as mb
 
-    channels = boundary_shape[4]
-    depth, height, width = boundary_shape[1:4]
-
     @mb.program(input_specs=[mb.TensorSpec(shape=boundary_shape, dtype=ct.converters.mil.mil.types.fp32)],
                 opset_version=ct.target.macOS14)
     def program(input):
-        ncdhw = mb.transpose(x=input, perm=[0, 4, 1, 2, 3], name="ndhwc_to_ncdhw")
-        norm1 = _group_norm(
-            mb, ncdhw, weights[f"{WEIGHT_PREFIX}.norm1.weight"],
-            weights[f"{WEIGHT_PREFIX}.norm1.bias"], "norm1", channels,
-            groups, depth, height, width)
-        hidden = _padded_conv(
-            mb, mb.silu(x=norm1, name="silu1"),
-            weights[f"{WEIGHT_PREFIX}.conv1.weight"],
-            weights[f"{WEIGHT_PREFIX}.conv1.bias"], "conv1")
-        norm2 = _group_norm(
-            mb, hidden, weights[f"{WEIGHT_PREFIX}.norm2.weight"],
-            weights[f"{WEIGHT_PREFIX}.norm2.bias"], "norm2", channels,
-            groups, depth, height, width)
-        output = _padded_conv(
-            mb, mb.silu(x=norm2, name="silu2"),
-            weights[f"{WEIGHT_PREFIX}.conv2.weight"],
-            weights[f"{WEIGHT_PREFIX}.conv2.bias"], "conv2")
-        return mb.transpose(x=mb.add(x=output, y=ncdhw, name="residual_add"),
-                            perm=[0, 2, 3, 4, 1], name="output")
+        return _fixed_graph(mb, input, weights, boundary_shape, groups)
 
     return ct.convert(
         program, convert_to="mlprogram",
@@ -247,8 +258,9 @@ def _numpy_conv(value, weight, bias):
 def run_graph_self_test():
     import coremltools as ct
     import numpy as np
-    channels = 32
-    shape = (1, 1, 2, 2, channels)
+    channels = 8
+    groups = 2
+    shape = (1, 1, 3, 3, channels)
     rng = np.random.default_rng(0x4833414E45)
     weights = {
         f"{WEIGHT_PREFIX}.norm1.weight": np.linspace(0.8, 1.2, channels, dtype=np.float32),
@@ -261,20 +273,32 @@ def run_graph_self_test():
         f"{WEIGHT_PREFIX}.conv2.bias": np.linspace(-0.01, 0.01, channels, dtype=np.float32),
     }
     for channel in range(channels):
-        weights[f"{WEIGHT_PREFIX}.conv1.weight"][channel, channel, 2, 1, 1] = 0.5
-        weights[f"{WEIGHT_PREFIX}.conv2.weight"][channel, channel, 2, 1, 1] = 0.25
+        weights[f"{WEIGHT_PREFIX}.conv1.weight"][channel, channel, 0, :, :] = 7.0
+        weights[f"{WEIGHT_PREFIX}.conv1.weight"][channel, channel, 1, :, :] = -5.0
+        weights[f"{WEIGHT_PREFIX}.conv1.weight"][channel, channel, 2, 0, 0] = 0.125
+        weights[f"{WEIGHT_PREFIX}.conv1.weight"][channel, channel, 2, 1, 1] = 0.375
+        weights[f"{WEIGHT_PREFIX}.conv1.weight"][channel, channel, 2, 2, 1] = -0.0625
+        weights[f"{WEIGHT_PREFIX}.conv2.weight"][channel, channel, 0, :, :] = -3.0
+        weights[f"{WEIGHT_PREFIX}.conv2.weight"][channel, channel, 1, :, :] = 9.0
+        weights[f"{WEIGHT_PREFIX}.conv2.weight"][channel, channel, 2, 0, 2] = -0.0625
+        weights[f"{WEIGHT_PREFIX}.conv2.weight"][channel, channel, 2, 1, 1] = 0.1875
+        weights[f"{WEIGHT_PREFIX}.conv2.weight"][channel, channel, 2, 2, 0] = 0.03125
     values = rng.standard_normal(shape, dtype=np.float32)
-    model = build_program(weights, shape, groups=32)
+    model = build_program(weights, shape, groups=groups)
+    _validate_model_schema(model.get_spec(), shape)
     model.compute_unit = ct.ComputeUnit.CPU_ONLY
-    predicted = model.predict({"input": values})["output"]
+    prediction = model.predict({"input": values})
+    if len(prediction) != 1:
+        raise RuntimeError("deterministic graph self-test expected one output")
+    predicted = next(iter(prediction.values()))
     ncdhw = values.transpose(0, 4, 1, 2, 3)
     norm1 = _numpy_group_norm(ncdhw, weights[f"{WEIGHT_PREFIX}.norm1.weight"],
-                              weights[f"{WEIGHT_PREFIX}.norm1.bias"], 32)
+                              weights[f"{WEIGHT_PREFIX}.norm1.bias"], groups)
     hidden = _numpy_conv(norm1 / (1.0 + np.exp(-norm1)),
                          weights[f"{WEIGHT_PREFIX}.conv1.weight"],
                          weights[f"{WEIGHT_PREFIX}.conv1.bias"])
     norm2 = _numpy_group_norm(hidden, weights[f"{WEIGHT_PREFIX}.norm2.weight"],
-                              weights[f"{WEIGHT_PREFIX}.norm2.bias"], 32)
+                              weights[f"{WEIGHT_PREFIX}.norm2.bias"], groups)
     reference = _numpy_conv(norm2 / (1.0 + np.exp(-norm2)),
                             weights[f"{WEIGHT_PREFIX}.conv2.weight"],
                             weights[f"{WEIGHT_PREFIX}.conv2.bias"])
@@ -283,6 +307,21 @@ def run_graph_self_test():
     if maximum >= 0.002:
         raise RuntimeError(f"deterministic graph self-test max_abs={maximum}")
     return maximum
+
+
+def _validate_model_schema(spec, boundary_shape=BOUNDARY_SHAPE,
+                           float32_data_type=65568):
+    features = list(spec.description.input) + list(spec.description.output)
+    if len(spec.description.input) != 1 or len(spec.description.output) != 1:
+        raise ValueError("compiled model must have one input and one output")
+    for feature in features:
+        if feature.type.WhichOneof("Type") != "multiArrayType":
+            raise ValueError("compiled model boundary is not a multi-array")
+        array = feature.type.multiArrayType
+        if tuple(array.shape) != tuple(boundary_shape):
+            raise ValueError("compiled model boundary shape is not exact 5D")
+        if array.dataType != float32_data_type:
+            raise ValueError("compiled model boundary dtype is not F32")
 
 
 def _cleanup_temp(*_args):
@@ -320,6 +359,12 @@ def atomic_save(model, destination, metadata):
     destination.parent.mkdir(parents=True, exist_ok=True)
     _ACTIVE_TEMP = Path(tempfile.mkdtemp(prefix=f".{destination.name}.tmp-",
                                         dir=destination.parent))
+    marker = os.environ.get("H3_ANE_TEST_CONVERTER_TEMP_READY")
+    release = os.environ.get("H3_ANE_TEST_CONVERTER_TEMP_RELEASE")
+    if marker and release:
+        Path(marker).write_text("temporary package created\n")
+        while not Path(release).exists():
+            time.sleep(0.001)
     package = _ACTIVE_TEMP / destination.name
     try:
         model.user_defined_metadata.update(metadata)

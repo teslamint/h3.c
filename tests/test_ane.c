@@ -17,6 +17,9 @@
 
 int h3_ane_test_validate_metadata(const char *const values[8],
                                   const h3_ane_contract *contract);
+int h3_ane_test_validate_metadata_field(const char *const values[8],
+                                        const h3_ane_contract *contract);
+int h3_ane_test_contract_code(int reason, int missing);
 
 static void die(const char *message) {
     fprintf(stderr, "FAIL tests/test_ane.c: %s\n", message);
@@ -370,34 +373,57 @@ typedef struct {
     const char *predict_block_ready_path;
     int active_predictions;
     int max_active_predictions;
+    size_t fill_operation_count;
     h3_ane_operation_usage operations[3];
     size_t operation_count;
 } fake_ane_backend;
 
-static int fake_load(void *opaque) {
+static int fake_load(void *opaque, h3_ane_diagnostic *diagnostic) {
     fake_ane_backend *fake = opaque;
     fake->load_count++;
+    if (!fake->load_result)
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_LOAD,
+                                       H3_ANE_CODE_MODEL_LOAD_FAILED,
+                                       H3_ANE_REASON_LOAD,
+                                       "Core ML model load failed");
     return fake->load_result;
 }
 
 static int fake_plan(void *opaque, h3_ane_operation_usage *operations,
-                     size_t *operation_count) {
+                     size_t *operation_count, h3_ane_diagnostic *diagnostic) {
     fake_ane_backend *fake = opaque;
     fake->plan_count++;
     if (fake->plan_never_completes) {
         for (;;) pause();
     }
-    if (!fake->plan_result) return 0;
+    if (!fake->plan_result) {
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_COMPUTE_PLAN,
+                                       H3_ANE_CODE_PLAN_LOAD_FAILED,
+                                       H3_ANE_REASON_ELIGIBILITY,
+                                       "Core ML compute plan load failed");
+        return 0;
+    }
+    if (!operations) {
+        *operation_count = fake->operation_count;
+        return fake->plan_result;
+    }
+    size_t fill_count = fake->fill_operation_count ?
+        fake->fill_operation_count : fake->operation_count;
+    if (*operation_count != fill_count) {
+        *operation_count = fill_count;
+        return fake->plan_result;
+    }
     require(*operation_count >= fake->operation_count,
             "bridge did not provide enough operation storage");
     memcpy(operations, fake->operations,
            fake->operation_count * sizeof(*operations));
-    *operation_count = fake->operation_count;
+    *operation_count = fill_count;
     return fake->plan_result;
 }
 
 static int fake_predict(void *opaque, const float *input, size_t input_count,
-                        float *output, size_t output_count) {
+                        float *output, size_t output_count,
+                        h3_ane_diagnostic *diagnostic) {
     fake_ane_backend *fake = opaque;
     fake->predict_count++;
     fake->active_predictions++;
@@ -410,6 +436,10 @@ static int fake_predict(void *opaque, const float *input, size_t input_count,
         for (;;) pause();
     }
     if (!fake->predict_result) {
+        h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_PREDICTION,
+                                       H3_ANE_CODE_PREDICTION_FAILED,
+                                       H3_ANE_REASON_PREDICTION,
+                                       "Core ML prediction failed");
         fake->active_predictions--;
         return 0;
     }
@@ -459,6 +489,23 @@ static void install_fake_backend(fake_ane_backend *fake) {
         .opaque = fake,
     };
     h3_ane_test_set_backend(&backend);
+}
+
+static void test_shared_plan_deadline(void) {
+    double deadline = 0.0;
+    require(h3_ane_test_plan_phase_wait_nanoseconds(&deadline, 100.0) ==
+                5LL * 1000 * 1000 * 1000,
+            "compute-plan deadline did not allow the initial five seconds");
+    require(deadline == 105.0,
+            "compute-plan count pass did not establish one deadline");
+    require(h3_ane_test_plan_phase_wait_nanoseconds(&deadline, 102.25) ==
+                2750LL * 1000 * 1000,
+            "cached compute-plan fill received a fresh timeout");
+    require(deadline == 105.0,
+            "compute-plan fill replaced the transaction deadline");
+    require(h3_ane_test_plan_phase_wait_nanoseconds(&deadline, 105.0) == 0 &&
+                h3_ane_test_plan_phase_wait_nanoseconds(&deadline, 106.0) == 0,
+            "expired cached-plan fill still received execution time");
 }
 
 static void make_qualified_model(const char *root, const char *name,
@@ -518,6 +565,108 @@ static void test_multiarray_stride_copy(void) {
             "negative MLMultiArray stride was accepted");
 }
 
+static void test_first_diagnostic_is_immutable(void) {
+    h3_ane_diagnostic diagnostic = {0};
+    h3_ane_diagnostic_record_first(
+        &diagnostic, H3_ANE_STAGE_CONTRACT, H3_ANE_CODE_METADATA_MISSING,
+        H3_ANE_REASON_CONTRACT, "creator metadata is missing");
+    h3_ane_diagnostic_record_first(
+        &diagnostic, H3_ANE_STAGE_PREDICTION, H3_ANE_CODE_PREDICTION_FAILED,
+        H3_ANE_REASON_PREDICTION, "later prediction failed");
+    require(diagnostic.stage == H3_ANE_STAGE_CONTRACT &&
+                diagnostic.code == H3_ANE_CODE_METADATA_MISSING &&
+                diagnostic.reason == H3_ANE_REASON_CONTRACT &&
+                strcmp(diagnostic.message, "creator metadata is missing") == 0,
+            "later failure replaced the first diagnostic");
+    h3_ane_diagnostic source = {0};
+    h3_ane_diagnostic_record_first(
+        &source, H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_OUTPUT_NONFINITE,
+        H3_ANE_REASON_NONFINITE, "Core ML output is non-finite");
+    h3_ane_diagnostic_merge_first(&diagnostic, &source);
+    require(diagnostic.code == H3_ANE_CODE_METADATA_MISSING,
+            "merge replaced an existing diagnostic");
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    h3_ane_diagnostic_merge_first(&diagnostic, &source);
+    require(diagnostic.code == H3_ANE_CODE_OUTPUT_NONFINITE,
+            "merge did not preserve a source diagnostic");
+    source.artifact_role = H3_ANE_ARTIFACT_COMPILED_MODEL;
+    source.has_artifact_role = 1;
+    source.contract_field = H3_ANE_CONTRACT_FIELD_SOURCE_SHA256;
+    source.has_contract_field = 1;
+    memcpy(source.digest,
+           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+           65);
+    source.has_digest = 1;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    h3_ane_diagnostic_merge_first(&diagnostic, &source);
+    require(diagnostic.has_artifact_role && diagnostic.has_contract_field &&
+                diagnostic.has_digest &&
+                strcmp(h3_ane_artifact_role_name(diagnostic.artifact_role),
+                       "compiled_model") == 0 &&
+                strcmp(h3_ane_contract_field_name(diagnostic.contract_field),
+                       "source_sha256") == 0,
+            "merge lost bounded diagnostic artifact context");
+
+    char long_message[400];
+    memset(long_message, 'x', sizeof(long_message));
+    long_message[sizeof(long_message) - 1] = '\0';
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    h3_ane_diagnostic_record_first(
+        &diagnostic, H3_ANE_STAGE_SETUP, H3_ANE_CODE_ALLOCATION_FAILED,
+        H3_ANE_REASON_LOAD, long_message);
+    require(diagnostic.message[sizeof(diagnostic.message) - 1] == '\0',
+            "diagnostic message is not bounded and terminated");
+}
+
+static void test_complete_diagnostic_taxonomy(void) {
+    for (int stage = H3_ANE_STAGE_NONE; stage <= H3_ANE_STAGE_PUBLICATION;
+         stage++) {
+        const char *name = h3_ane_stage_name((h3_ane_stage)stage);
+        require(name != NULL && *name, "diagnostic stage has no stable name");
+    }
+    require(h3_ane_stage_name((h3_ane_stage)-1) == NULL,
+            "invalid diagnostic stage received a name");
+    for (int code = H3_ANE_CODE_NONE;
+         code <= H3_ANE_CODE_RECEIPT_WRITE_FAILED; code++) {
+        const char *name = h3_ane_code_name((h3_ane_code)code);
+        require(name != NULL && *name, "diagnostic code has no stable name");
+    }
+    require(h3_ane_code_name((h3_ane_code)-1) == NULL,
+            "invalid diagnostic code received a name");
+    require(h3_ane_artifact_role_name(H3_ANE_ARTIFACT_COMPILED_MODEL) &&
+                h3_ane_artifact_role_name((h3_ane_artifact_role)-1) == NULL &&
+                h3_ane_contract_field_name(H3_ANE_CONTRACT_FIELD_SOURCE_SHA256) &&
+                h3_ane_contract_field_name((h3_ane_contract_field)-1) == NULL,
+            "diagnostic context name mapping is not closed");
+}
+
+static void test_diagnostic_code_snapshots(void) {
+    static const struct {
+        h3_ane_stage stage;
+        h3_ane_code code;
+        h3_ane_reason reason;
+    } cases[] = {
+        {H3_ANE_STAGE_SETUP, H3_ANE_CODE_DISABLED, H3_ANE_REASON_DISABLED},
+        {H3_ANE_STAGE_ARTIFACT, H3_ANE_CODE_COMPILED_MODEL_UNREADABLE, H3_ANE_REASON_FINGERPRINT},
+        {H3_ANE_STAGE_CONTRACT, H3_ANE_CODE_INPUT_DTYPE_MISMATCH, H3_ANE_REASON_DTYPE},
+        {H3_ANE_STAGE_RECEIPT, H3_ANE_CODE_RECEIPT_DIGEST_MISMATCH, H3_ANE_REASON_RECEIPT},
+        {H3_ANE_STAGE_ELIGIBILITY, H3_ANE_CODE_OPERATION_USAGE_UNKNOWN, H3_ANE_REASON_ELIGIBILITY},
+        {H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_OUTPUT_COPY_FAILED, H3_ANE_REASON_SHAPE},
+        {H3_ANE_STAGE_PUBLICATION, H3_ANE_CODE_RESULT_WRITE_FAILED, H3_ANE_REASON_RECEIPT},
+    };
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        h3_ane_diagnostic diagnostic = {0};
+        h3_ane_diagnostic_record_first(&diagnostic, cases[index].stage,
+                                       cases[index].code, cases[index].reason,
+                                       "stable fixture failure");
+        require(diagnostic.stage == cases[index].stage &&
+                    diagnostic.code == cases[index].code &&
+                    h3_ane_stage_name(diagnostic.stage) != NULL &&
+                    h3_ane_code_name(diagnostic.code) != NULL,
+                "diagnostic fixture did not snapshot exact taxonomy");
+    }
+}
+
 static size_t capture_create_diagnostic(const char *model_path,
                                         const h3_ane_contract *contract,
                                         int authorized, char output[512]) {
@@ -550,6 +699,19 @@ static void test_runtime_metadata(void) {
         "1", "FL2VA", "0", "0", "encoder.down.0.block.0", "F32",
         "1,1,256,256,128", source,
     };
+    static const h3_ane_contract_field fields[8] = {
+        H3_ANE_CONTRACT_FIELD_VERSION, H3_ANE_CONTRACT_FIELD_VARIANT,
+        H3_ANE_CONTRACT_FIELD_BLOCK_LEVEL, H3_ANE_CONTRACT_FIELD_BLOCK_INDEX,
+        H3_ANE_CONTRACT_FIELD_WEIGHT_PREFIX,
+        H3_ANE_CONTRACT_FIELD_BOUNDARY_DTYPE, H3_ANE_CONTRACT_FIELD_SHAPE,
+        H3_ANE_CONTRACT_FIELD_SOURCE_SHA256,
+    };
+    static const h3_ane_code mismatch_codes[8] = {
+        H3_ANE_CODE_METADATA_MISMATCH, H3_ANE_CODE_METADATA_MISMATCH,
+        H3_ANE_CODE_METADATA_MISMATCH, H3_ANE_CODE_METADATA_MISMATCH,
+        H3_ANE_CODE_METADATA_MISMATCH, H3_ANE_CODE_DTYPE_MISMATCH,
+        H3_ANE_CODE_SHAPE_MISMATCH, H3_ANE_CODE_FINGERPRINT_MISMATCH,
+    };
     require(h3_ane_test_validate_metadata(valid, &contract) ==
                 H3_ANE_REASON_NONE,
             "matching creator-defined metadata was rejected");
@@ -560,6 +722,29 @@ static void test_runtime_metadata(void) {
         require(h3_ane_test_validate_metadata(missing, &contract) !=
                     H3_ANE_REASON_NONE,
                 "missing creator-defined metadata was accepted");
+        require(h3_ane_test_validate_metadata_field(missing, &contract) ==
+                    (int)fields[index],
+                "missing creator metadata lost its exact contract field");
+        require(h3_ane_test_contract_code(H3_ANE_REASON_CONTRACT, 1) ==
+                    H3_ANE_CODE_METADATA_MISSING,
+                "missing creator metadata received an unstable code");
+    }
+    static const char *const mismatches[8] = {
+        "01", "Ref2VA", "1", "1", "encoder.down.0.block.1", "F16",
+        "1,1,128,256,128",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    };
+    for (size_t index = 0; index < 8; index++) {
+        const char *mismatch[8];
+        memcpy(mismatch, valid, sizeof(mismatch));
+        mismatch[index] = mismatches[index];
+        int mismatch_reason = h3_ane_test_validate_metadata(mismatch, &contract);
+        require(mismatch_reason != H3_ANE_REASON_NONE &&
+                h3_ane_test_validate_metadata_field(mismatch, &contract) ==
+                    (int)fields[index] &&
+                h3_ane_test_contract_code(mismatch_reason, 0) ==
+                    (int)mismatch_codes[index],
+                "mismatched creator metadata lost its exact contract field");
     }
     const char *malformed[8];
     memcpy(malformed, valid, sizeof(malformed));
@@ -567,7 +752,7 @@ static void test_runtime_metadata(void) {
     require(h3_ane_test_validate_metadata(malformed, &contract) ==
                 H3_ANE_REASON_CONTRACT,
             "malformed metadata version was accepted");
-    static const char *mismatches[8] = {
+    static const char *reason_mismatches[8] = {
         "2", "Ref2VA", "1", "1", "encoder.down.0.block.1", "F16",
         "1,1,128,128,128",
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
@@ -581,11 +766,231 @@ static void test_runtime_metadata(void) {
     for (size_t index = 0; index < 8; index++) {
         const char *changed[8];
         memcpy(changed, valid, sizeof(changed));
-        changed[index] = mismatches[index];
+        changed[index] = reason_mismatches[index];
         require(h3_ane_test_validate_metadata(changed, &contract) ==
                     (int)reasons[index],
                 "metadata mismatch returned the wrong stable reason");
     }
+}
+
+static h3_ane_operation_usage eligible_usage(size_t index) {
+    h3_ane_operation_usage usage = {
+        .supported_devices = H3_ANE_DEVICE_CPU |
+                             H3_ANE_DEVICE_NEURAL_ENGINE,
+        .preferred_device = H3_ANE_DEVICE_NEURAL_ENGINE,
+    };
+    snprintf(usage.name, sizeof(usage.name), "operation-%zu", index);
+    return usage;
+}
+
+static void require_plan_failure(const h3_ane_test_plan_node *nodes,
+                                 size_t count, h3_ane_code code,
+                                 uint64_t observed, uint64_t limit,
+                                 const char *message) {
+    h3_ane_operation_usage *operations = NULL;
+    size_t operation_count = 0;
+    h3_ane_inventory_summary summary;
+    h3_ane_diagnostic diagnostic = {0};
+    require(!h3_ane_test_collect_plan(nodes, count, &operations,
+                                      &operation_count, &summary, &diagnostic),
+            message);
+    require(operations == NULL &&
+                diagnostic.stage == H3_ANE_STAGE_COMPUTE_PLAN &&
+                diagnostic.code == code && diagnostic.has_count &&
+                diagnostic.observed_count == observed &&
+                diagnostic.limit == limit,
+            message);
+}
+
+static void test_large_compute_plan_inventory(void) {
+    h3_ane_test_plan_node nodes[441] = {0};
+    for (size_t index = 0; index < 441; index++) {
+        nodes[index].usage = eligible_usage(index);
+        if (index >= 149) nodes[index].usage.is_constant = 1;
+    }
+    h3_ane_operation_usage *operations = NULL;
+    size_t operation_count = 0;
+    h3_ane_inventory_summary summary;
+    h3_ane_diagnostic diagnostic = {0};
+    require_plan_failure(NULL, 0, H3_ANE_CODE_OPERATION_INVENTORY_EMPTY,
+                         0, 0,
+                         "zero-operation inventory did not fail exactly");
+    require(h3_ane_test_collect_plan(nodes, 441, &operations,
+                                     &operation_count, &summary, &diagnostic),
+            "441-operation inventory was truncated or rejected");
+    require(operation_count == 441 && summary.total == 441 &&
+                summary.nonconstant == 149 && summary.constant == 292 &&
+                summary.neural_engine_supported == 149,
+            "441-operation inventory summary is incorrect");
+    free(operations);
+
+    h3_ane_test_plan_node unsupported = {
+        .usage = eligible_usage(0),
+    };
+    unsupported.usage.supported_devices = 0;
+    unsupported.usage.preferred_device = 0;
+    operations = NULL;
+    operation_count = 0;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(!h3_ane_test_collect_plan(&unsupported, 1, &operations,
+                                      &operation_count, &summary, &diagnostic) &&
+                diagnostic.stage == H3_ANE_STAGE_ELIGIBILITY &&
+                diagnostic.code == H3_ANE_CODE_OPERATION_USAGE_UNKNOWN,
+            "unknown nonconstant usage did not preserve first diagnostic");
+    unsupported.usage = eligible_usage(0);
+    unsupported.usage.preferred_device = 0;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(!h3_ane_test_collect_plan(&unsupported, 1, &operations,
+                                      &operation_count, &summary, &diagnostic) &&
+                diagnostic.code == H3_ANE_CODE_DEVICE_UNKNOWN &&
+                diagnostic.has_supported_devices &&
+                !diagnostic.has_preferred_device,
+            "known supported mask with unknown preferred device was accepted");
+    unsupported.usage = eligible_usage(0);
+    unsupported.usage.supported_devices = H3_ANE_DEVICE_CPU;
+    unsupported.usage.preferred_device = H3_ANE_DEVICE_CPU;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(!h3_ane_test_collect_plan(&unsupported, 1, &operations,
+                                      &operation_count, &summary, &diagnostic) &&
+                diagnostic.code ==
+                    H3_ANE_CODE_OPERATION_NOT_NEURAL_ENGINE_SUPPORTED,
+            "CPU-only operation was accepted");
+    unsupported.usage.supported_devices = H3_ANE_DEVICE_GPU;
+    unsupported.usage.preferred_device = H3_ANE_DEVICE_GPU;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(!h3_ane_test_collect_plan(&unsupported, 1, &operations,
+                                      &operation_count, &summary, &diagnostic) &&
+                diagnostic.code ==
+                    H3_ANE_CODE_OPERATION_NOT_NEURAL_ENGINE_SUPPORTED,
+            "GPU-only operation was accepted");
+
+    h3_ane_test_plan_node *limit_nodes =
+        calloc(H3_ANE_MAX_OPERATIONS + 1, sizeof(*limit_nodes));
+    require(limit_nodes != NULL, "cannot allocate plan limit fixture");
+    for (size_t index = 0; index <= H3_ANE_MAX_OPERATIONS; index++)
+        limit_nodes[index].usage = eligible_usage(index);
+    operations = NULL;
+    operation_count = 0;
+    memset(&summary, 0, sizeof(summary));
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(h3_ane_test_collect_plan(limit_nodes, H3_ANE_MAX_OPERATIONS,
+                                     &operations, &operation_count, &summary,
+                                     &diagnostic) &&
+                operation_count == H3_ANE_MAX_OPERATIONS,
+            "4096-operation inventory was rejected");
+    free(operations);
+    require_plan_failure(limit_nodes, H3_ANE_MAX_OPERATIONS + 1,
+                         H3_ANE_CODE_OPERATION_INVENTORY_LIMIT_EXCEEDED,
+                         H3_ANE_MAX_OPERATIONS + 1, H3_ANE_MAX_OPERATIONS,
+                         "4097-operation inventory did not fail at limit");
+    free(limit_nodes);
+
+    h3_ane_test_plan_node depth[65] = {0};
+    for (size_t index = 0; index < 65; index++) {
+        depth[index].usage = eligible_usage(index);
+        if (index + 1 < 65) {
+            depth[index].children = &depth[index + 1];
+            depth[index].child_count = 1;
+        }
+    }
+    operations = NULL;
+    operation_count = 0;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(h3_ane_test_collect_plan(depth, 1, &operations, &operation_count,
+                                     &summary, &diagnostic) &&
+                operation_count == 65,
+            "depth-64 nested inventory was rejected");
+    free(operations);
+    depth[64].children = &depth[64];
+    depth[64].child_count = 1;
+    require_plan_failure(depth, 1,
+                         H3_ANE_CODE_OPERATION_NESTING_LIMIT_EXCEEDED,
+                         H3_ANE_MAX_OPERATION_DEPTH + 1,
+                         H3_ANE_MAX_OPERATION_DEPTH,
+                         "depth-65 inventory did not fail at nesting limit");
+
+    h3_ane_test_plan_node constant_nil = {
+        .usage = {.name = "constant-nil", .is_constant = 1},
+    };
+    operations = NULL;
+    operation_count = 0;
+    memset(&summary, 0, sizeof(summary));
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(h3_ane_test_collect_plan(&constant_nil, 1, &operations,
+                                     &operation_count, &summary, &diagnostic) &&
+                summary.constant_nil_usage == 1,
+            "constant nil usage was rejected or not counted");
+    free(operations);
+}
+
+typedef struct {
+    h3_ane_test_plan_node nodes[2];
+    size_t pass;
+    int drift;
+} changing_plan;
+
+static size_t changing_root_count(void *opaque) {
+    changing_plan *plan = opaque;
+    plan->pass++;
+    return plan->drift && plan->pass > 1 ? 2 : 1;
+}
+
+static void *changing_root_at(void *opaque, size_t index) {
+    return &((changing_plan *)opaque)->nodes[index];
+}
+
+static size_t changing_child_count(void *opaque, void *node) {
+    (void)opaque;
+    (void)node;
+    return 0;
+}
+
+static void *changing_child_at(void *opaque, void *node, size_t index) {
+    (void)opaque;
+    (void)node;
+    (void)index;
+    return NULL;
+}
+
+static void changing_usage(void *opaque, void *node,
+                           h3_ane_operation_usage *usage) {
+    changing_plan *plan = opaque;
+    *usage = ((h3_ane_test_plan_node *)node)->usage;
+    if (plan->pass == 1) {
+        usage->supported_devices = H3_ANE_DEVICE_CPU;
+        usage->preferred_device = H3_ANE_DEVICE_CPU;
+    }
+}
+
+static void test_plan_pass_ordering(void) {
+    const h3_ane_plan_tree_adapter adapter = {
+        .root_count = changing_root_count, .root_at = changing_root_at,
+        .child_count = changing_child_count, .child_at = changing_child_at,
+        .usage = changing_usage,
+    };
+    changing_plan plan = {0};
+    plan.nodes[0].usage = eligible_usage(0);
+    plan.nodes[1].usage = eligible_usage(1);
+    h3_ane_operation_usage *operations = NULL;
+    size_t count = 0;
+    h3_ane_inventory_summary summary;
+    h3_ane_diagnostic diagnostic = {0};
+    require(h3_ane_collect_plan_tree(&adapter, &plan, &operations, &count,
+                                     &summary, &diagnostic) && count == 1,
+            "stale ineligible count-pass usage rejected eligible fill usage");
+    free(operations);
+
+    memset(&plan, 0, sizeof(plan));
+    plan.nodes[0].usage = eligible_usage(0);
+    plan.nodes[1].usage = eligible_usage(1);
+    plan.drift = 1;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    require(!h3_ane_collect_plan_tree(&adapter, &plan, &operations, &count,
+                                      &summary, &diagnostic) &&
+                diagnostic.stage == H3_ANE_STAGE_COMPUTE_PLAN &&
+                diagnostic.code ==
+                    H3_ANE_CODE_OPERATION_INVENTORY_CHANGED,
+            "fill drift did not precede count-pass eligibility evidence");
 }
 
 typedef struct {
@@ -636,7 +1041,7 @@ static void test_runtime_bridge(const char *root) {
     install_fake_backend(&fake);
     ane = h3_ane_create_authorized(model_path, &contract, 0, error,
                                    sizeof(error));
-    require(ane != NULL && fake.load_count == 1 && fake.plan_count == 1,
+    require(ane != NULL && fake.load_count == 1 && fake.plan_count == 2,
             "explicit authorized creation depended on H3_ANE_MODEL");
     h3_ane_free(ane);
 
@@ -658,9 +1063,16 @@ static void test_runtime_bridge(const char *root) {
     install_fake_backend(&fake);
     ane = create_enabled(model_path, &contract, 0, error);
     require(ane != NULL, error);
-    require(fake.load_count == 1 && fake.plan_count == 1,
-            "qualified fake backend did not load and plan exactly once");
+    require(fake.load_count == 1 && fake.plan_count == 2,
+            "qualified fake backend did not complete count and fill planning");
     require(!h3_ane_is_shadow(ane), "qualified handle became shadow");
+    h3_ane_inventory_summary runtime_inventory;
+    h3_ane_inventory_snapshot(ane, &runtime_inventory);
+    require(runtime_inventory.total == 3 &&
+                runtime_inventory.constant == 1 &&
+                runtime_inventory.nonconstant == 2 &&
+                runtime_inventory.neural_engine_supported == 2,
+            "runtime inventory snapshot is incorrect");
     const size_t count = (size_t)1 * 1 * 256 * 256 * 128;
     float *input = calloc(count, sizeof(*input));
     float *output = calloc(count, sizeof(*output));
@@ -693,6 +1105,21 @@ static void test_runtime_bridge(const char *root) {
             "failed call inherited timing from the previous prediction");
     h3_ane_free(ane);
     require(fake.free_count == 1, "loaded backend was not freed exactly once");
+
+    fake = valid_fake_backend();
+    fake.fill_operation_count = fake.operation_count + 1;
+    install_fake_backend(&fake);
+    ane = create_enabled(model_path, &contract, 0, error);
+    h3_ane_diagnostic drift_diagnostic;
+    h3_ane_diagnostic_snapshot(ane, &drift_diagnostic);
+    require(drift_diagnostic.stage == H3_ANE_STAGE_COMPUTE_PLAN &&
+                drift_diagnostic.code ==
+                    H3_ANE_CODE_OPERATION_INVENTORY_CHANGED &&
+                drift_diagnostic.has_count &&
+                drift_diagnostic.observed_count == 4 &&
+                drift_diagnostic.limit == 3,
+            "count/fill drift lost its exact first diagnostic context");
+    h3_ane_free(ane);
 
     char shadow_path[512];
     make_directory(shadow_path, root, "shadow-model");
@@ -753,6 +1180,15 @@ static void test_runtime_bridge(const char *root) {
     ane = create_enabled(model_path, &changed, 0, error);
     require_predict_reason(ane, 1, H3_ANE_REASON_CONTRACT,
                            "contract failure reason was unstable");
+    h3_ane_diagnostic contract_diagnostic = {0};
+    h3_ane_diagnostic_snapshot(ane, &contract_diagnostic);
+    require(contract_diagnostic.has_contract_field &&
+                contract_diagnostic.stage == H3_ANE_STAGE_CONTRACT &&
+                contract_diagnostic.code == H3_ANE_CODE_METADATA_MISMATCH &&
+                contract_diagnostic.contract_field ==
+                    H3_ANE_CONTRACT_FIELD_BLOCK_INDEX &&
+                !contract_diagnostic.has_digest,
+            "caller contract mismatch lost exact block_index field");
     h3_ane_free(ane);
 
     fake = valid_fake_backend();
@@ -781,13 +1217,44 @@ static void test_runtime_bridge(const char *root) {
     ane = create_enabled(model_path, &changed, 0, error);
     require_predict_reason(ane, 1, H3_ANE_REASON_DTYPE,
                            "dtype failure reason was unstable");
+    memset(&contract_diagnostic, 0, sizeof(contract_diagnostic));
+    h3_ane_diagnostic_snapshot(ane, &contract_diagnostic);
+    require(contract_diagnostic.contract_field ==
+                H3_ANE_CONTRACT_FIELD_BOUNDARY_DTYPE &&
+                contract_diagnostic.stage == H3_ANE_STAGE_CONTRACT &&
+                contract_diagnostic.code == H3_ANE_CODE_DTYPE_MISMATCH &&
+                !contract_diagnostic.has_digest,
+            "caller contract mismatch lost exact boundary_dtype field");
+    h3_ane_free(ane);
+
+    changed = contract;
+    changed.shape[2] = 128;
+    ane = create_enabled(model_path, &changed, 0, error);
+    require_predict_reason(ane, 1, H3_ANE_REASON_SHAPE,
+                           "shape failure reason was unstable");
+    memset(&contract_diagnostic, 0, sizeof(contract_diagnostic));
+    h3_ane_diagnostic_snapshot(ane, &contract_diagnostic);
+    require(contract_diagnostic.stage == H3_ANE_STAGE_CONTRACT &&
+                contract_diagnostic.code == H3_ANE_CODE_SHAPE_MISMATCH &&
+                contract_diagnostic.contract_field ==
+                    H3_ANE_CONTRACT_FIELD_SHAPE &&
+                !contract_diagnostic.has_digest,
+            "caller shape mismatch lost exact digest-free context");
     h3_ane_free(ane);
 
     h3_ane_contract fingerprint = contract;
-    fingerprint.source_sha256[0] = 'e';
+    fingerprint.source_sha256[0] = 'X';
     ane = create_enabled(model_path, &fingerprint, 0, error);
     require_predict_reason(ane, 1, H3_ANE_REASON_FINGERPRINT,
                            "fingerprint failure reason was unstable");
+    memset(&contract_diagnostic, 0, sizeof(contract_diagnostic));
+    h3_ane_diagnostic_snapshot(ane, &contract_diagnostic);
+    require(contract_diagnostic.stage == H3_ANE_STAGE_CONTRACT &&
+                contract_diagnostic.code == H3_ANE_CODE_FINGERPRINT_MISMATCH &&
+                contract_diagnostic.contract_field ==
+                    H3_ANE_CONTRACT_FIELD_SOURCE_SHA256 &&
+                !contract_diagnostic.has_digest,
+            "caller source mismatch exposed digest or lost exact context");
     h3_ane_free(ane);
 
     fake = valid_fake_backend();
@@ -1120,7 +1587,8 @@ static void test_video_encoder_ane_surface(void) {
     require(latent.ane_stats.attempts == 0,
             "video latent ANE stats do not initialize to zero");
     int (*qualification)(const char *, const char *, const float *, size_t,
-                         float *, float *, size_t, char *, size_t) =
+                         float *, float *, size_t, h3_ane_diagnostic *,
+                         char *, size_t) =
         h3_video_encoder_block0_qualification;
     require(qualification != NULL,
             "video encoder qualification surface is unavailable");
@@ -1151,6 +1619,53 @@ static void test_video_encoder_ane_surface(void) {
                     (uint32_t)variations[index][8],
                     (uint32_t)variations[index][9]),
                 "unsupported encoder candidate was accepted");
+}
+
+static void test_video_encoder_qualification_first_failures(void) {
+    const char *weights = "MiniMax-H3/FL2VA/video_vae/source";
+    if (access(weights, R_OK) != 0) {
+        printf("skip: released FL2VA qualification fixture is not installed\n");
+        return;
+    }
+    const size_t count = (size_t)1 * 1 * 256 * 256 * 128;
+    float *input = calloc(count, sizeof(*input));
+    float *metal = calloc(count, sizeof(*metal));
+    float *coreml = calloc(count, sizeof(*coreml));
+    require(input && metal && coreml,
+            "cannot allocate qualification diagnostic fixture");
+    fake_ane_backend fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    static const struct {
+        h3_video_encoder_qualification_failure failure;
+        h3_ane_stage stage;
+        h3_ane_code code;
+    } cases[] = {
+        {H3_VIDEO_ENCODER_QUALIFICATION_FAIL_INPUT_ALLOCATION,
+         H3_ANE_STAGE_SETUP, H3_ANE_CODE_ALLOCATION_FAILED},
+        {H3_VIDEO_ENCODER_QUALIFICATION_FAIL_METAL_RUN,
+         H3_ANE_STAGE_PREDICTION, H3_ANE_CODE_PREDICTION_FAILED},
+        {H3_VIDEO_ENCODER_QUALIFICATION_FAIL_METAL_READ,
+         H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_OUTPUT_COPY_FAILED},
+    };
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        char error[256];
+        h3_ane_diagnostic diagnostic = {0};
+        h3_video_encoder_test_set_qualification_failure(cases[index].failure);
+        require(!h3_video_encoder_block0_qualification(
+                    weights, "fixture.mlmodelc", input, count, metal, coreml,
+                    count, &diagnostic, error, sizeof(error)),
+                "injected qualification failure unexpectedly passed");
+        require(diagnostic.stage == cases[index].stage &&
+                    diagnostic.code == cases[index].code,
+                "qualification bridge lost its exact local first failure");
+        require(strstr(diagnostic.message, weights) == NULL &&
+                    strstr(diagnostic.message, "MiniMax-H3") == NULL,
+                "qualification diagnostic exposed a private fixture path");
+    }
+    h3_video_encoder_test_set_qualification_failure(
+        H3_VIDEO_ENCODER_QUALIFICATION_FAIL_NONE);
+    h3_ane_test_set_backend(NULL);
+    free(input); free(metal); free(coreml);
 }
 
 static void run_cancellation_fixture(const char *root,
@@ -1196,10 +1711,17 @@ int main(void) {
     test_contract_is_exact();
     test_compiled_directory_receipt_integration(root);
     test_runtime_metadata();
+    test_shared_plan_deadline();
+    test_large_compute_plan_inventory();
+    test_plan_pass_ordering();
     test_multiarray_stride_copy();
+    test_first_diagnostic_is_immutable();
+    test_complete_diagnostic_taxonomy();
+    test_diagnostic_code_snapshots();
     test_runtime_bridge(root);
     test_dispatch_fallback(root);
     test_video_encoder_ane_surface();
+    test_video_encoder_qualification_first_failures();
     printf("PASS tests/test_ane.c\n");
     return 0;
 }

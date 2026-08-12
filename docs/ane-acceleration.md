@@ -1,68 +1,102 @@
-# Experimental ANE acceleration
+# Experimental ANE eligibility and shadow measurement
 
-This document describes the default-off Apple Neural Engine (ANE) measurement
-harness for FL2VA visual encoder level 0, block 0. It is an experiment, not a
-production backend or a performance claim. Metal remains the default, fallback,
-and numerical oracle.
+The Apple Neural Engine (ANE) path is a default-off experiment for FL2VA visual
+encoder level 0, block 0. Metal remains the default backend, fallback, and
+numerical oracle. The experiment does not change the public `h3.h` API.
 
-## Current result
+## Current evidence and claim boundary
 
-The harness, converter, compiler path, qualification tool, benchmark tool, and
-analyzer are implemented. A real conversion and `coremlcompiler` compile both
-succeeded with the local FL2VA weights:
+The current fixed artifact passes the production compute-plan inventory:
 
-- source fingerprint:
-  `ad7b9b6432fc3c31c095bd6918c47ea5d6d0f145f4fae33fd46e0fc2738ce163`
-- compiled-model digest:
-  `eb9aa723703364943e8171003f4445f10673f6b5b889d45a76d135375990ebe1`
+| Inventory field | Observed value |
+|---|---:|
+| Total operations | 441 |
+| Constant operations | 292 |
+| Nonconstant operations | 149 |
+| Nonconstant operations supporting Neural Engine | 149 |
+| CPU-only nonconstant operations | 0 |
+| GPU-only nonconstant operations | 0 |
+| Unknown nonconstant operations | 0 |
+| Constants with no device usage | 292 |
 
-Real qualification then failed closed with `ANE backend is unavailable`. The
-failure is retained in `.release-loop/evidence/U4/real-qualification.json`.
-The tool did not create a passing `<MODEL.mlmodelc>.qualification.json`
-sidecar. Therefore:
+This is **eligibility** evidence only. `MLComputePlan` reports anticipated device
+support and preferred devices; it does not report runtime placement.
 
-- the harness is ready for further measurement;
-- real numerical qualification has not passed;
-- ANE placement and performance have not been established; and
-- no acceleration, memory, or energy claim exists.
+The real artifact still fails strict qualification:
 
-Do not treat build success, conversion, compilation, configuration,
-`MLComputePlan` eligibility, preferred CPU placement, or mixed placement as ANE
-execution evidence.
+- `max_abs = 0.19216197729110718`
+- `relative_l2 = 0.038400878187031535`
+- strict bounds: `max_abs < 0.002`, `relative_l2 < 0.02`
+- diagnostic: `parity/parity_bounds_failed`
+- receipt: `null`
 
-## Runtime contract
+The approved `shadow-measurement-v1` profile passes its finite provisional
+bounds, `max_abs < 0.25` and `relative_l2 < 0.05`, with the same metrics. Its
+result is always `authority: false` and `receipt: null`. Core ML output remains
+discarded; Metal output remains authoritative.
 
-The experiment applies only to this boundary:
+Do not describe shadow threshold success as parity qualification, production
+equivalence, observed ANE execution, or authorization. No Instruments trace has
+yet shown Neural Engine activity overlapping prediction, so runtime placement
+is not observed. Latency, process-memory, and energy gates also remain blocked.
+
+## Fixed graph and runtime contract
+
+The experiment applies to one immutable external boundary:
 
 | Field | Value |
 |---|---|
-| Model variant | `FL2VA` |
+| Variant | `FL2VA` |
 | Block | level `0`, block `0` |
 | Weight prefix | `encoder.down.0.block.0` |
-| Boundary shape | NDHWC `[1,1,256,256,128]` |
-| Boundary dtype | `F32` |
+| Input and output | F32 NDHWC `[1,1,256,256,128]` |
 | Runtime floor | macOS 14.4 |
 | Core ML compute units | CPU and Neural Engine |
 
-Every non-constant operation must list the Neural Engine as a supported device
-before prediction is attempted. Preferred CPU or mixed placement is recorded,
-but it does not establish that prediction ran on ANE.
+Internally, the converter removes only the singleton depth dimension. It
+preserves 32-group normalization with epsilon `1e-6`, affine scale and bias,
+channel order, reflected one-pixel spatial padding, SiLU, two convolutions, and
+the residual addition. With input depth one and two frames of front zero
+padding, only temporal OIDHW kernel plane two can affect the output, so the
+fixed graph uses that exact OIHW plane for each 2D convolution and restores the
+depth dimension at the output. This reduction is not valid for deeper inputs.
 
-### Environment variables
+Production compute-plan traversal is two-pass. It first counts recursively,
+then allocates and fills the exact count. It rejects:
+
+- zero operations or more than 4096 operations;
+- nesting deeper than 64 blocks;
+- allocation overflow or failure; and
+- any count/fill disagreement.
+
+The 4096-operation and 64-level bounds are resource-safety limits, not
+eligibility shortcuts. After a structurally valid inventory, every nonconstant
+operation must have known Neural Engine support. A constant with nil device
+usage is counted but does not fail eligibility.
+
+### Runtime environment
 
 | Variable | Effect |
 |---|---|
-| `H3_ANE_MODEL=/absolute/path/model.mlmodelc` | Explicitly opts into the compiled model. When unset, no Core ML model is loaded. Use an absolute path so the model, receipt, benchmark, and trace all identify the same artifact. |
-| `H3_ANE_SHADOW=1` | Runs Core ML diagnostically but always adopts the unchanged Metal result. Shadow mode may inspect an unqualified model because its output is never adopted. |
-| `H3_ANE_TRACE=1` | Prints each compute-plan operation name, constant flag, supported-device bit mask, and preferred-device bit mask to stderr. |
-| `H3_ANE_WEIGHT_DIR=/path/to/source` | Selects the source-weight directory for `h3_ane_bench`; the default is `MiniMax-H3/FL2VA/video_vae/source`. |
+| `H3_ANE_MODEL=/absolute/path/model.mlmodelc` | Explicit opt-in. When unset, no Core ML model is loaded. |
+| `H3_ANE_SHADOW=1` | Runs Core ML diagnostically but always returns Metal output. Only the exact value `1` enables it. |
+| `H3_ANE_TRACE=1` | Prints operation support and preferred-device diagnostics. Only the exact value `1` enables it. |
+| `H3_ANE_WEIGHT_DIR=/absolute/source` | Supplies released FL2VA source weights to the real and shadow Make targets and benchmark tool. |
 
-Only the exact string `1` enables shadow or trace mode.
+Non-shadow runtime use also requires the strict receipt at:
 
-### Canonical model metadata
+```text
+<MODEL.mlmodelc>.qualification.json
+```
 
-The converter writes these strings into the Core ML model's
-`userDefinedMetadata`:
+The receipt binds the compiled-directory digest, source-tensor fingerprint,
+test vector, timestamp, and strict metrics. A missing, malformed, failed, stale,
+or mismatched receipt selects Metal. Shadow execution never creates or preserves
+this authority.
+
+## Canonical metadata and local artifacts
+
+The converter writes these creator-defined metadata strings:
 
 | Key | Canonical value |
 |---|---|
@@ -73,7 +107,7 @@ The converter writes these strings into the Core ML model's
 | `weight_prefix` | `encoder.down.0.block.0` |
 | `boundary_dtype` | `F32` |
 | `shape` | `1,1,256,256,128` |
-| `source_sha256` | source-tensor fingerprint |
+| `source_sha256` | canonical source-tensor fingerprint |
 | `h3_ane_boundary_layout` | `NDHWC` |
 | `h3_ane_weight_layout` | `OIDHW` |
 | `h3_ane_group_count` | `32` |
@@ -81,107 +115,246 @@ The converter writes these strings into the Core ML model's
 | `h3_ane_temporal_padding` | `front=2,back=0,mode=constant` |
 | `h3_ane_spatial_padding` | `1,1,1,1,mode=reflect` |
 
-Runtime validates the version, variant, block coordinates, weight prefix,
-boundary dtype and shape, and source fingerprint before prediction.
+The source fingerprint hashes the eight selected tensors in sorted name order,
+including name, dtype identifier, rank, shape, payload length, and raw bytes.
+The compiled-model digest hashes regular files in sorted relative-path order.
+Unsafe paths, unsupported file types, and every symlink are rejected.
 
-### Fingerprints and qualification receipt
+Weights, `.mlpackage`, `.mlmodelc`, receipts, media, and raw Instruments traces
+remain local and gitignored. Commit only bounded sanitized result summaries;
+never commit absolute private paths, device identifiers, checkpoints, compiled
+models, or raw traces.
 
-The source fingerprint is a SHA-256 over the eight selected tensors in sorted
-name order. The canonical stream includes the tensor name, dtype identifier,
-rank and shape, payload length, and raw payload bytes, so changing the active
-weights changes the fingerprint.
-
-The compiled-model digest is a SHA-256 over the compiled directory's regular
-files in sorted relative-path order. Unsafe paths, unsupported file types, and
-all symlinks are rejected, including symlinks whose targets remain inside the
-model directory. Changing compiled bytes invalidates the digest.
-
-Non-shadow execution requires the fixed receipt path:
-
-```text
-<MODEL.mlmodelc>.qualification.json
-```
-
-The receipt binds the compiled digest to the source fingerprint and records its
-schema version, test-vector identity, qualification timestamp, maximum absolute
-error, relative L2 error, and passing status. Qualification passes only when
-`max_abs < 0.002` and `relative_l2 < 0.02`. A missing, malformed, failed, stale,
-or mismatched receipt selects Metal. The qualification command invalidates an
-old receipt before testing and writes a new sidecar atomically only on pass.
-
-## Build and inspect the tools
+Core ML Tools remains outside the C runtime and default build. All conversion
+and integration targets use this exact isolated environment:
 
 ```sh
-make h3_ane_qualification h3_ane_bench h3_ane_tool_tests
-./h3_ane_qualification --help
-./h3_ane_bench --help
-python3 scripts/analyze_ane_benchmark.py --help
-```
-
-The ANE tools do not change the default `make` or runtime selection. The C
-runtime has no Python dependency.
-
-## Convert and compile the block
-
-Core ML Tools is deliberately isolated from the repository and C runtime. Use
-the pinned environment for every conversion:
-
-```sh
-uv run --python 3.12 \
+UV_CACHE_DIR=/private/tmp/uv-cache uv run --python 3.12 \
   --with coremltools==9.0 \
   --with numpy==2.3.2 \
   --with safetensors==0.6.2 \
-  scripts/convert_ane_visual_block.py \
-  --weights MiniMax-H3/FL2VA/video_vae/source \
-  --output build/ane-visual-block.mlpackage
+  scripts/convert_ane_visual_block.py --help
 ```
 
-Compile the emitted package into an otherwise empty output directory:
+If the packages are absent globally, that is expected. If uv cannot resolve or
+reuse the pinned packages, report dependency unavailability; do not label it an
+ANE, graph, or qualification failure.
+
+## Structured qualification result
+
+Build and inspect the qualifier:
 
 ```sh
-mkdir -p build/coreml
-xcrun coremlcompiler compile \
-  build/ane-visual-block.mlpackage \
-  build/coreml
-export H3_ANE_MODEL="$PWD/build/coreml/ane-visual-block.mlmodelc"
+make h3_ane_qualification h3_ane_integration_probe h3_ane_tool_tests
+./h3_ane_qualification --help
+python3 scripts/run_ane_integration.py --help
 ```
 
-For atomic replacement of a named compiled destination, the converter also
-supports `--compile-output build/ane-visual-block.mlmodelc`. It invokes the same
-`coremlcompiler compile` command in a temporary sibling directory and publishes
-the single resulting `.mlmodelc` only after a successful compile.
+The strict qualifier writes `h3-ane-qualification/v1`. These fields are stable:
 
-If `coremltools`, NumPy, or safetensors is absent globally, that is expected.
-`uv run --with` installs or reuses them in an isolated uv environment. An
-offline machine without the packages in its uv cache fails before conversion;
-this is a dependency-availability failure, not a runtime or ANE result.
+```json
+{
+  "schema": "h3-ane-qualification/v1",
+  "status": "passed|failed",
+  "model_sha256": "hex-or-empty",
+  "source_sha256": "hex-or-empty",
+  "test_vector": "xorshift32-v1",
+  "qualified_at": "UTC-or-empty",
+  "max_abs": 0.0,
+  "relative_l2": 0.0,
+  "receipt_path": "compiled-model.qualification.json|null",
+  "failure_reason": "message|null",
+  "failure_stage": "stage|null",
+  "failure_code": "code|null",
+  "failure_operation": "bounded-name|null",
+  "supported_devices": ["cpu", "gpu", "neural-engine"],
+  "preferred_device": "cpu|gpu|neural-engine|null",
+  "observed_count": 0,
+  "limit": 0,
+  "artifact_role": "compiled_model|source_weights|null",
+  "contract_field": "version|variant|block_level|block_index|weight_prefix|boundary_dtype|shape|source_sha256|null",
+  "digest": "hex|null"
+}
+```
 
-## Qualify numerical parity
+Context fields are `null` when the failing boundary does not provide them.
+Device arrays use only `cpu`, `gpu`, and `neural-engine`, in that order. A
+successful strict result sets every failure field to `null`. If the result
+cannot be atomically published, no result exists: stderr reports
+`publication/result_write_failed`, the process exits 2, and no receipt is
+written. If receipt publication fails, the result is rewritten as
+`publication/receipt_write_failed` when possible and authority remains absent.
+Strict and shadow qualification both prove same-directory, link-safe receipt
+quarantine before prediction or authority mutation. A failed preflight exits 2,
+preserves an existing or absent receipt state unchanged, and publishes
+`measurement_started:false`, `authority_state:"unchanged"`, `authority:false`,
+and `receipt_path:null` when the result destination is independently writable.
 
-Build the native qualifier, then run it against the same source weights and
-compiled directory:
+The closed failure stages and codes are:
+
+| Stage | Codes |
+|---|---|
+| `setup` | `disabled`, `os_unsupported`, `allocation_failed` |
+| `artifact` | `compiled_model_unreadable`, `compiled_model_digest_failed`, `source_weights_unreadable`, `source_tensor_digest_failed` |
+| `contract` | `metadata_missing`, `metadata_mismatch`, `fingerprint_mismatch`, `shape_mismatch`, `dtype_mismatch` |
+| `receipt` | `receipt_missing`, `receipt_malformed`, `receipt_digest_mismatch`, `receipt_invalid` |
+| `load` | `model_load_failed`, `model_load_exception` |
+| `compute_plan` | `allocation_failed`, `plan_timeout`, `plan_load_failed`, `program_missing`, `main_missing`, `operation_inventory_empty`, `operation_inventory_limit_exceeded`, `operation_nesting_limit_exceeded`, `operation_inventory_changed` |
+| `eligibility` | `operation_usage_unknown`, `operation_not_neural_engine_supported`, `device_unknown` |
+| `input` | `input_shape_mismatch`, `input_dtype_mismatch`, `input_copy_failed` |
+| `prediction` | `prediction_failed`, `prediction_exception` |
+| `output` | `output_shape_mismatch`, `output_dtype_mismatch`, `output_copy_failed`, `output_nonfinite` |
+| `parity` | `parity_metrics_nonfinite`, `parity_bounds_failed` |
+| `publication` | `result_write_failed`, `receipt_write_failed` |
+
+`placement` is deliberately not a qualification stage.
+
+## One-command integration targets
+
+### Synthetic package/compiler/runtime gate
+
+This target needs no released weights. It generates deterministic exact-shape
+weights, converts and compiles the package, loads it through the production
+metadata and compute-plan consumer, and publishes a sanitized
+`h3-ane-integration/v1` summary:
 
 ```sh
-make h3_ane_qualification
+make h3_ane_integration_test
+```
+
+A passing summary has `mode: "synthetic"`, inventory `441/149/149/0`, and
+`diagnostic`, `parity`, and `receipt` set to `null`. Synthetic success proves
+the package/compiler/production-reader gate; it does not qualify real weights or
+authorize runtime output.
+
+The `h3-ane-integration/v1` summary has this mode-dependent field contract:
+
+| Field | Synthetic | Strict real | Shadow |
+|---|---|---|---|
+| `schema` | `h3-ane-integration/v1` | same | same |
+| `status` | `passed|failed` | `passed|failed` | `passed|failed` |
+| `mode` | `synthetic` | `real` | `shadow` |
+| `profile` | `null` | `null` | `shadow-measurement-v1` |
+| `authority` | `null` | `null` | always `false` |
+| `source_sha256` | digest or `null` on failure | same | same |
+| `inventory` | eight-field inventory or `null` | same | same |
+| `diagnostic` | `{stage,code,message}` or `null` | same | same |
+| `parity` | always `null` | `{max_abs,relative_l2}` or `null` | same shape, never authority |
+| `receipt` | always `null` | validated receipt subset or `null` | always `null` |
+| `artifacts` | `{model_sha256,source_sha256}` or `null` | same | same |
+| `stages` | completed child exit codes | same | same |
+| `measurement_started` | absent | absent | boolean when qualification reports it |
+| `authority_state` | absent | absent | `invalidated`, `unchanged`, or absent before that boundary |
+
+The eight inventory fields are `total`, `constant`, `nonconstant`,
+`neural_engine_supported`, `cpu_only`, `gpu_only`, `unknown_nonconstant`, and
+`constant_nil_usage`. In this document, `441/149/149/0` means total /
+nonconstant / Neural-Engine-supported / CPU-only-and-unknown (both zero).
+
+### Strict real qualification
+
+The explicit real target requires released weights:
+
+```sh
+export ANE_INTEGRATION_WORK=/private/tmp/h3-ane-integration
+export H3_ANE_WEIGHT_DIR="$PWD/MiniMax-H3/FL2VA/video_vae/source"
+make h3_ane_real_qualification_test
+```
+
+Without `H3_ANE_WEIGHT_DIR`, Make exits 2 before Python and reports
+`H3_ANE_WEIGHT_DIR is required for h3_ane_real_qualification_test`. Missing
+weights are a prerequisite failure, not an ANE failure.
+
+Strict mode is the exclusive authority path. It uses finite
+`max_abs < 0.002` and `relative_l2 < 0.02`, publishes a digest-bound receipt
+only after both pass, and alone can authorize non-shadow Core ML output. The
+current real target exits nonzero with `parity/parity_bounds_failed`, the
+metrics shown above, and `receipt: null`.
+
+Only after that target succeeds, bind later strict commands to its exact
+compiled artifact and receipt:
+
+```sh
+export H3_ANE_STRICT_MODEL="$ANE_INTEGRATION_WORK/visual-block.mlmodelc"
+test -d "$H3_ANE_STRICT_MODEL"
+test -f "$H3_ANE_STRICT_MODEL.qualification.json"
+
 ./h3_ane_qualification \
-  --model MiniMax-H3/FL2VA/video_vae/source \
-  --coreml-model "$H3_ANE_MODEL" \
-  --output .release-loop/evidence/ane-qualification.json
+  --model "$H3_ANE_WEIGHT_DIR" \
+  --coreml-model "$H3_ANE_STRICT_MODEL" \
+  --output /absolute/local/path/strict-qualification.json
 ```
 
-The qualifier generates a deterministic `xorshift32-v1` input, runs the exact
-Metal block and Core ML, and records both parity metrics. Exit zero plus a
-`status: "passed"` result and the matching sidecar prove offline parity. A
-failed result or absent receipt means non-shadow execution remains unauthorized.
+`ANE_INTEGRATION_WORK` defaults to `/private/tmp/h3-ane-integration`; set it
+before the Make target to choose another work directory. Always derive
+`H3_ANE_STRICT_MODEL` from that same value. Never substitute the shadow
+artifact: shadow measurement cannot create the receipt required here.
 
-The optional end-to-end visual-encoder test also needs
-`misc/fixtures/h3_real_video_encoder_256.safetensors`. That private, ignored
-fixture is absent in this checkout. `make test` reports a skip when either the
-fixture or released visual-encoder weights are absent; a skip is not parity
-evidence.
+### Non-authorizing shadow measurement
 
-Prepare one real 256-by-256 conditioning image and keep its absolute path fixed
-for both the Metal baseline and shadow run:
+Run the approved shadow profile with the same released weights:
+
+```sh
+export ANE_SHADOW_WORK=/private/tmp/h3-ane-shadow-measurement
+export H3_ANE_WEIGHT_DIR="$PWD/MiniMax-H3/FL2VA/video_vae/source"
+make h3_ane_shadow_measurement_test
+export H3_ANE_SHADOW_MODEL="$ANE_SHADOW_WORK/visual-block.mlmodelc"
+test -d "$H3_ANE_SHADOW_MODEL"
+```
+
+The Make target invokes the qualifier with `--shadow-only`. Direct use against
+an existing compiled model is:
+
+```sh
+./h3_ane_qualification --shadow-only \
+  --model "$H3_ANE_WEIGHT_DIR" \
+  --coreml-model "$H3_ANE_SHADOW_MODEL" \
+  --output /absolute/local/path/shadow-qualification.json
+```
+
+Both interfaces apply finite `max_abs < 0.25` and `relative_l2 < 0.05`. A
+passing qualifier result includes:
+
+```json
+{
+  "profile": "shadow-measurement-v1",
+  "status": "passed",
+  "authority": false,
+  "measurement_started": true,
+  "authority_state": "invalidated",
+  "bounds": {"max_abs": 0.25, "relative_l2": 0.05},
+  "threshold_outcome": true,
+  "receipt_path": null
+}
+```
+
+The integration summary uses `mode: "shadow"`, the same profile and authority
+fields, inventory, parity metrics, `receipt: null`, and per-stage exit statuses.
+Passing shadow measurement only allows local exploratory placement, latency,
+memory, and energy collection while Core ML output is discarded. It does not
+pass any of those evidence gates by itself.
+
+Before measuring or changing authority, shadow mode proves that the receipt
+directory supports a link-safe same-directory quarantine using disposable
+sibling entries. If this preflight fails:
+
+- measurement does not start;
+- an existing receipt and authority state remain byte-for-byte unchanged;
+- the process exits 2;
+- a writable result records `measurement_started: false`,
+  `authority_state: "unchanged"`, `authority: false`, `receipt_path: null`,
+  `failure_stage: "receipt"`, and `failure_code: "receipt_invalid"`; and
+- no placement, parity, latency, memory, or energy evidence from that invocation
+  is accepted.
+
+If preflight succeeds, the live receipt pathname is invalidated before
+measurement. Success, threshold failure, nonfinite metrics, publication failure,
+or cancellation never publishes replacement authority.
+
+## Runtime shadow and observed placement
+
+After the shadow target passes, use its explicit `H3_ANE_SHADOW_MODEL` path and
+a real 256-by-256 first-frame condition so the fixed block executes:
 
 ```sh
 export FIRST_FRAME=/absolute/path/to/first-frame-256.png
@@ -189,22 +362,16 @@ test -f "$FIRST_FRAME"
 test "$(ffprobe -v error -select_streams v:0 \
   -show_entries stream=width,height -of csv=s=x:p=0 \
   "$FIRST_FRAME")" = "256x256"
-```
 
-Do not substitute a synthetic tensor or omit `--first-frame`: the comparison
-must execute the real visual-conditioning encoder at the experiment's fixed
-256-by-256 geometry.
+env -u H3_ANE_MODEL -u H3_ANE_SHADOW -u H3_ANE_TRACE \
+./h3 -d ./MiniMax-H3 \
+  -p "A slow camera move around the supplied first frame." \
+  --first-frame "$FIRST_FRAME" \
+  --width 256 --height 256 --frames 22 --steps 4 \
+  --layers 50 --reuse 1 \
+  -o outputs/ane-metal-baseline.mp4
 
-## Run shadow diagnostics
-
-Shadow mode does not require a passing receipt because it always returns Metal
-output. Use a 256-square first-frame conditioning path so the fixed block is a
-candidate:
-
-```sh
-H3_ANE_MODEL="$H3_ANE_MODEL" \
-H3_ANE_SHADOW=1 \
-H3_ANE_TRACE=1 \
+H3_ANE_MODEL="$H3_ANE_SHADOW_MODEL" H3_ANE_SHADOW=1 H3_ANE_TRACE=1 \
 ./h3 -d ./MiniMax-H3 \
   -p "A slow camera move around the supplied first frame." \
   --first-frame "$FIRST_FRAME" \
@@ -213,173 +380,119 @@ H3_ANE_TRACE=1 \
   -o outputs/ane-shadow.mp4
 ```
 
-Trace lines report compute-plan support and preferred-device masks. They are
-preflight diagnostics only. Shadow parity and an eligible plan still do not
-prove ANE placement.
+The baseline and shadow commands use the same real first frame, prompt, and
+generation geometry. The baseline explicitly removes every ANE opt-in variable,
+so it exercises the unchanged Metal visual-conditioning path.
 
-## Record alternating A/B latency
-
-Do not run a Core ML benchmark until qualification has created a matching
-passing receipt. The benchmark uses two warm-ups per backend by default and
-alternates Metal/Core ML (`AB`) on even pairs and Core ML/Metal (`BA`) on odd
-pairs:
+Record the same shadow workload with the installed `Core ML` Instruments
+template. Use a new deterministic local path; `xctrace` does not overwrite an
+existing trace:
 
 ```sh
-export H3_ANE_WEIGHT_DIR="$PWD/MiniMax-H3/FL2VA/video_vae/source"
-./h3_ane_bench \
-  --backend ab \
-  --coreml-model "$H3_ANE_MODEL" \
-  --warmup 2 \
-  --pairs 20 \
-  --output .release-loop/evidence/ane-ab.json
-python3 scripts/analyze_ane_benchmark.py \
-  .release-loop/evidence/ane-ab.json
-```
+export ANE_SHADOW_WORK="${ANE_SHADOW_WORK:-/private/tmp/h3-ane-shadow-measurement}"
+export H3_ANE_SHADOW_MODEL="$ANE_SHADOW_WORK/visual-block.mlmodelc"
+export FIRST_FRAME=/absolute/path/to/first-frame-256.png
+export H3_ANE_SHADOW_TRACE=/private/tmp/h3-ane-shadow-placement.trace
+test -d "$H3_ANE_SHADOW_MODEL"
+test -f "$FIRST_FRAME"
+test "$(ffprobe -v error -select_streams v:0 \
+  -show_entries stream=width,height -of csv=s=x:p=0 \
+  "$FIRST_FRAME")" = "256x256"
+test ! -e "$H3_ANE_SHADOW_TRACE"
 
-The JSON records the selected backend, placement summary, Metal time, Core ML
-input/prediction/output and transfer-inclusive total time, parity metrics, all
-post-warm-up samples, and peak process RSS. The analyzer rejects incomplete or
-nonalternating samples and fewer than 20 pairs. It exits zero only when both:
-
-- the 95% deterministic bootstrap confidence-interval lower bound for paired
-  `Metal - Core ML` transfer-inclusive latency is positive; and
-- median transfer-inclusive latency improves by at least 5%.
-
-## Record process memory
-
-Capture maximum resident set size independently for each backend and retain
-stderr with the JSON evidence:
-
-```sh
-/usr/bin/time -l ./h3_ane_bench \
-  --backend metal --pairs 20 \
-  --output .release-loop/evidence/ane-metal.json \
-  2> .release-loop/evidence/ane-metal-time.txt
-
-/usr/bin/time -l ./h3_ane_bench \
-  --backend coreml --coreml-model "$H3_ANE_MODEL" --pairs 20 \
-  --output .release-loop/evidence/ane-coreml.json \
-  2> .release-loop/evidence/ane-coreml-time.txt
-```
-
-Use the `maximum resident set size` values from `/usr/bin/time -l`, not GPU-only
-allocation statistics. A process-memory claim passes only when Core ML maximum
-RSS is no more than 5% above the matched Metal value.
-
-## Capture placement and energy with Instruments
-
-First retain a default Metal/MPSGraph generation baseline using the same real
-256-by-256 first frame, prompt, and generation geometry as the shadow run.
-Unset all ANE variables so the trace cannot accidentally opt into Core ML:
-
-```sh
-env -u H3_ANE_MODEL -u H3_ANE_SHADOW -u H3_ANE_TRACE \
-xctrace record \
-  --template 'Metal System Trace' \
-  --output .release-loop/evidence/h3-metal-baseline.trace \
+xcrun xctrace record \
+  --template 'Core ML' \
+  --output "$H3_ANE_SHADOW_TRACE" \
+  --env H3_ANE_MODEL="$H3_ANE_SHADOW_MODEL" \
+  --env H3_ANE_SHADOW=1 \
+  --env H3_ANE_TRACE=1 \
   --launch -- ./h3 -d ./MiniMax-H3 \
   -p "A slow camera move around the supplied first frame." \
   --first-frame "$FIRST_FRAME" \
   --width 256 --height 256 --frames 22 --steps 4 \
   --layers 50 --reuse 1 \
-  -o outputs/h3-metal-baseline.mp4
+  -o outputs/ane-shadow-placement.mp4
 ```
 
-After qualification passes, record the focused alternating workload with the
-installed Core ML template:
+This trace is placement evidence only. Shadow remains non-authorizing, creates
+no receipt, discards the Core ML block output, and returns Metal output. Retain
+the trace locally and commit only a bounded sanitized summary.
+
+`eligible` means every nonconstant operation advertises Neural Engine support.
+`preferred` means the compute plan names a preferred device. Neither word means
+runtime placement. Use `observed Neural Engine` only for a retained Instruments
+trace showing Neural Engine activity overlapping the Core ML prediction
+interval. The trace command must keep `H3_ANE_SHADOW=1`; the generated request
+still returns Metal output.
+
+## Strict-only benchmark and independent evidence gates
+
+`h3_ane_bench` creates a non-shadow handle, so it requires a passing strict
+receipt. The current artifact has no receipt; these commands are future gates,
+not current shadow evidence.
+
+After strict qualification succeeds, record 20 alternating pairs and analyze
+transfer-inclusive latency:
 
 ```sh
-xctrace record \
-  --template 'Core ML' \
-  --output .release-loop/evidence/ane-placement.trace \
-  --env H3_ANE_MODEL="$H3_ANE_MODEL" \
-  --env H3_ANE_WEIGHT_DIR="$H3_ANE_WEIGHT_DIR" \
-  --launch -- ./h3_ane_bench \
-  --backend ab --coreml-model "$H3_ANE_MODEL" \
-  --warmup 2 --pairs 20 \
-  --output .release-loop/evidence/ane-instruments-ab.json
+make h3_ane_bench
+test -f "$H3_ANE_STRICT_MODEL.qualification.json"
+./h3_ane_bench --backend ab --coreml-model "$H3_ANE_STRICT_MODEL" \
+  --warmup 2 --pairs 20 --output /absolute/local/path/ane-ab.json
+python3 scripts/analyze_ane_benchmark.py /absolute/local/path/ane-ab.json
 ```
 
-An ANE placement claim requires retained Instruments evidence showing Neural
-Engine activity overlapping the measured Core ML prediction intervals. Model
-configuration, device support, `placement_summary`, and CPU or mixed preferred
-placement are insufficient.
+Latency passes only with at least 20 complete alternating pairs, a positive 95%
+bootstrap confidence-interval lower bound for paired `Metal - Core ML`, and at
+least 5% median transfer-inclusive improvement.
 
-Record energy separately over the same A/B workload. On macOS, use the Core ML
-template with the Neural Engine instrument; the installed `Power Profiler`
-template is not supported for a macOS target:
+Record process memory independently:
 
 ```sh
-xctrace record \
+/usr/bin/time -l ./h3_ane_bench --backend metal --pairs 20 \
+  --output /absolute/local/path/ane-metal.json 2> /absolute/local/path/ane-metal-time.txt
+/usr/bin/time -l ./h3_ane_bench --backend coreml \
+  --coreml-model "$H3_ANE_STRICT_MODEL" --pairs 20 \
+  --output /absolute/local/path/ane-coreml.json 2> /absolute/local/path/ane-coreml-time.txt
+```
+
+Process memory passes only when Core ML maximum resident set size grows no more
+than 5% relative to matched Metal. GPU allocation statistics cannot substitute.
+
+Energy is a separate, conditional strict-receipt run. The installed catalog
+names the template `Core ML` and the additional instrument `Neural Engine`:
+
+```sh
+export H3_ANE_ENERGY_TRACE=/private/tmp/h3-ane-strict-energy.trace
+test -f "$H3_ANE_STRICT_MODEL.qualification.json"
+test ! -e "$H3_ANE_ENERGY_TRACE"
+
+xcrun xctrace record \
   --template 'Core ML' \
   --instrument 'Neural Engine' \
-  --output .release-loop/evidence/ane-energy.trace \
-  --env H3_ANE_MODEL="$H3_ANE_MODEL" \
+  --output "$H3_ANE_ENERGY_TRACE" \
   --env H3_ANE_WEIGHT_DIR="$H3_ANE_WEIGHT_DIR" \
   --launch -- ./h3_ane_bench \
-  --backend ab --coreml-model "$H3_ANE_MODEL" \
+  --backend ab --coreml-model "$H3_ANE_STRICT_MODEL" \
   --warmup 2 --pairs 20 \
-  --output .release-loop/evidence/ane-energy-ab.json
+  --output /absolute/local/path/ane-energy-ab.json
 ```
 
-Open the retained trace in Instruments and export one available energy counter
-for every pair. Record its exact counter name and unit with the exported data.
-If this Xcode/macOS combination exposes placement/activity but no energy
-counter, the energy gate remains unverified; do not substitute utilization or
-duration. An energy claim passes only when the same counter's paired median
-improves by at least 5%. Latency success cannot stand in for energy evidence.
+Run this only after strict qualification succeeds. Inspect and export one
+available energy counter with its exact name and unit. If the installed
+instrument exposes placement/activity but no unit-bearing energy counter for
+the host target, the energy gate remains unverified.
 
-## Independent evidence gates
+Placement requires an Instruments trace with Neural Engine activity overlapping
+prediction. Energy requires a named exported counter and unit with at least 5%
+paired-median improvement on the same workload. Eligibility, preferred device,
+strict parity, a receipt, or shadow threshold success cannot substitute for
+observed placement, latency, process memory, or energy evidence.
 
-These gates are independent; failure or absence of one cannot be replaced by a
-different successful measurement.
-
-| Gate | Passing evidence |
+| Gate | Required evidence |
 |---|---|
-| Parity | Passing receipt bound to the active source and compiled digests; `max_abs < 0.002` and `relative_l2 < 0.02`. |
-| Placement | Retained Instruments trace showing Neural Engine activity overlapping Core ML prediction. |
-| Latency | At least 20 complete alternating pairs; positive 95% CI lower bound for paired `Metal - Core ML`; at least 5% median transfer-inclusive improvement. |
-| Process memory | Matched `/usr/bin/time -l` maximum RSS; Core ML growth no greater than 5%. |
-| Energy | One named, unit-bearing exported Instruments counter; at least 5% paired-median improvement. |
-
-## Fallback reasons and statistics
-
-Every failure falls back to the unchanged Metal block using the immutable
-original input. Core ML writes to separate storage and is adopted only after all
-online structural checks pass. Shadow mode always adopts Metal.
-
-The stable `h3_ane_reason` values are:
-
-| Reason | Meaning |
-|---|---|
-| `H3_ANE_REASON_NONE` | The last ANE operation completed without a fallback. |
-| `H3_ANE_REASON_DISABLED` | No matching explicit opt-in/model path was supplied. |
-| `H3_ANE_REASON_OS` | The process is running below macOS 14.4. |
-| `H3_ANE_REASON_CONTRACT` | Version, variant, block identity, weight prefix, or other model contract data is incompatible. |
-| `H3_ANE_REASON_FINGERPRINT` | Source or compiled-artifact fingerprinting failed or did not match. |
-| `H3_ANE_REASON_RECEIPT` | The fixed qualification receipt is missing, invalid, failed, stale, or mismatched. |
-| `H3_ANE_REASON_ELIGIBILITY` | The compute plan is unavailable or a non-constant operation does not support Neural Engine. |
-| `H3_ANE_REASON_LOAD` | The Core ML backend is incomplete or the model failed to load. |
-| `H3_ANE_REASON_PREDICTION` | Prediction, host transfer, or replacement-output allocation failed. |
-| `H3_ANE_REASON_SHAPE` | The fixed count or `[1,1,256,256,128]` shape does not match. |
-| `H3_ANE_REASON_DTYPE` | The boundary is not F32. |
-| `H3_ANE_REASON_NONFINITE` | Prediction produced NaN or infinity. |
-
-The operator-visible `h3_ane_stats` fields are:
-
-| Stat | Meaning |
-|---|---|
-| `load_seconds` | Core ML model-load time. |
-| `input_seconds` | Host input preparation/transfer time for the last prediction. |
-| `prediction_seconds` | Core ML prediction time for the last prediction. |
-| `output_seconds` | Output transfer time for the last prediction. |
-| `attempts` | Total dispatch attempts. |
-| `predictions` | Successful structurally valid Core ML predictions. |
-| `fallbacks` | Attempts that selected or returned Metal. |
-| `last_reason` | Stable reason for the last fallback, or `NONE`. |
-| `preferred_device` | Bit mask accumulated from compute-plan preferred devices: CPU `0x1`, GPU `0x2`, Neural Engine `0x4`. |
-| `shadow` | Whether the handle is diagnostic shadow mode. |
-
-Benchmark evidence exposes the transfer phases, placement summary, parity
-metrics, sample order, and `peak_rss_bytes`. `H3_ANE_TRACE=1` exposes the
-operation-level support/preference details needed to interpret the masks.
+| Strict qualification | Matching digest-bound receipt; `max_abs < 0.002`; `relative_l2 < 0.02`. |
+| Observed placement | Retained Instruments trace showing Neural Engine activity overlapping prediction. |
+| Latency | 20+ complete alternating pairs; positive paired 95% CI lower bound; at least 5% median transfer-inclusive improvement. |
+| Process memory | Matched `/usr/bin/time -l`; Core ML maximum RSS growth no greater than 5%. |
+| Energy | One named, unit-bearing Instruments counter; at least 5% paired-median improvement. |

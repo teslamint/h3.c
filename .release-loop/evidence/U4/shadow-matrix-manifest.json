@@ -1,0 +1,64 @@
+{
+  "boundary": "all mutation fixtures use TemporaryDirectory or /private/tmp; released weights are read-only only in the retained real measurement",
+  "deviation": "docs/deviations/2026-08-12-ane-shadow-measurement.md",
+  "plan": "docs/plans/2026-08-12-001-feat-ane-eligibility-fix-plan.md",
+  "records": [
+    {
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_post_preflight_invalidation_failure_is_structured tests.test_ane_tools.NativeToolTests.test_shadow_receipt_preflight_is_side_effect_free_before_quarantine tests.test_ane_tools.NativeToolTests.test_shadow_invalidation_never_modifies_link_targets tests.test_ane_tools.NativeToolTests.test_signal_pending_during_invalidation_runs_after_path_is_safe",
+      "fixture": "NativeToolTests.test_shadow_post_preflight_invalidation_failure_is_structured plus prior preflight/link/signal fixtures",
+      "injection": "directory changes from writable to non-writable after successful capability preflight and before quarantine; genuine receipt and separate writable result; retained link and pending-signal adversaries",
+      "mechanism": "all native failures before measurement use the same structured receipt/preflight result; no unchanged claim follows a receipt mutation",
+      "next_invocation": "a later invocation must repeat capability preflight and only then attempt invalidation",
+      "outcome": "invalidation failure exits 2, measurement marker absent, receipt byte-identical, structured measurement_started false and authority_state unchanged; successful paths remain link-safe and signal-atomic",
+      "plan_row": "Invalidate prior receipt"
+    },
+    {
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_bounds_profile_and_strict_threshold_preservation tests.test_ane_tools.NativeToolTests.test_shadow_result_write_failure_leaves_no_authority tests.test_ane_tools.NativeToolTests.test_signal_pending_during_invalidation_runs_after_path_is_safe",
+      "fixture": "NativeToolTests shadow bounds/nonfinite/negative/result-write/cancellation tests",
+      "injection": "inside/outside/negative/nonfinite metrics, absent result parent, and pending SIGTERM, each after independent strict receipt generation",
+      "mechanism": "shared diagnostic serialization, finite/nonnegative bounds, atomic temp cleanup, and signal-atomic invalidation",
+      "next_invocation": "rerun creates a new atomic RESULT only after repeating link-safe invalidation",
+      "outcome": "complete structured RESULT or stable exit 2/143 with no partial result and no live authority pathname",
+      "plan_row": "Publish initial qualification RESULT"
+    },
+    {
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_bounds_profile_and_strict_threshold_preservation",
+      "fixture": "NativeToolTests.test_shadow_bounds_profile_and_strict_threshold_preservation",
+      "injection": "passing shadow metrics 0.249999/0.049999 after independently generated strict receipt",
+      "mechanism": "receipt publication branch is guarded by !shadow_only; strict threshold preservation is exercised separately",
+      "next_invocation": "only default strict mode can publish a replacement receipt",
+      "outcome": "shadow exits 0 with authority false and receipt_path null; no receipt is published",
+      "plan_row": "Publish passing receipt"
+    },
+    {
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_result_write_failure_leaves_no_authority",
+      "fixture": "NativeToolTests.test_shadow_result_write_failure_leaves_no_authority",
+      "injection": "shadow RESULT destination parent absent after independently generated strict receipt",
+      "mechanism": "shadow bypasses both receipt publication and its RESULT rewrite transition",
+      "next_invocation": "fresh shadow rerun republishes only a non-authorizing RESULT; strict rerun is required for authority",
+      "outcome": "exit 2 with receipt absent; no receipt-publication rewrite occurs because shadow cannot enter receipt publication",
+      "plan_row": "Rewrite RESULT after receipt publication failure"
+    },
+    {
+      "exact_command": "python3 -m unittest tests.test_ane_tools.IntegrationCoordinatorTests.test_qualifier_diagnostic_taxonomy_and_context_are_closed tests.test_ane_tools.IntegrationCoordinatorTests.test_contract_field_context_serializes_exactly_or_null && ./h3_ane_tests",
+      "fixture": "production h3_ane.m taxonomy table plus native qualifier/video regressions and coordinator validation",
+      "injection": "sealed contract/fingerprint_mismatch, receipt/receipt_digest_mismatch, output/output_copy_failed; eight exact nullable contract_field values; fabricated cross-stage pairs",
+      "mechanism": "closed production stage/code table and native record-site regressions; no claim of automatic three-source tuple extraction",
+      "next_invocation": "only sealed production pairs and validated nullable context can publish qualifier failures",
+      "outcome": "contract/fingerprint_mismatch accepted, receipt/fingerprint_mismatch rejected, receipt_digest_mismatch accepted, output/output_copy_failed accepted; exact contract_field or null propagates with bounded digest/message",
+      "plan_row": "Publish integration summary"
+    },
+    {
+      "exact_command": "git diff --name-only 38f8eb0..1c98c9d -- h3_ane.m h3_video_encoder.c tests/qualify_ane.c scripts/run_ane_integration.py tests/test_ane.c tests/test_ane_tools.py && make h3_ane_tests && ./h3_ane_tests && python3 -m unittest discover -s tests -p test_ane_tools.py",
+      "fixture": "review-gate source-scope audit at 1c98c9d plus retained strict real evidence",
+      "injection": "Round2 stateful fixtures plus review-gate exact contract code/field/null-digest closure",
+      "mechanism": "reviewed source commit is named directly; shadow remains authority false and strict receipt validation remains unchanged",
+      "next_invocation": "non-shadow adoption remains unavailable until a new strict receipt is published",
+      "outcome": "sealed taxonomy and strict fail-closed evidence agree at reviewed source 1c98c9d; Round2 fe193e1 evidence remains historical input only",
+      "plan_row": "Adopt Core ML request output"
+    }
+  ],
+  "schema": "h3-release-loop-shadow-matrix/v6",
+  "source_commit": "1c98c9db641b675088f8fe65c537c50569cfe8bb",
+  "timestamp_utc": "2026-08-12T14:18:00Z"
+}
