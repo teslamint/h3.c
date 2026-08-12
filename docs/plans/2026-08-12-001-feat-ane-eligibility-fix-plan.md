@@ -2,7 +2,8 @@
 schema: plan/v1
 title: ANE Eligibility and Qualification Diagnostics
 type: feat
-status: approved
+status: done
+completed_by: 47bd2c5c3d060a9f925b86347204b9860ac86a8d
 date: 2026-08-12
 execution: code
 origin: docs/specs/2026-08-12-ane-eligibility-fix-design.md
