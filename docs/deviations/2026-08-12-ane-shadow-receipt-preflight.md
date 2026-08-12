@@ -1,7 +1,7 @@
 # ANE Shadow Receipt Preflight Addendum
 
-Date: 2026-08-12  
-Approved by: user  
+Date: 2026-08-12
+Approved by: user
 Status: approved
 
 ## Original contract
@@ -76,4 +76,3 @@ self-authored coordinator mapping.
 - Parent deviation: `docs/deviations/2026-08-12-ane-shadow-measurement.md`
 - Affected unit: U4 compiler-to-receipt integration gate
 - Review trigger: U4 shadow review round 3 surviving P1 findings
-

@@ -1,7 +1,7 @@
 # ANE Shadow-Only Measurement Deviation
 
-Date: 2026-08-12  
-Approved by: user  
+Date: 2026-08-12
+Approved by: user
 Status: approved
 
 ## Original contract
