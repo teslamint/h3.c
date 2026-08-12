@@ -1542,6 +1542,53 @@ static void test_video_encoder_ane_surface(void) {
                 "unsupported encoder candidate was accepted");
 }
 
+static void test_video_encoder_qualification_first_failures(void) {
+    const char *weights = "MiniMax-H3/FL2VA/video_vae/source";
+    if (access(weights, R_OK) != 0) {
+        printf("skip: released FL2VA qualification fixture is not installed\n");
+        return;
+    }
+    const size_t count = (size_t)1 * 1 * 256 * 256 * 128;
+    float *input = calloc(count, sizeof(*input));
+    float *metal = calloc(count, sizeof(*metal));
+    float *coreml = calloc(count, sizeof(*coreml));
+    require(input && metal && coreml,
+            "cannot allocate qualification diagnostic fixture");
+    fake_ane_backend fake = valid_fake_backend();
+    install_fake_backend(&fake);
+    static const struct {
+        h3_video_encoder_qualification_failure failure;
+        h3_ane_stage stage;
+        h3_ane_code code;
+    } cases[] = {
+        {H3_VIDEO_ENCODER_QUALIFICATION_FAIL_INPUT_ALLOCATION,
+         H3_ANE_STAGE_SETUP, H3_ANE_CODE_ALLOCATION_FAILED},
+        {H3_VIDEO_ENCODER_QUALIFICATION_FAIL_METAL_RUN,
+         H3_ANE_STAGE_PREDICTION, H3_ANE_CODE_PREDICTION_FAILED},
+        {H3_VIDEO_ENCODER_QUALIFICATION_FAIL_METAL_READ,
+         H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_OUTPUT_COPY_FAILED},
+    };
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        char error[256];
+        h3_ane_diagnostic diagnostic = {0};
+        h3_video_encoder_test_set_qualification_failure(cases[index].failure);
+        require(!h3_video_encoder_block0_qualification(
+                    weights, "fixture.mlmodelc", input, count, metal, coreml,
+                    count, &diagnostic, error, sizeof(error)),
+                "injected qualification failure unexpectedly passed");
+        require(diagnostic.stage == cases[index].stage &&
+                    diagnostic.code == cases[index].code,
+                "qualification bridge lost its exact local first failure");
+        require(strstr(diagnostic.message, weights) == NULL &&
+                    strstr(diagnostic.message, "MiniMax-H3") == NULL,
+                "qualification diagnostic exposed a private fixture path");
+    }
+    h3_video_encoder_test_set_qualification_failure(
+        H3_VIDEO_ENCODER_QUALIFICATION_FAIL_NONE);
+    h3_ane_test_set_backend(NULL);
+    free(input); free(metal); free(coreml);
+}
+
 static void run_cancellation_fixture(const char *root,
                                      const char *ready_path) {
     static const char source[] =
@@ -1595,6 +1642,7 @@ int main(void) {
     test_runtime_bridge(root);
     test_dispatch_fallback(root);
     test_video_encoder_ane_surface();
+    test_video_encoder_qualification_first_failures();
     printf("PASS tests/test_ane.c\n");
     return 0;
 }

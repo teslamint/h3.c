@@ -33,7 +33,15 @@ int h3_video_encoder_block0_qualification(
     float *coreml_output, size_t output_count,
     h3_ane_diagnostic *diagnostic,
     char *error, size_t error_size);
+typedef enum {
+    H3_VIDEO_ENCODER_QUALIFICATION_FAIL_NONE,
+    H3_VIDEO_ENCODER_QUALIFICATION_FAIL_INPUT_ALLOCATION,
+    H3_VIDEO_ENCODER_QUALIFICATION_FAIL_METAL_RUN,
+    H3_VIDEO_ENCODER_QUALIFICATION_FAIL_METAL_READ
+} h3_video_encoder_qualification_failure;
 #ifdef H3_ANE_TESTING
+void h3_video_encoder_test_set_qualification_failure(
+    h3_video_encoder_qualification_failure failure);
 int h3_video_encoder_test_ane_candidate(
     int frames, int encoder_height, int encoder_width, int level, int block,
     uint32_t depth, uint32_t height, uint32_t width,

@@ -360,6 +360,28 @@ static const char *const block0_tensor_names[] = {
     "encoder.down.0.block.0.conv2.bias",
 };
 
+static int qualification_test_failure;
+
+void h3_video_encoder_test_set_qualification_failure(
+    h3_video_encoder_qualification_failure failure) {
+    qualification_test_failure = (int)failure;
+}
+
+static int load_block0_weights(encoder_context *encoder, char *error,
+                               size_t error_size) {
+    encoder_block *block = &encoder->levels[0].blocks[0];
+    return load_norm(encoder, &block->norm1,
+                     "encoder.down.0.block.0.norm1", 128, error, error_size) &&
+           load_conv(encoder, &block->conv1,
+                     "encoder.down.0.block.0.conv1", 128, 128, 3,
+                     1, 1, 1, 2, 1, 1, 1, 1, error, error_size) &&
+           load_norm(encoder, &block->norm2,
+                     "encoder.down.0.block.0.norm2", 128, error, error_size) &&
+           load_conv(encoder, &block->conv2,
+                     "encoder.down.0.block.0.conv2", 128, 128, 3,
+                     1, 1, 1, 2, 1, 1, 1, 1, error, error_size);
+}
+
 static int block0_contract(const h3_weight_store *store,
                            h3_ane_contract *contract,
                            char *error, size_t error_size) {
@@ -962,7 +984,7 @@ int h3_video_encoder_block0_qualification(
         diagnostic->has_artifact_role = 1;
     }
     int ok = encoder.gpu && encoder.store;
-    if (ok && !load_weights(&encoder, error, error_size)) {
+    if (ok && !load_block0_weights(&encoder, error, error_size)) {
         h3_ane_diagnostic_record_first(
             diagnostic, H3_ANE_STAGE_ARTIFACT,
             H3_ANE_CODE_SOURCE_WEIGHTS_UNREADABLE,
@@ -993,19 +1015,31 @@ int h3_video_encoder_block0_qualification(
             H3_ANE_REASON_LOAD, "ANE qualification handle allocation failed");
         ok = 0;
     }
+    if (ok && qualification_test_failure ==
+                  H3_VIDEO_ENCODER_QUALIFICATION_FAIL_INPUT_ALLOCATION) {
+        h3_ane_diagnostic_record_first(
+            diagnostic, H3_ANE_STAGE_SETUP, H3_ANE_CODE_ALLOCATION_FAILED,
+            H3_ANE_REASON_LOAD, "qualification input allocation failed");
+        fail(error, error_size, "cannot allocate qualification input");
+        ok = 0;
+    }
     h3_gpu_tensor *original = ok ?
         h3_gpu_tensor_from_f32(encoder.gpu, input, input_count) : NULL;
     h3_gpu_tensor *metal = NULL;
     if (ok && original) {
-        metal = run_block(&encoder, original, &encoder.levels[0].blocks[0],
-                          1, 256, 256, 128, 128, error, error_size);
+        if (qualification_test_failure !=
+            H3_VIDEO_ENCODER_QUALIFICATION_FAIL_METAL_RUN)
+            metal = run_block(&encoder, original, &encoder.levels[0].blocks[0],
+                              1, 256, 256, 128, 128, error, error_size);
         if (!metal) {
             h3_ane_diagnostic_record_first(
                 diagnostic, H3_ANE_STAGE_PREDICTION,
                 H3_ANE_CODE_PREDICTION_FAILED, H3_ANE_REASON_PREDICTION,
                 "Metal qualification execution failed");
             ok = 0;
-        } else if (!h3_gpu_tensor_read_f32(metal, metal_output, output_count)) {
+        } else if (qualification_test_failure ==
+                       H3_VIDEO_ENCODER_QUALIFICATION_FAIL_METAL_READ ||
+                   !h3_gpu_tensor_read_f32(metal, metal_output, output_count)) {
             h3_ane_diagnostic_record_first(
                 diagnostic, H3_ANE_STAGE_OUTPUT,
                 H3_ANE_CODE_OUTPUT_COPY_FAILED, H3_ANE_REASON_PREDICTION,
