@@ -55,6 +55,19 @@ static int atomic_open(const char *path) {
 static int atomic_finish(FILE *stream, const char *path) {
     int descriptor = fileno(stream);
     int ok = fflush(stream) == 0 && fsync(descriptor) == 0 && fclose(stream) == 0;
+#ifdef H3_ANE_TOOL_TESTING
+    const char *pause_marker = getenv("H3_ANE_TEST_PAUSE_BEFORE_RENAME");
+    const char *pause_suffix = getenv("H3_ANE_TEST_PAUSE_SUFFIX");
+    size_t path_size = strlen(path);
+    size_t suffix_size = pause_suffix ? strlen(pause_suffix) : 0;
+    if (ok && pause_marker && *pause_marker && pause_suffix &&
+        path_size >= suffix_size &&
+        strcmp(path + path_size - suffix_size, pause_suffix) == 0) {
+        FILE *marker = fopen(pause_marker, "w");
+        if (marker) { fputs("temporary file synced\n", marker); fclose(marker); }
+        for (;;) pause();
+    }
+#endif
     if (ok) ok = rename(active_temp, path) == 0;
     if (!ok) cleanup_temp();
     else active_temp[0] = '\0';

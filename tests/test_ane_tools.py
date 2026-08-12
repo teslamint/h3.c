@@ -356,6 +356,37 @@ class NativeToolTests(unittest.TestCase):
             self.assertNotIn("PRIVATE-SENTINEL", encoded)
             self.assertNotIn(str(root), encoded)
 
+    def test_signal_before_result_rename_removes_temporary_and_authority(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            model = root / "model.mlmodelc"
+            model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            output = root / "result.json"
+            marker = root / "result-synced"
+            receipt = Path(f"{model}.qualification.json")
+            env = os.environ.copy()
+            env.update({
+                "H3_ANE_TEST_METRICS": "0.001,0.01",
+                "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+                "H3_ANE_TEST_PAUSE_BEFORE_RENAME": str(marker),
+                "H3_ANE_TEST_PAUSE_SUFFIX": "result.json",
+            })
+            process = subprocess.Popen(
+                [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                 "--coreml-model", str(model), "--output", str(output)], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            import time
+            for _ in range(200):
+                if marker.exists(): break
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            process.terminate(); process.wait(timeout=5); process.communicate()
+            self.assertFalse(output.exists())
+            self.assertFalse(receipt.exists())
+            self.assertFalse(list(root.glob("result.json.tmp-*")))
+
     def test_receipt_is_final_commit_point_under_post_receipt_signal(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
