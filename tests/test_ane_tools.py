@@ -24,6 +24,23 @@ class FakeTensor:
         self.values = values
 
 
+class Reshapable:
+    def __init__(self, values):
+        self.values = values
+
+    def reshape(self, shape):
+        return (tuple(shape), self.values)
+
+
+class PlaneWeights:
+    def __init__(self):
+        self.selection = None
+
+    def __getitem__(self, selection):
+        self.selection = selection
+        return ("selected-plane", selection)
+
+
 def complete_benchmark(metal=1.0, coreml=0.8, pairs=20):
     samples = []
     for pair in range(pairs):
@@ -155,6 +172,176 @@ class ConverterTests(unittest.TestCase):
             self.converter.compile_package(package, destination, runner=runner)
             self.assertEqual((destination / "complete").read_text(), "yes")
             self.assertFalse(list(root.glob(".model.mlmodelc.compile-*")))
+
+    def test_group_norm_uses_consecutive_four_channel_native_groups_then_affine(self):
+        class Recorder:
+            def __init__(self):
+                self.slices = []
+                self.norms = []
+                self.concatenations = []
+                self.multiplications = []
+                self.additions = []
+
+            def slice_by_index(self, **kwargs):
+                self.slices.append(kwargs)
+                return f"slice-{len(self.slices) - 1}"
+
+            def layer_norm(self, **kwargs):
+                self.norms.append(kwargs)
+                return f"norm-{len(self.norms) - 1}"
+
+            def concat(self, **kwargs):
+                self.concatenations.append(kwargs)
+                return "concatenated"
+
+            def mul(self, **kwargs):
+                self.multiplications.append(kwargs)
+                return "scaled"
+
+            def add(self, **kwargs):
+                self.additions.append(kwargs)
+                return "affine"
+
+        recorder = Recorder()
+        scale = Reshapable(list(range(1, 9)))
+        bias = Reshapable(list(range(-4, 4)))
+        result = self.converter._group_norm(
+            recorder, "nhwc", scale, bias, "norm", channels=8, groups=2,
+            height=2, width=3)
+
+        self.assertEqual(result, "affine")
+        self.assertEqual(
+            [(call["begin"], call["end"]) for call in recorder.slices],
+            [([0, 0, 0, 0], [1, 2, 3, 4]),
+             ([0, 0, 0, 4], [1, 2, 3, 8])])
+        self.assertEqual([call["axes"] for call in recorder.norms],
+                         [[1, 2, 3], [1, 2, 3]])
+        self.assertEqual([call["epsilon"] for call in recorder.norms],
+                         [1e-6, 1e-6])
+        self.assertEqual(recorder.concatenations[0]["values"],
+                         ["norm-0", "norm-1"])
+        self.assertEqual(recorder.concatenations[0]["axis"], 3)
+        self.assertEqual(recorder.multiplications[0]["y"],
+                         ((1, 1, 1, 8), list(range(1, 9))))
+        self.assertEqual(recorder.additions[0]["y"],
+                         ((1, 1, 1, 8), list(range(-4, 4))))
+
+    def test_conv2d_uses_only_oid_hw_plane_two_and_reflected_spatial_padding(self):
+        class Recorder:
+            def __init__(self):
+                self.transposes = []
+                self.pads = []
+                self.convolutions = []
+
+            def transpose(self, **kwargs):
+                self.transposes.append(kwargs)
+                return "nchw" if len(self.transposes) == 1 else "nhwc"
+
+            def pad(self, **kwargs):
+                self.pads.append(kwargs)
+                return "reflected"
+
+            def conv(self, **kwargs):
+                self.convolutions.append(kwargs)
+                return "convolved"
+
+        recorder = Recorder()
+        weights = PlaneWeights()
+        result = self.converter._padded_conv(
+            recorder, "nhwc", weights, [1.0, 2.0],
+            "conv")
+
+        self.assertEqual(result, "nhwc")
+        self.assertEqual([call["perm"] for call in recorder.transposes],
+                         [[0, 3, 1, 2], [0, 2, 3, 1]])
+        self.assertEqual(recorder.pads[0]["pad"],
+                         [0, 0, 0, 0, 1, 1, 1, 1])
+        self.assertEqual(recorder.pads[0]["mode"], "reflect")
+        self.assertEqual(weights.selection,
+                         (slice(None), slice(None), 2, slice(None), slice(None)))
+        self.assertEqual(recorder.convolutions[0]["weight"][0], "selected-plane")
+        self.assertEqual(recorder.convolutions[0]["pad_type"], "valid")
+
+        corner_source = [[[[[1.0, 2.0], [3.0, 4.0]]]]]
+        self.assertEqual(self.converter.pad_ncdhw_fixture(corner_source)[0][0][2][0][0],
+                         4.0)
+
+    def test_fixed_graph_squeezes_and_restores_depth_with_silu_residual_order(self):
+        class Recorder:
+            def __init__(self):
+                self.calls = []
+
+            def __getattr__(self, operation):
+                def record(**kwargs):
+                    self.calls.append((operation, kwargs))
+                    return kwargs.get("name", operation)
+                return record
+
+        recorder = Recorder()
+        weights = {
+            f"{self.converter.WEIGHT_PREFIX}.norm1.weight": Reshapable([1.0] * 8),
+            f"{self.converter.WEIGHT_PREFIX}.norm1.bias": Reshapable([0.0] * 8),
+            f"{self.converter.WEIGHT_PREFIX}.conv1.weight": PlaneWeights(),
+            f"{self.converter.WEIGHT_PREFIX}.conv1.bias": [0.0] * 8,
+            f"{self.converter.WEIGHT_PREFIX}.norm2.weight": Reshapable([1.0] * 8),
+            f"{self.converter.WEIGHT_PREFIX}.norm2.bias": Reshapable([0.0] * 8),
+            f"{self.converter.WEIGHT_PREFIX}.conv2.weight": PlaneWeights(),
+            f"{self.converter.WEIGHT_PREFIX}.conv2.bias": [0.0] * 8,
+        }
+        result = self.converter._fixed_graph(
+            recorder, "input5d", weights, (1, 1, 2, 3, 8), groups=2)
+
+        operations = [operation for operation, _ in recorder.calls]
+        self.assertEqual(operations[0], "squeeze")
+        self.assertEqual(recorder.calls[0][1]["axes"], [1])
+        self.assertEqual(operations.count("layer_norm"), 4)
+        self.assertEqual(operations.count("conv"), 2)
+        self.assertEqual(operations.count("silu"), 2)
+        residual_index = next(i for i, call in enumerate(recorder.calls)
+                              if call[1].get("name") == "residual")
+        restore_index = next(i for i, call in enumerate(recorder.calls)
+                             if call[1].get("name") == "restore_depth")
+        self.assertLess(residual_index, restore_index)
+        self.assertEqual(recorder.calls[residual_index][1]["x"], "remove_depth")
+        self.assertEqual(recorder.calls[restore_index][1]["axes"], [1])
+        self.assertEqual(result, "restore_depth")
+
+    def test_boundary_shape_is_exact_f32_five_dimensional_contract(self):
+        self.assertEqual(self.converter.BOUNDARY_SHAPE,
+                         (1, 1, 256, 256, 128))
+        self.assertEqual(self.converter.contract_metadata("a" * 64)["boundary_dtype"],
+                         "F32")
+
+    def test_compiled_schema_requires_one_f32_five_dimensional_input_and_output(self):
+        class MultiArray:
+            def __init__(self, shape, data_type):
+                self.shape = shape
+                self.dataType = data_type
+
+        class Type:
+            def __init__(self, shape, data_type):
+                self.multiArrayType = MultiArray(shape, data_type)
+
+            def WhichOneof(self, _):
+                return "multiArrayType"
+
+        class Feature:
+            def __init__(self, shape, data_type):
+                self.type = Type(shape, data_type)
+
+        class Description:
+            input = [Feature([1, 1, 256, 256, 128], 65568)]
+            output = [Feature([1, 1, 256, 256, 128], 65568)]
+
+        class Spec:
+            description = Description()
+
+        self.converter._validate_model_schema(
+            Spec(), (1, 1, 256, 256, 128), 65568)
+        Description.output = [Feature([1, 256, 256, 128], 65568)]
+        with self.assertRaisesRegex(ValueError, "shape"):
+            self.converter._validate_model_schema(
+                Spec(), (1, 1, 256, 256, 128), 65568)
 
 
 class AnalyzerTests(unittest.TestCase):
