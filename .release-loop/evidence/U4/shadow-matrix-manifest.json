@@ -1,0 +1,64 @@
+{
+  "boundary": "all mutation fixtures use TemporaryDirectory or /private/tmp; released weights are read-only only in the retained real measurement",
+  "deviation": "docs/deviations/2026-08-12-ane-shadow-measurement.md",
+  "plan": "docs/plans/2026-08-12-001-feat-ane-eligibility-fix-plan.md",
+  "records": [
+    {
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_invalidation_rename_conflict_removes_runtime_authority",
+      "fixture": "NativeToolTests.test_shadow_invalidation_rename_conflict_removes_runtime_authority",
+      "injection": "independently generated strict passing receipt plus nonempty .invalid directory blocks audit rename",
+      "mechanism": "rename failure falls back to unlink, then truncate if unlink fails; measurement never starts while a loadable receipt remains",
+      "next_invocation": "a later strict pass must recompute and publish new authority",
+      "outcome": "exit 0 shadow result; original live receipt removed; conflicting .invalid remains non-authorizing",
+      "plan_row": "Invalidate prior receipt"
+    },
+    {
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_bounds_profile_and_strict_threshold_preservation tests.test_ane_tools.NativeToolTests.test_shadow_result_write_failure_leaves_no_authority",
+      "fixture": "NativeToolTests.test_shadow_bounds_profile_and_strict_threshold_preservation and test_shadow_result_write_failure_leaves_no_authority",
+      "injection": "inside/outside/negative/nonfinite metrics and absent result parent, each after independently generating a strict passing receipt",
+      "mechanism": "shared diagnostic serializer preserves full stage/code/context and atomic temp cleanup prevents partial RESULT",
+      "next_invocation": "rerun begins by invalidating any newly seeded strict authority and recreates RESULT atomically",
+      "outcome": "atomic structured shadow RESULT on measurable outcomes; result-write failure exits 2; no live receipt in every case",
+      "plan_row": "Publish initial qualification RESULT"
+    },
+    {
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_bounds_profile_and_strict_threshold_preservation",
+      "fixture": "NativeToolTests.test_shadow_bounds_profile_and_strict_threshold_preservation",
+      "injection": "passing shadow metrics 0.249999/0.049999 after independently generated strict receipt",
+      "mechanism": "receipt publication branch is guarded by !shadow_only; strict threshold preservation is exercised separately",
+      "next_invocation": "only default strict mode can publish a replacement receipt",
+      "outcome": "shadow exits 0 with authority false and receipt_path null; no receipt is published",
+      "plan_row": "Publish passing receipt"
+    },
+    {
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_result_write_failure_leaves_no_authority",
+      "fixture": "NativeToolTests.test_shadow_result_write_failure_leaves_no_authority",
+      "injection": "shadow RESULT destination parent absent after independently generated strict receipt",
+      "mechanism": "shadow bypasses both receipt publication and its RESULT rewrite transition",
+      "next_invocation": "fresh shadow rerun republishes only a non-authorizing RESULT; strict rerun is required for authority",
+      "outcome": "exit 2 with receipt absent; no receipt-publication rewrite occurs because shadow cannot enter receipt publication",
+      "plan_row": "Rewrite RESULT after receipt publication failure"
+    },
+    {
+      "exact_command": "python3 -m unittest tests.test_ane_tools.IntegrationCoordinatorTests",
+      "fixture": "IntegrationCoordinatorTests shadow success/failure/alias/size/inventory tests",
+      "injection": "success, both parity failure codes, output aliases, extra inventory key, oversized summary, and summary publication failure",
+      "mechanism": "closed inventory equality, 16384-byte serialized ceiling, atomic JSON, and exact structured shadow diagnostics",
+      "next_invocation": "safe distinct output reruns replace summary atomically after all stages",
+      "outcome": "bounded canonical summary or stable failure; aliases rejected before work mutation; authority outputs cleaned",
+      "plan_row": "Publish integration summary"
+    },
+    {
+      "exact_command": "git diff f7b4784..e0e62cba0806f7bdeae1f239fa3197ac88a690ff -- h3_ane.c h3_ane_dispatch.c h3_video_encoder.c && ANE_INTEGRATION_OUTPUT=/private/tmp/u4-strict-summary-review1.json ANE_INTEGRATION_WORK=/private/tmp/u4-strict-work-review1 H3_ANE_WEIGHT_DIR=MiniMax-H3/FL2VA/video_vae/source make h3_ane_real_qualification_test",
+      "fixture": "scope/diff authority check plus strict real target",
+      "injection": "same FP16 candidate exceeds unchanged strict max_abs bound",
+      "mechanism": "shadow evidence is authority false and runtime receipt validation/adoption code is unchanged",
+      "next_invocation": "non-shadow adoption remains unavailable until a new strict receipt is published",
+      "outcome": "runtime adoption files have no deviation diff; strict target fails closed with parity_bounds_failed and receipt null",
+      "plan_row": "Adopt Core ML request output"
+    }
+  ],
+  "schema": "h3-release-loop-shadow-matrix/v1",
+  "source_commit": "e0e62cba0806f7bdeae1f239fa3197ac88a690ff",
+  "timestamp_utc": "2026-08-12T08:51:10Z"
+}
