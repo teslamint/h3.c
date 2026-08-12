@@ -49,16 +49,16 @@
       "plan_row": "Publish integration summary"
     },
     {
-      "exact_command": "git diff --name-only 38f8eb0..fe193e1 -- h3_ane.m h3_video_encoder.c tests/qualify_ane.c scripts/run_ane_integration.py tests/test_ane.c tests/test_ane_tools.py",
-      "fixture": "current source-scope audit plus strict real evidence retained separately",
-      "injection": "Round2 changes are limited to exact contract-field diagnostics and stateful conversion/compile/integration fixtures",
-      "mechanism": "current source commit is named directly; shadow remains authority false and strict receipt validation remains unchanged",
+      "exact_command": "git diff --name-only 38f8eb0..1c98c9d -- h3_ane.m h3_video_encoder.c tests/qualify_ane.c scripts/run_ane_integration.py tests/test_ane.c tests/test_ane_tools.py && make h3_ane_tests && ./h3_ane_tests && python3 -m unittest discover -s tests -p test_ane_tools.py",
+      "fixture": "review-gate source-scope audit at 1c98c9d plus retained strict real evidence",
+      "injection": "Round2 stateful fixtures plus review-gate exact contract code/field/null-digest closure",
+      "mechanism": "reviewed source commit is named directly; shadow remains authority false and strict receipt validation remains unchanged",
       "next_invocation": "non-shadow adoption remains unavailable until a new strict receipt is published",
-      "outcome": "current sealed taxonomy and strict fail-closed evidence agree; no historical taxonomy commit is asserted",
+      "outcome": "sealed taxonomy and strict fail-closed evidence agree at reviewed source 1c98c9d; Round2 fe193e1 evidence remains historical input only",
       "plan_row": "Adopt Core ML request output"
     }
   ],
   "schema": "h3-release-loop-shadow-matrix/v6",
-  "source_commit": "fe193e1da98e0ecade1b503991a5018ef83a1607",
-  "timestamp_utc": "2026-08-12T13:45:58Z"
+  "source_commit": "1c98c9db641b675088f8fe65c537c50569cfe8bb",
+  "timestamp_utc": "2026-08-12T14:18:00Z"
 }
