@@ -586,6 +586,23 @@ static void test_first_diagnostic_is_immutable(void) {
     h3_ane_diagnostic_merge_first(&diagnostic, &source);
     require(diagnostic.code == H3_ANE_CODE_OUTPUT_NONFINITE,
             "merge did not preserve a source diagnostic");
+    source.artifact_role = H3_ANE_ARTIFACT_COMPILED_MODEL;
+    source.has_artifact_role = 1;
+    source.contract_field = H3_ANE_CONTRACT_FIELD_SOURCE_SHA256;
+    source.has_contract_field = 1;
+    memcpy(source.digest,
+           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+           65);
+    source.has_digest = 1;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    h3_ane_diagnostic_merge_first(&diagnostic, &source);
+    require(diagnostic.has_artifact_role && diagnostic.has_contract_field &&
+                diagnostic.has_digest &&
+                strcmp(h3_ane_artifact_role_name(diagnostic.artifact_role),
+                       "compiled_model") == 0 &&
+                strcmp(h3_ane_contract_field_name(diagnostic.contract_field),
+                       "source_sha256") == 0,
+            "merge lost bounded diagnostic artifact context");
 
     char long_message[400];
     memset(long_message, 'x', sizeof(long_message));
@@ -613,6 +630,11 @@ static void test_complete_diagnostic_taxonomy(void) {
     }
     require(h3_ane_code_name((h3_ane_code)-1) == NULL,
             "invalid diagnostic code received a name");
+    require(h3_ane_artifact_role_name(H3_ANE_ARTIFACT_COMPILED_MODEL) &&
+                h3_ane_artifact_role_name((h3_ane_artifact_role)-1) == NULL &&
+                h3_ane_contract_field_name(H3_ANE_CONTRACT_FIELD_SOURCE_SHA256) &&
+                h3_ane_contract_field_name((h3_ane_contract_field)-1) == NULL,
+            "diagnostic context name mapping is not closed");
 }
 
 static void test_diagnostic_code_snapshots(void) {

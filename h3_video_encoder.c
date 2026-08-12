@@ -956,12 +956,21 @@ int h3_video_encoder_block0_qualification(
             diagnostic, H3_ANE_STAGE_ARTIFACT,
             H3_ANE_CODE_SOURCE_WEIGHTS_UNREADABLE,
             H3_ANE_REASON_FINGERPRINT, "source weights are unreadable");
+    if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE &&
+        diagnostic->stage == H3_ANE_STAGE_ARTIFACT) {
+        diagnostic->artifact_role = H3_ANE_ARTIFACT_SOURCE_WEIGHTS;
+        diagnostic->has_artifact_role = 1;
+    }
     int ok = encoder.gpu && encoder.store;
     if (ok && !load_weights(&encoder, error, error_size)) {
         h3_ane_diagnostic_record_first(
             diagnostic, H3_ANE_STAGE_ARTIFACT,
             H3_ANE_CODE_SOURCE_WEIGHTS_UNREADABLE,
             H3_ANE_REASON_FINGERPRINT, "source weights are incompatible");
+        if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE) {
+            diagnostic->artifact_role = H3_ANE_ARTIFACT_SOURCE_WEIGHTS;
+            diagnostic->has_artifact_role = 1;
+        }
         ok = 0;
     }
     h3_ane_contract contract;
@@ -970,18 +979,40 @@ int h3_video_encoder_block0_qualification(
             diagnostic, H3_ANE_STAGE_ARTIFACT,
             H3_ANE_CODE_SOURCE_TENSOR_DIGEST_FAILED,
             H3_ANE_REASON_FINGERPRINT, "source tensor digest failed");
+        if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE) {
+            diagnostic->artifact_role = H3_ANE_ARTIFACT_SOURCE_WEIGHTS;
+            diagnostic->has_artifact_role = 1;
+        }
         ok = 0;
     }
     if (ok) encoder.ane = h3_ane_create_authorized(
         model_path, &contract, 1, error, error_size);
-    if (ok && !encoder.ane) ok = 0;
+    if (ok && !encoder.ane) {
+        h3_ane_diagnostic_record_first(
+            diagnostic, H3_ANE_STAGE_SETUP, H3_ANE_CODE_ALLOCATION_FAILED,
+            H3_ANE_REASON_LOAD, "ANE qualification handle allocation failed");
+        ok = 0;
+    }
     h3_gpu_tensor *original = ok ?
         h3_gpu_tensor_from_f32(encoder.gpu, input, input_count) : NULL;
     h3_gpu_tensor *metal = NULL;
     if (ok && original) {
         metal = run_block(&encoder, original, &encoder.levels[0].blocks[0],
                           1, 256, 256, 128, 128, error, error_size);
-        ok = metal && h3_gpu_tensor_read_f32(metal, metal_output, output_count);
+        if (!metal) {
+            h3_ane_diagnostic_record_first(
+                diagnostic, H3_ANE_STAGE_PREDICTION,
+                H3_ANE_CODE_PREDICTION_FAILED, H3_ANE_REASON_PREDICTION,
+                "Metal qualification execution failed");
+            ok = 0;
+        } else if (!h3_gpu_tensor_read_f32(metal, metal_output, output_count)) {
+            h3_ane_diagnostic_record_first(
+                diagnostic, H3_ANE_STAGE_OUTPUT,
+                H3_ANE_CODE_OUTPUT_COPY_FAILED, H3_ANE_REASON_PREDICTION,
+                "Metal qualification output read failed");
+            fail(error, error_size, "cannot read Metal qualification output");
+            ok = 0;
+        }
     } else if (ok) {
         h3_ane_diagnostic_record_first(
             diagnostic, H3_ANE_STAGE_SETUP, H3_ANE_CODE_ALLOCATION_FAILED,
@@ -992,7 +1023,11 @@ int h3_video_encoder_block0_qualification(
     if (ok) ok = h3_ane_predict(encoder.ane, input, input_count,
                                 coreml_output, output_count,
                                 &encoder.ane_stats, error, error_size);
-    if (encoder.ane) h3_ane_diagnostic_snapshot(encoder.ane, diagnostic);
+    if (encoder.ane) {
+        h3_ane_diagnostic backend_diagnostic = {0};
+        h3_ane_diagnostic_snapshot(encoder.ane, &backend_diagnostic);
+        h3_ane_diagnostic_merge_first(diagnostic, &backend_diagnostic);
+    }
     h3_gpu_tensor_free(metal);
     h3_gpu_tensor_free(original);
     cleanup(&encoder);

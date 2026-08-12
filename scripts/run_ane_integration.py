@@ -47,10 +47,10 @@ DIAGNOSTIC_CODES = {
     "setup": {"disabled", "os_unsupported", "allocation_failed"},
     "artifact": {"compiled_model_unreadable", "compiled_model_digest_failed",
                  "source_weights_unreadable", "source_tensor_digest_failed"},
-    "contract": {"metadata_missing", "metadata_mismatch",
+    "contract": {"metadata_missing", "metadata_mismatch", "fingerprint_mismatch",
                  "shape_mismatch", "dtype_mismatch"},
     "receipt": {"receipt_missing", "receipt_malformed",
-                "fingerprint_mismatch", "receipt_digest_mismatch",
+                "receipt_digest_mismatch",
                 "receipt_invalid"},
     "load": {"model_load_failed", "model_load_exception"},
     "compute_plan": {"allocation_failed", "plan_timeout", "plan_load_failed",
@@ -64,7 +64,7 @@ DIAGNOSTIC_CODES = {
     "input": {"input_shape_mismatch", "input_dtype_mismatch",
               "input_copy_failed"},
     "prediction": {"prediction_failed", "prediction_exception"},
-    "output": {"allocation_failed", "output_shape_mismatch", "output_dtype_mismatch",
+    "output": {"output_shape_mismatch", "output_dtype_mismatch",
                "output_copy_failed", "output_nonfinite"},
     "parity": {"parity_metrics_nonfinite", "parity_bounds_failed"},
     "publication": {"result_write_failed", "receipt_write_failed"},
@@ -241,7 +241,7 @@ def _failed(mode, failure):
     diagnostic = failure.diagnostic or {
         "stage": failure.stage, "code": failure.code,
         "message": str(failure)[:160]}
-    diagnostic = _bounded_mapping(diagnostic, 8)
+    diagnostic = _bounded_mapping(diagnostic, 11)
     inventory = dict(EXPECTED_INVENTORY) \
         if failure.inventory == EXPECTED_INVENTORY else None
     parity = _bounded_parity(failure.parity)
@@ -259,7 +259,7 @@ def _failed(mode, failure):
             "inventory": inventory, "diagnostic": diagnostic,
             "parity": parity, "receipt": None,
             "artifacts": artifacts, "stages": stages}
-    if mode == "shadow":
+    if mode in ("real", "shadow") and failure.measurement_started is not None:
         document["measurement_started"] = failure.measurement_started
         document["authority_state"] = failure.authority_state
     return document
@@ -272,7 +272,8 @@ def _bounded_mapping(value, limit):
     result = {}
     canonical_keys = ("stage", "code", "message", "operation",
                       "supported_devices", "preferred_device",
-                      "observed_count", "limit")
+                      "observed_count", "limit", "artifact_role",
+                      "contract_field", "digest")
     for key in canonical_keys[:limit]:
         if key not in value:
             continue
@@ -308,6 +309,9 @@ def validate_qualification_diagnostic(document):
     preferred = document.get("preferred_device")
     observed = document.get("observed_count")
     limit = document.get("limit")
+    artifact_role = document.get("artifact_role")
+    contract_field = document.get("contract_field")
+    digest = document.get("digest")
     if stage not in DIAGNOSTIC_CODES or code not in DIAGNOSTIC_CODES[stage] or \
             not isinstance(message, str) or not message or len(message) > 159:
         raise ValueError("invalid qualifier diagnostic taxonomy")
@@ -343,10 +347,26 @@ def validate_qualification_diagnostic(document):
     elif stage != "compute_plan" or code not in optional_count_codes:
         if observed is not None or limit is not None:
             raise ValueError("forbidden qualifier count context")
+    if artifact_role is not None and artifact_role not in {
+            "compiled_model", "source_weights"}:
+        raise ValueError("invalid qualifier artifact context")
+    if contract_field is not None and contract_field not in {
+            "version", "variant", "block_level", "block_index",
+            "weight_prefix", "boundary_dtype", "shape", "source_sha256"}:
+        raise ValueError("invalid qualifier contract context")
+    if digest is not None and not _digest(digest):
+        raise ValueError("invalid qualifier digest context")
+    if artifact_role is not None and stage not in {"artifact", "receipt"}:
+        raise ValueError("forbidden qualifier artifact context")
+    if contract_field is not None and stage != "contract":
+        raise ValueError("forbidden qualifier contract context")
+    if digest is not None and artifact_role is None and contract_field is None:
+        raise ValueError("unscoped qualifier digest context")
     return {"stage": stage, "code": code, "message": message,
             "operation": operation, "supported_devices": devices,
             "preferred_device": preferred, "observed_count": observed,
-            "limit": limit}
+            "limit": limit, "artifact_role": artifact_role,
+            "contract_field": contract_field, "digest": digest}
 
 
 def publish_failure(path, document):
@@ -378,6 +398,40 @@ def prepare_work_directory(path):
     path.mkdir(parents=True)
     (path / WORK_MARKER).write_text(SCHEMA + "\n")
     return path
+
+
+def receipt_preflight(path):
+    """Prove same-directory link-safe quarantine without touching authority."""
+    path = Path(path)
+    parent = path.parent
+    try:
+        mode = parent.stat().st_mode
+    except OSError:
+        return False
+    if mode & 0o222 == 0:
+        return False
+    source = target = None
+    try:
+        descriptor, source = tempfile.mkstemp(
+            prefix=f".{path.name}.preflight-source-", dir=parent)
+        os.close(descriptor)
+        descriptor, target = tempfile.mkstemp(
+            prefix=f".{path.name}.preflight-target-", dir=parent)
+        os.close(descriptor)
+        os.replace(source, target)
+        source = None
+        os.unlink(target)
+        target = None
+        return True
+    except OSError:
+        return False
+    finally:
+        for temporary in (source, target):
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
 
 
 def cleanup_authority():
@@ -447,6 +501,30 @@ def execute(args):
         raise StageFailure("setup", "--weights is required in real or shadow mode")
     weights = Path(args.weights).resolve() if args.weights else work / "weights"
     validate_paths(output, work, weights, args.mode)
+    reused_receipt = Path(f"{work / 'visual-block.mlmodelc'}.qualification.json")
+    if work.exists():
+        marker = work / WORK_MARKER
+        if not work.is_dir() or not marker.is_file() or \
+                marker.read_text() != SCHEMA + "\n":
+            raise StageFailure("setup", "work directory is not coordinator-owned",
+                               code="unsafe_work_directory")
+        receipt_before = receipt_snapshot(reused_receipt)
+        if args.mode in ("real", "shadow") and \
+                not receipt_preflight(reused_receipt):
+            if receipt_snapshot(reused_receipt) != receipt_before:
+                raise StageFailure("qualification",
+                                   "unchanged receipt snapshot mismatch",
+                                   code="invalid_result")
+            raise StageFailure(
+                "receipt", "receipt quarantine preflight failed",
+                code="receipt_invalid", diagnostic={
+                    "stage": "receipt", "code": "receipt_invalid",
+                    "message": "receipt quarantine preflight failed",
+                    "operation": None, "supported_devices": None,
+                    "preferred_device": None, "observed_count": None,
+                    "limit": None, "artifact_role": None,
+                    "contract_field": None, "digest": None},
+                measurement_started=False, authority_state="unchanged")
     work = prepare_work_directory(work)
     if args.mode == "synthetic":
         generate_fixture(weights)
@@ -525,14 +603,15 @@ def execute(args):
                     artifacts=artifacts) from None
             measurement_started = failed.get("measurement_started")
             authority_state = failed.get("authority_state")
-            preflight_failed = args.mode == "shadow" and \
+            preflight_failed = args.mode in ("real", "shadow") and \
                 measurement_started is False and authority_state == "unchanged" and \
                 diagnostic["stage"] == "receipt" and \
                 diagnostic["code"] == "receipt_invalid" and \
-                failed.get("profile") == "shadow-measurement-v1" and \
-                failed.get("authority") is False and \
+                failed.get("profile") == (
+                    "shadow-measurement-v1" if args.mode == "shadow" else None) and \
+                (args.mode != "shadow" or failed.get("authority") is False) and \
                 failed.get("receipt_path") is None
-            if args.mode == "shadow" and measurement_started is False and \
+            if args.mode in ("real", "shadow") and measurement_started is False and \
                     not preflight_failed:
                 raise StageFailure(
                     "qualification", "invalid shadow preflight result",
@@ -542,7 +621,7 @@ def execute(args):
             if preflight_failed:
                 receipt_after = receipt_snapshot(receipt_path)
                 if receipt_after != receipt_before or \
-                        receipt_before.get("state") != "regular":
+                        receipt_before.get("state") not in {"regular", "absent"}:
                     raise StageFailure(
                         "qualification", "unchanged receipt snapshot mismatch",
                         code="invalid_result", source_sha256=source_sha,

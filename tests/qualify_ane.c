@@ -141,6 +141,10 @@ static int source_digest(const char *directory, char digest[65],
         h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_ARTIFACT,
             H3_ANE_CODE_SOURCE_WEIGHTS_UNREADABLE, H3_ANE_REASON_FINGERPRINT,
             "source weights are unreadable");
+        if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE) {
+            diagnostic->artifact_role = H3_ANE_ARTIFACT_SOURCE_WEIGHTS;
+            diagnostic->has_artifact_role = 1;
+        }
         return 0;
     }
     int ok = h3_ane_sha256_tensors(
@@ -149,6 +153,10 @@ static int source_digest(const char *directory, char digest[65],
         h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_ARTIFACT,
             H3_ANE_CODE_SOURCE_TENSOR_DIGEST_FAILED,
             H3_ANE_REASON_FINGERPRINT, "source tensor digest failed");
+    if (!ok && diagnostic && diagnostic->code != H3_ANE_CODE_NONE) {
+        diagnostic->artifact_role = H3_ANE_ARTIFACT_SOURCE_WEIGHTS;
+        diagnostic->has_artifact_role = 1;
+    }
     h3_weight_store_free(store);
     return ok;
 }
@@ -332,28 +340,45 @@ static void write_diagnostic_fields(FILE *stream, const char *failure,
     if (diagnostic && diagnostic->has_count)
         fprintf(stream, "%llu", (unsigned long long)diagnostic->limit);
     else fputs("null", stream);
+    fputs(",\"artifact_role\":", stream);
+    if (diagnostic && diagnostic->has_artifact_role)
+        json_string(stream, h3_ane_artifact_role_name(diagnostic->artifact_role));
+    else fputs("null", stream);
+    fputs(",\"contract_field\":", stream);
+    if (diagnostic && diagnostic->has_contract_field)
+        json_string(stream, h3_ane_contract_field_name(diagnostic->contract_field));
+    else fputs("null", stream);
+    fputs(",\"digest\":", stream);
+    if (diagnostic && diagnostic->has_digest)
+        json_string(stream, diagnostic->digest);
+    else fputs("null", stream);
 }
 
-static int invalidate_receipt(const char *receipt, char *invalid) {
+static int invalidate_receipt(const char *receipt, char *invalid,
+                              size_t invalid_size) {
     struct stat status;
     if (lstat(receipt, &status) != 0) return errno == ENOENT;
-    if (snprintf(invalid, strlen(receipt) + sizeof(".invalid-XXXXXX"),
-                 "%s.invalid-XXXXXX", receipt) < 0) return 0;
+    int written = snprintf(invalid, invalid_size, "%s.invalid-XXXXXX", receipt);
+    if (written < 0 || (size_t)written >= invalid_size) return 0;
     int quarantine = mkstemp(invalid);
     if (quarantine < 0) return 0;
     if (close(quarantine) != 0) { unlink(invalid); return 0; }
     pause_during_invalidation_if_requested();
     if (rename(receipt, invalid) == 0) return 1;
-    int rename_error = errno;
     unlink(invalid);
-    if (unlink(receipt) == 0) return 1;
-    fprintf(stderr, "h3_ane_qualification: cannot invalidate old receipt: %s\n",
-            strerror(rename_error));
     return 0;
 }
 
 static int receipt_preflight(const char *receipt) {
     char source[4096], target[4096];
+    char parent[4096];
+    int parent_written = snprintf(parent, sizeof(parent), "%s", receipt);
+    if (parent_written < 0 || (size_t)parent_written >= sizeof(parent)) return 0;
+    char *slash = strrchr(parent, '/');
+    if (slash) *slash = '\0'; else snprintf(parent, sizeof(parent), ".");
+    struct stat parent_status;
+    if (stat(parent, &parent_status) != 0 ||
+        (parent_status.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) == 0) return 0;
     if (snprintf(source, sizeof(source), "%s.preflight-source-XXXXXX", receipt) >=
             (int)sizeof(source) ||
         snprintf(target, sizeof(target), "%s.preflight-target-XXXXXX", receipt) >=
@@ -384,15 +409,20 @@ static void pause_after_preflight_if_requested(void) {
 #endif
 }
 
-static int write_shadow_preflight_failure(const char *path) {
+static int write_preflight_failure(const char *path, int shadow_only,
+                                   const char *authority_state) {
     int descriptor = atomic_open(path);
     if (descriptor < 0) return 0;
     FILE *stream = fdopen(descriptor, "w");
     if (!stream) { close(descriptor); cleanup_temp(); return 0; }
-    fputs("{\"schema\":\"h3-ane-qualification/v1\","
-          "\"profile\":\"shadow-measurement-v1\",\"status\":\"failed\","
+    fputs("{\"schema\":\"h3-ane-qualification/v1\",\"profile\":", stream);
+    if (shadow_only) json_string(stream, "shadow-measurement-v1");
+    else fputs("null", stream);
+    fputs(",\"status\":\"failed\","
           "\"authority\":false,\"measurement_started\":false,"
-          "\"authority_state\":\"unchanged\",\"model_sha256\":\"\","
+          "\"authority_state\":", stream);
+    json_string(stream, authority_state);
+    fputs(",\"model_sha256\":\"\","
           "\"source_sha256\":\"\",\"test_vector\":\"xorshift32-v1\","
           "\"qualified_at\":\"\",\"max_abs\":null,\"relative_l2\":null,"
           "\"bounds\":{\"max_abs\":0.25,\"relative_l2\":0.05},"
@@ -401,7 +431,8 @@ static int write_shadow_preflight_failure(const char *path) {
           "\"failure_stage\":\"receipt\",\"failure_code\":\"receipt_invalid\","
           "\"failure_operation\":null,\"supported_devices\":null,"
           "\"preferred_device\":null,\"observed_count\":null,"
-          "\"limit\":null}\n", stream);
+          "\"limit\":null,\"artifact_role\":null,"
+          "\"contract_field\":null,\"digest\":null}\n", stream);
     return atomic_finish(stream, path);
 }
 
@@ -467,35 +498,59 @@ int main(int argc, char **argv) {
     if (!parse_args(argc, argv, &weights, &model, &output, &shadow_only)) {
         usage(stderr); return 2;
     }
-    signal(SIGINT, cancelled); signal(SIGTERM, cancelled);
-    size_t receipt_size = strlen(model) + sizeof(".qualification.json");
-    char *receipt = malloc(receipt_size);
-    char *invalid = malloc(receipt_size + sizeof(".invalid-XXXXXX"));
-    if (!receipt || !invalid) return 2;
-    snprintf(receipt, receipt_size, "%s.qualification.json", model);
-    invalid[0] = '\0';
-    if (shadow_only && !receipt_preflight(receipt)) {
-        int published = write_shadow_preflight_failure(output);
-        if (!published)
-            fprintf(stderr, "h3_ane_qualification: receipt/preflight_failed\n");
-        free(receipt); free(invalid); return 2;
+    if (signal(SIGINT, cancelled) == SIG_ERR ||
+        signal(SIGTERM, cancelled) == SIG_ERR) {
+        if (!write_preflight_failure(output, shadow_only, "unchanged"))
+            fprintf(stderr, "h3_ane_qualification: publication/result_write_failed\n");
+        return 2;
     }
-    if (shadow_only) pause_after_preflight_if_requested();
+    char receipt[4096], invalid[4096];
+    if (snprintf(receipt, sizeof(receipt), "%s.qualification.json", model) >=
+        (int)sizeof(receipt)) {
+        if (!write_preflight_failure(output, shadow_only, "unchanged"))
+            fprintf(stderr, "h3_ane_qualification: publication/result_write_failed\n");
+        return 2;
+    }
+    invalid[0] = '\0';
+    if (!receipt_preflight(receipt)) {
+        int published = write_preflight_failure(output, shadow_only, "unchanged");
+        if (!published)
+            fprintf(stderr, "h3_ane_qualification: publication/result_write_failed\n");
+        return 2;
+    }
+    pause_after_preflight_if_requested();
     sigset_t invalidation_signals, previous_signals;
     sigemptyset(&invalidation_signals);
     sigaddset(&invalidation_signals, SIGINT);
     sigaddset(&invalidation_signals, SIGTERM);
-    if (sigprocmask(SIG_BLOCK, &invalidation_signals, &previous_signals) != 0) {
-        free(receipt); free(invalid); return 2;
+#ifdef H3_ANE_TOOL_TESTING
+    int fail_signal_block = getenv("H3_ANE_TEST_FAIL_SIGNAL_BLOCK") != NULL;
+#else
+    int fail_signal_block = 0;
+#endif
+    if (fail_signal_block ||
+        sigprocmask(SIG_BLOCK, &invalidation_signals, &previous_signals) != 0) {
+        if (!write_preflight_failure(output, shadow_only, "unchanged"))
+            fprintf(stderr, "h3_ane_qualification: publication/result_write_failed\n");
+        return 2;
     }
-    if (!invalidate_receipt(receipt, invalid)) {
+    if (!invalidate_receipt(receipt, invalid, sizeof(invalid))) {
         sigprocmask(SIG_SETMASK, &previous_signals, NULL);
-        if (shadow_only && !write_shadow_preflight_failure(output))
-            fprintf(stderr, "h3_ane_qualification: receipt/invalidation_failed\n");
-        free(receipt); free(invalid); return 2;
+        if (!write_preflight_failure(output, shadow_only, "unchanged"))
+            fprintf(stderr, "h3_ane_qualification: publication/result_write_failed\n");
+        return 2;
     }
-    if (sigprocmask(SIG_SETMASK, &previous_signals, NULL) != 0) {
-        unlink(receipt); free(receipt); free(invalid); return 2;
+#ifdef H3_ANE_TOOL_TESTING
+    int fail_signal_restore = getenv("H3_ANE_TEST_FAIL_SIGNAL_RESTORE") != NULL;
+#else
+    int fail_signal_restore = 0;
+#endif
+    if (fail_signal_restore ||
+        sigprocmask(SIG_SETMASK, &previous_signals, NULL) != 0) {
+        unlink(receipt);
+        if (!write_preflight_failure(output, shadow_only, "invalidated"))
+            fprintf(stderr, "h3_ane_qualification: publication/result_write_failed\n");
+        return 2;
     }
     pause_after_invalidation_if_requested();
 
@@ -542,7 +597,7 @@ int main(int argc, char **argv) {
                      relative_l2, failure, &diagnostic);
     if (!result_written) {
         fprintf(stderr, "h3_ane_qualification: publication/result_write_failed\n");
-        unlink(receipt); free(receipt); free(invalid); return 2;
+        unlink(receipt); return 2;
     }
     if (!shadow_only && passed && !write_receipt(receipt, model_sha, source_sha, at,
                                  max_abs, relative_l2)) {
@@ -556,11 +611,10 @@ int main(int argc, char **argv) {
                           relative_l2, failure, &diagnostic)) {
             fprintf(stderr,
                     "h3_ane_qualification: publication/receipt_write_failed; publication/result_write_failed\n");
-            free(receipt); free(invalid); return 2;
+            return 2;
         }
     }
     if (!shadow_only && passed) pause_after_receipt_if_requested();
     else unlink(receipt);
-    free(receipt); free(invalid);
     return passed ? 0 : 1;
 }

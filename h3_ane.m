@@ -104,6 +104,8 @@ static void set_error(char *error, size_t error_size, const char *message) {
     snprintf(error, error_size, "%s", message ? message : "ANE failure");
 }
 
+static int valid_hex_digest(const char digest[65]);
+
 void h3_ane_diagnostic_record_first(h3_ane_diagnostic *diagnostic,
                                     h3_ane_stage stage, h3_ane_code code,
                                     h3_ane_reason reason,
@@ -155,6 +157,48 @@ const char *h3_ane_code_name(h3_ane_code code) {
     };
     return code >= H3_ANE_CODE_NONE && code <= H3_ANE_CODE_RECEIPT_WRITE_FAILED ?
         names[code] : NULL;
+}
+
+const char *h3_ane_artifact_role_name(h3_ane_artifact_role role) {
+    static const char *const names[] = {
+        "none", "compiled_model", "source_weights",
+    };
+    return role >= H3_ANE_ARTIFACT_NONE &&
+                   role <= H3_ANE_ARTIFACT_SOURCE_WEIGHTS ? names[role] : NULL;
+}
+
+const char *h3_ane_contract_field_name(h3_ane_contract_field field) {
+    static const char *const names[] = {
+        "none", "version", "variant", "block_level", "block_index",
+        "weight_prefix", "boundary_dtype", "shape", "source_sha256",
+    };
+    return field >= H3_ANE_CONTRACT_FIELD_NONE &&
+                   field <= H3_ANE_CONTRACT_FIELD_SOURCE_SHA256 ?
+        names[field] : NULL;
+}
+
+static void set_artifact_context(h3_ane_diagnostic *diagnostic,
+                                 h3_ane_artifact_role role,
+                                 const char *digest) {
+    if (!diagnostic || diagnostic->code == H3_ANE_CODE_NONE) return;
+    diagnostic->artifact_role = role;
+    diagnostic->has_artifact_role = role != H3_ANE_ARTIFACT_NONE;
+    if (digest && valid_hex_digest(digest)) {
+        memcpy(diagnostic->digest, digest, 65);
+        diagnostic->has_digest = 1;
+    }
+}
+
+static void set_contract_context(h3_ane_diagnostic *diagnostic,
+                                 h3_ane_contract_field field,
+                                 const char *digest) {
+    if (!diagnostic || diagnostic->code == H3_ANE_CODE_NONE) return;
+    diagnostic->contract_field = field;
+    diagnostic->has_contract_field = field != H3_ANE_CONTRACT_FIELD_NONE;
+    if (digest && valid_hex_digest(digest)) {
+        memcpy(diagnostic->digest, digest, 65);
+        diagnostic->has_digest = 1;
+    }
 }
 
 static void record_first(h3_ane *ane, h3_ane_stage stage, h3_ane_code code,
@@ -624,6 +668,10 @@ static int real_load(void *opaque, h3_ane_diagnostic *diagnostic) {
                 h3_ane_diagnostic_record_first(diagnostic,
                     H3_ANE_STAGE_CONTRACT, H3_ANE_CODE_METADATA_MISSING,
                     H3_ANE_REASON_CONTRACT, "creator metadata is missing");
+                NSUInteger index = [requiredKeys indexOfObject:key];
+                if (index != NSNotFound)
+                    set_contract_context(diagnostic,
+                        (h3_ane_contract_field)(index + 1), NULL);
                 return -(int)H3_ANE_REASON_CONTRACT;
             }
         }
@@ -631,8 +679,20 @@ static int real_load(void *opaque, h3_ane_diagnostic *diagnostic) {
             creatorMetadata, &contract);
         if (metadataReason != H3_ANE_REASON_NONE) {
             h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_CONTRACT,
-                H3_ANE_CODE_METADATA_MISMATCH, metadataReason,
+                metadataReason == H3_ANE_REASON_FINGERPRINT ?
+                    H3_ANE_CODE_FINGERPRINT_MISMATCH :
+                    H3_ANE_CODE_METADATA_MISMATCH, metadataReason,
                 "creator metadata is missing or incompatible");
+            if (metadataReason == H3_ANE_REASON_FINGERPRINT)
+                set_contract_context(diagnostic,
+                    H3_ANE_CONTRACT_FIELD_SOURCE_SHA256,
+                    [creatorMetadata[@"source_sha256"] UTF8String]);
+            else if (metadataReason == H3_ANE_REASON_DTYPE)
+                set_contract_context(diagnostic,
+                    H3_ANE_CONTRACT_FIELD_BOUNDARY_DTYPE, NULL);
+            else if (metadataReason == H3_ANE_REASON_SHAPE)
+                set_contract_context(diagnostic,
+                    H3_ANE_CONTRACT_FIELD_SHAPE, NULL);
             return -(int)metadataReason;
         }
         NSDictionary<NSString *, MLFeatureDescription *> *inputs =
@@ -1077,6 +1137,9 @@ static h3_ane *create_impl(const char *model_path,
                      contract_reason == H3_ANE_REASON_DTYPE ?
                          H3_ANE_CODE_DTYPE_MISMATCH : H3_ANE_CODE_METADATA_MISMATCH,
                      contract_reason, "ANE model contract is incompatible");
+        if (contract_reason == H3_ANE_REASON_DTYPE)
+            set_contract_context(&ane->diagnostic,
+                                 H3_ANE_CONTRACT_FIELD_BOUNDARY_DTYPE, NULL);
         mark_unavailable(ane, contract_reason, error, error_size,
                          "ANE model contract is incompatible");
         return ane;
@@ -1090,6 +1153,8 @@ static h3_ane *create_impl(const char *model_path,
                          H3_ANE_CODE_COMPILED_MODEL_UNREADABLE,
                          H3_ANE_REASON_FINGERPRINT,
                          "compiled model is unreadable");
+            set_artifact_context(&ane->diagnostic,
+                                 H3_ANE_ARTIFACT_COMPILED_MODEL, NULL);
             mark_unavailable(ane, H3_ANE_REASON_FINGERPRINT, error, error_size,
                              "compiled ANE model is unreadable");
             return ane;
@@ -1099,6 +1164,8 @@ static h3_ane *create_impl(const char *model_path,
                          H3_ANE_CODE_COMPILED_MODEL_DIGEST_FAILED,
                          H3_ANE_REASON_FINGERPRINT,
                          "compiled model digest failed");
+            set_artifact_context(&ane->diagnostic,
+                                 H3_ANE_ARTIFACT_COMPILED_MODEL, NULL);
             mark_unavailable(ane, H3_ANE_REASON_FINGERPRINT, error, error_size,
                              "cannot fingerprint compiled ANE model");
             return ane;
@@ -1132,9 +1199,12 @@ static h3_ane *create_impl(const char *model_path,
         }
         if (strcmp(receipt.source_sha256, contract->source_sha256) != 0) {
             record_first(ane, H3_ANE_STAGE_RECEIPT,
-                         H3_ANE_CODE_FINGERPRINT_MISMATCH,
+                         H3_ANE_CODE_RECEIPT_DIGEST_MISMATCH,
                          H3_ANE_REASON_FINGERPRINT,
                          "source fingerprint does not match");
+            set_artifact_context(&ane->diagnostic,
+                                 H3_ANE_ARTIFACT_SOURCE_WEIGHTS,
+                                 receipt.source_sha256);
             mark_unavailable(ane, H3_ANE_REASON_FINGERPRINT, error, error_size,
                              "ANE source fingerprint does not match");
             return ane;
@@ -1144,6 +1214,9 @@ static h3_ane *create_impl(const char *model_path,
                          H3_ANE_CODE_RECEIPT_DIGEST_MISMATCH,
                          H3_ANE_REASON_RECEIPT,
                          "receipt model digest does not match");
+            set_artifact_context(&ane->diagnostic,
+                                 H3_ANE_ARTIFACT_COMPILED_MODEL,
+                                 receipt.model_sha256);
             mark_unavailable(ane, H3_ANE_REASON_RECEIPT, error, error_size,
                              "ANE qualification receipt digest does not match");
             return ane;
@@ -1422,7 +1495,7 @@ static int predict_impl(h3_ane *ane, const float *input, size_t input_count,
                                   error_size, "ANE boundary shape is invalid");
     float *scratch = malloc(output_count * sizeof(*scratch));
     if (!scratch)
-        record_first(ane, H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_ALLOCATION_FAILED,
+        record_first(ane, H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_OUTPUT_COPY_FAILED,
                      H3_ANE_REASON_PREDICTION, "ANE output allocation failed");
     if (!scratch)
         return prediction_failure(ane, H3_ANE_REASON_PREDICTION, stats, error,

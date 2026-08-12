@@ -633,7 +633,8 @@ raise SystemExit(1)
                     "message": "parity qualification failed",
                     "operation": None, "supported_devices": None,
                     "preferred_device": None, "observed_count": None,
-                    "limit": None})
+                    "limit": None, "artifact_role": None,
+                    "contract_field": None, "digest": None})
                 self.assertEqual(document["parity"], {
                     "max_abs": max_abs, "relative_l2": relative_l2})
                 self.assertIsNone(document["receipt"])
@@ -678,16 +679,16 @@ raise SystemExit(1)
             with self.assertRaises(ValueError):
                 self.coordinator.validate_qualification_diagnostic(document)
         production = (ROOT / "h3_ane.m").read_text()
-        self.assertIn("H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_ALLOCATION_FAILED",
+        self.assertIn("H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_OUTPUT_COPY_FAILED",
                       production)
         output_allocation = {
-            "failure_stage": "output", "failure_code": "allocation_failed",
+            "failure_stage": "output", "failure_code": "output_copy_failed",
             "failure_reason": "output allocation failed",
             "failure_operation": None, "supported_devices": None,
             "preferred_device": None, "observed_count": None, "limit": None}
         self.assertEqual(
             self.coordinator.validate_qualification_diagnostic(output_allocation)[
-                "code"], "allocation_failed")
+                "code"], "output_copy_failed")
         fabricated = dict(output_allocation, failure_stage="eligibility",
                           failure_code="operation_inventory_empty")
         with self.assertRaises(ValueError):
@@ -703,15 +704,14 @@ raise SystemExit(1)
         receipt_fingerprint = dict(
             output_allocation, failure_stage="receipt",
             failure_code="fingerprint_mismatch")
-        self.assertEqual(
+        with self.assertRaisesRegex(ValueError, "taxonomy"):
             self.coordinator.validate_qualification_diagnostic(
-                receipt_fingerprint)["code"], "fingerprint_mismatch")
+                receipt_fingerprint)
         contract_fingerprint = dict(
             output_allocation, failure_stage="contract",
             failure_code="fingerprint_mismatch")
-        with self.assertRaisesRegex(ValueError, "taxonomy"):
-            self.coordinator.validate_qualification_diagnostic(
-                contract_fingerprint)
+        self.assertEqual(self.coordinator.validate_qualification_diagnostic(
+            contract_fingerprint)["code"], "fingerprint_mismatch")
         for code in ("operation_inventory_empty",
                      "operation_inventory_limit_exceeded"):
             optional = dict(output_allocation, failure_stage="compute_plan",
@@ -1370,6 +1370,41 @@ time.sleep(30)
             self.assertFalse(output.exists())
 
 
+    def test_reused_work_preflight_failure_preserves_regular_or_absent_authority(self):
+        for seeded in (True, False):
+            with self.subTest(seeded=seeded), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); work = root / "work"; work.mkdir()
+                (work / self.coordinator.WORK_MARKER).write_text(
+                    self.coordinator.SCHEMA + "\n")
+                compiled = work / "visual-block.mlmodelc"; compiled.mkdir()
+                sentinel = work / "sentinel"; sentinel.write_bytes(b"keep")
+                receipt = Path(f"{compiled}.qualification.json")
+                if seeded:
+                    receipt.write_bytes(b"existing-authority")
+                before = self.coordinator.receipt_snapshot(receipt)
+                output = root / "summary.json"; weights = root / "weights"
+                weights.mkdir()
+                os.chmod(work, 0o555)
+                try:
+                    result = subprocess.run(
+                        [sys.executable,
+                         str(ROOT / "scripts/run_ane_integration.py"), "shadow",
+                         "--repo", str(ROOT), "--work-dir", str(work),
+                         "--output", str(output), "--weights", str(weights)],
+                        text=True, capture_output=True, check=False)
+                finally:
+                    os.chmod(work, 0o755)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(self.coordinator.receipt_snapshot(receipt), before)
+                self.assertEqual(sentinel.read_bytes(), b"keep")
+                document = json.loads(output.read_text())
+                self.assertFalse(document["measurement_started"])
+                self.assertEqual(document["authority_state"], "unchanged")
+                self.assertEqual(document["diagnostic"]["stage"], "receipt")
+                self.assertEqual(document["diagnostic"]["code"],
+                                 "receipt_invalid")
+
+
 class NativeToolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1662,6 +1697,60 @@ class NativeToolTests(unittest.TestCase):
             self.assertEqual(document["failure_stage"], "receipt")
             self.assertEqual(document["failure_code"], "receipt_invalid")
             self.assertFalse(list(receipt.parent.glob(receipt.name + ".preflight-*")))
+
+    def test_strict_preflight_failure_preserves_receipt_and_never_measures(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); model, receipt = self.seed_valid_receipt(root)
+            original = receipt.read_bytes(); output = root / "result" / "strict.json"
+            output.parent.mkdir(); marker = root / "MEASUREMENT-MUST-NOT-START"
+            os.chmod(model.parent, 0o555)
+            try:
+                result = subprocess.run(
+                    [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                     "--coreml-model", str(model), "--output", str(output)],
+                    env={**os.environ, "H3_ANE_TEST_METRICS": "0.001,0.01",
+                         "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+                         "H3_ANE_TEST_MEASUREMENT_MARKER": str(marker)},
+                    text=True, capture_output=True, check=False)
+            finally:
+                os.chmod(model.parent, 0o755)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(receipt.read_bytes(), original)
+            self.assertFalse(marker.exists())
+            document = json.loads(output.read_text())
+            self.assertIsNone(document["profile"])
+            self.assertFalse(document["authority"])
+            self.assertFalse(document["measurement_started"])
+            self.assertEqual(document["authority_state"], "unchanged")
+            self.assertIsNone(document["receipt_path"])
+            self.assertEqual(document["failure_stage"], "receipt")
+            self.assertEqual(document["failure_code"], "receipt_invalid")
+            self.assertFalse(list(receipt.parent.glob(receipt.name + ".preflight-*")))
+
+    def test_signal_mask_early_failures_publish_atomic_non_authority(self):
+        for variable, state in (("H3_ANE_TEST_FAIL_SIGNAL_BLOCK", "unchanged"),
+                                ("H3_ANE_TEST_FAIL_SIGNAL_RESTORE", "invalidated")):
+            with self.subTest(variable=variable), tempfile.TemporaryDirectory() as root:
+                root = Path(root); model, receipt = self.seed_valid_receipt(root)
+                output = root / "result.json"
+                result = subprocess.run(
+                    [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                     "--coreml-model", str(model), "--output", str(output)],
+                    env={**os.environ, variable: "1",
+                         "H3_ANE_TEST_METRICS": "0.001,0.01",
+                         "H3_ANE_TEST_SOURCE_SHA256": "1" * 64},
+                    text=True, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                document = json.loads(output.read_text())
+                self.assertFalse(document["measurement_started"])
+                self.assertEqual(document["authority_state"], state)
+                self.assertFalse(document["authority"])
+                self.assertIsNone(document["receipt_path"])
+                if state == "unchanged":
+                    self.assertTrue(receipt.exists())
+                else:
+                    self.assertFalse(receipt.exists())
+                self.assertFalse(list(root.glob("result.json.tmp-*")))
 
     def test_shadow_post_preflight_invalidation_failure_is_structured(self):
         with tempfile.TemporaryDirectory() as root:

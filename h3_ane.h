@@ -103,6 +103,8 @@ void h3_ane_diagnostic_merge_first(h3_ane_diagnostic *destination,
                                    const h3_ane_diagnostic *source);
 const char *h3_ane_stage_name(h3_ane_stage stage);
 const char *h3_ane_code_name(h3_ane_code code);
+const char *h3_ane_artifact_role_name(h3_ane_artifact_role role);
+const char *h3_ane_contract_field_name(h3_ane_contract_field field);
 
 enum {
     H3_ANE_MAX_OPERATIONS = 4096,

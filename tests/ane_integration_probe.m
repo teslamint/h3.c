@@ -47,8 +47,8 @@ static int publish(const char *path, int passed,
     if (descriptor < 0) return 0;
     FILE *stream = fdopen(descriptor, "w");
     if (!stream) { close(descriptor); cleanup(); return 0; }
-    fprintf(stream, "{\"schema\":\"h3-ane-integration-probe/v1\"," 
-                    "\"status\":\"%s\",\"model_sha256\":\"%s\"," 
+    fprintf(stream, "{\"schema\":\"h3-ane-integration-probe/v1\","
+                    "\"status\":\"%s\",\"model_sha256\":\"%s\","
                     "\"source_sha256\":\"%s\",\"inventory\":{"
                     "\"total\":%llu,\"constant\":%llu,"
                     "\"nonconstant\":%llu,\"neural_engine_supported\":%llu,"
@@ -74,6 +74,19 @@ static int publish(const char *path, int passed,
         json_string(stream, h3_ane_code_name(diagnostic->code));
         fputs(",\"message\":", stream);
         json_string(stream, message);
+        fputs(",\"artifact_role\":", stream);
+        if (diagnostic->has_artifact_role)
+            json_string(stream,
+                        h3_ane_artifact_role_name(diagnostic->artifact_role));
+        else fputs("null", stream);
+        fputs(",\"contract_field\":", stream);
+        if (diagnostic->has_contract_field)
+            json_string(stream,
+                        h3_ane_contract_field_name(diagnostic->contract_field));
+        else fputs("null", stream);
+        fputs(",\"digest\":", stream);
+        if (diagnostic->has_digest) json_string(stream, diagnostic->digest);
+        else fputs("null", stream);
         fputc('}', stream);
     }
     fputs("}\n", stream);

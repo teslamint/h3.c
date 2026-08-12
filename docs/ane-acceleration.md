@@ -170,7 +170,10 @@ The strict qualifier writes `h3-ane-qualification/v1`. These fields are stable:
   "supported_devices": ["cpu", "gpu", "neural-engine"],
   "preferred_device": "cpu|gpu|neural-engine|null",
   "observed_count": 0,
-  "limit": 0
+  "limit": 0,
+  "artifact_role": "compiled_model|source_weights|null",
+  "contract_field": "version|variant|block_level|block_index|weight_prefix|boundary_dtype|shape|source_sha256|null",
+  "digest": "hex|null"
 }
 ```
 
@@ -181,6 +184,11 @@ cannot be atomically published, no result exists: stderr reports
 `publication/result_write_failed`, the process exits 2, and no receipt is
 written. If receipt publication fails, the result is rewritten as
 `publication/receipt_write_failed` when possible and authority remains absent.
+Strict and shadow qualification both prove same-directory, link-safe receipt
+quarantine before prediction or authority mutation. A failed preflight exits 2,
+preserves an existing or absent receipt state unchanged, and publishes
+`measurement_started:false`, `authority_state:"unchanged"`, `authority:false`,
+and `receipt_path:null` when the result destination is independently writable.
 
 The closed failure stages and codes are:
 
@@ -188,14 +196,14 @@ The closed failure stages and codes are:
 |---|---|
 | `setup` | `disabled`, `os_unsupported`, `allocation_failed` |
 | `artifact` | `compiled_model_unreadable`, `compiled_model_digest_failed`, `source_weights_unreadable`, `source_tensor_digest_failed` |
-| `contract` | `metadata_missing`, `metadata_mismatch`, `shape_mismatch`, `dtype_mismatch` |
-| `receipt` | `receipt_missing`, `receipt_malformed`, `fingerprint_mismatch`, `receipt_digest_mismatch`, `receipt_invalid` |
+| `contract` | `metadata_missing`, `metadata_mismatch`, `fingerprint_mismatch`, `shape_mismatch`, `dtype_mismatch` |
+| `receipt` | `receipt_missing`, `receipt_malformed`, `receipt_digest_mismatch`, `receipt_invalid` |
 | `load` | `model_load_failed`, `model_load_exception` |
 | `compute_plan` | `allocation_failed`, `plan_timeout`, `plan_load_failed`, `program_missing`, `main_missing`, `operation_inventory_empty`, `operation_inventory_limit_exceeded`, `operation_nesting_limit_exceeded`, `operation_inventory_changed` |
 | `eligibility` | `operation_usage_unknown`, `operation_not_neural_engine_supported`, `device_unknown` |
 | `input` | `input_shape_mismatch`, `input_dtype_mismatch`, `input_copy_failed` |
 | `prediction` | `prediction_failed`, `prediction_exception` |
-| `output` | `allocation_failed`, `output_shape_mismatch`, `output_dtype_mismatch`, `output_copy_failed`, `output_nonfinite` |
+| `output` | `output_shape_mismatch`, `output_dtype_mismatch`, `output_copy_failed`, `output_nonfinite` |
 | `parity` | `parity_metrics_nonfinite`, `parity_bounds_failed` |
 | `publication` | `result_write_failed`, `receipt_write_failed` |
 
