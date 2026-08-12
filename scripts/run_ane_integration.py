@@ -50,8 +50,12 @@ DIAGNOSTIC_CODES = {
     "receipt": {"receipt_missing", "receipt_malformed",
                 "receipt_digest_mismatch", "receipt_invalid"},
     "load": {"model_load_failed", "model_load_exception"},
-    "compute_plan": {"plan_timeout", "plan_load_failed", "program_missing",
-                     "main_missing"},
+    "compute_plan": {"allocation_failed", "plan_timeout", "plan_load_failed",
+                     "program_missing", "main_missing",
+                     "operation_inventory_empty",
+                     "operation_inventory_limit_exceeded",
+                     "operation_nesting_limit_exceeded",
+                     "operation_inventory_changed"},
     "eligibility": {"operation_inventory_empty",
                     "operation_inventory_limit_exceeded",
                     "operation_nesting_limit_exceeded",
@@ -78,7 +82,8 @@ WORK_MARKER = ".h3-ane-integration-owned"
 class StageFailure(RuntimeError):
     def __init__(self, stage, message, *, source_sha256=None, inventory=None,
                  code=None, parity=None, stages=None, artifacts=None,
-                 diagnostic=None):
+                 diagnostic=None, measurement_started=None,
+                 authority_state=None):
         super().__init__(message)
         self.stage = stage
         self.source_sha256 = source_sha256
@@ -88,6 +93,8 @@ class StageFailure(RuntimeError):
         self.stages = stages or {}
         self.artifacts = artifacts
         self.diagnostic = diagnostic
+        self.measurement_started = measurement_started
+        self.authority_state = authority_state
 
 
 class UnsafeOutput(ValueError):
@@ -244,7 +251,7 @@ def _failed(mode, failure):
     stages = {key: value for key, value in failure.stages.items()
               if key in ("conversion", "probe", "qualification") and
               isinstance(value, int) and not isinstance(value, bool)}
-    return {"schema": SCHEMA, "status": "failed", "mode": mode,
+    document = {"schema": SCHEMA, "status": "failed", "mode": mode,
             "profile": "shadow-measurement-v1" if mode == "shadow" else None,
             "authority": False if mode == "shadow" else None,
             "source_sha256": failure.source_sha256
@@ -252,6 +259,10 @@ def _failed(mode, failure):
             "inventory": inventory, "diagnostic": diagnostic,
             "parity": parity, "receipt": None,
             "artifacts": artifacts, "stages": stages}
+    if mode == "shadow":
+        document["measurement_started"] = failure.measurement_started
+        document["authority_state"] = failure.authority_state
+    return document
 
 
 def _bounded_mapping(value, limit):
@@ -260,7 +271,8 @@ def _bounded_mapping(value, limit):
                 "message": "integration result is invalid"}
     result = {}
     canonical_keys = ("stage", "code", "message", "operation",
-                      "supported_devices", "preferred_device")
+                      "supported_devices", "preferred_device",
+                      "observed_count", "limit")
     for key in canonical_keys[:limit]:
         if key not in value:
             continue
@@ -294,6 +306,8 @@ def validate_qualification_diagnostic(document):
     operation = document.get("failure_operation")
     devices = document.get("supported_devices")
     preferred = document.get("preferred_device")
+    observed = document.get("observed_count")
+    limit = document.get("limit")
     if stage not in DIAGNOSTIC_CODES or code not in DIAGNOSTIC_CODES[stage] or \
             not isinstance(message, str) or not message or len(message) > 159:
         raise ValueError("invalid qualifier diagnostic taxonomy")
@@ -311,22 +325,37 @@ def validate_qualification_diagnostic(document):
                                   preferred not in DEVICE_LABELS or
                                   not devices or preferred not in devices):
         raise ValueError("invalid qualifier preferred device")
+    count_codes = {"allocation_failed", "operation_inventory_empty",
+                   "operation_inventory_limit_exceeded",
+                   "operation_nesting_limit_exceeded",
+                   "operation_inventory_changed"}
+    if observed is not None or limit is not None:
+        if stage != "compute_plan" or code not in count_codes or \
+                not isinstance(observed, int) or isinstance(observed, bool) or \
+                observed < 0 or not isinstance(limit, int) or \
+                isinstance(limit, bool) or limit < 0:
+            raise ValueError("invalid qualifier count context")
     return {"stage": stage, "code": code, "message": message,
             "operation": operation, "supported_devices": devices,
-            "preferred_device": preferred}
+            "preferred_device": preferred, "observed_count": observed,
+            "limit": limit}
 
 
 def publish_failure(path, document):
     try:
         atomic_json(path, document)
     except ValueError:
-        atomic_json(path, {
+        minimal = {
             "schema": SCHEMA, "status": "failed", "mode": document.get("mode"),
             "profile": document.get("profile"), "authority": document.get("authority"),
             "source_sha256": None, "inventory": None,
             "diagnostic": {"stage": "integration", "code": "invalid_result",
                            "message": "integration result is invalid"},
-            "parity": None, "receipt": None, "artifacts": None, "stages": {}})
+            "parity": None, "receipt": None, "artifacts": None, "stages": {}}
+        if document.get("mode") == "shadow":
+            minimal["measurement_started"] = document.get("measurement_started")
+            minimal["authority_state"] = document.get("authority_state")
+        atomic_json(path, minimal)
 
 
 def prepare_work_directory(path):
@@ -457,6 +486,30 @@ def execute(args):
                     source_sha256=source_sha, inventory=inventory,
                     stages={**stages, "qualification": 1},
                     artifacts=artifacts) from None
+            measurement_started = failed.get("measurement_started")
+            authority_state = failed.get("authority_state")
+            preflight_failed = args.mode == "shadow" and \
+                measurement_started is False and authority_state == "unchanged" and \
+                diagnostic["stage"] == "receipt" and \
+                diagnostic["code"] == "receipt_invalid" and \
+                failed.get("profile") == "shadow-measurement-v1" and \
+                failed.get("authority") is False and \
+                failed.get("receipt_path") is None
+            if args.mode == "shadow" and measurement_started is False and \
+                    not preflight_failed:
+                raise StageFailure(
+                    "qualification", "invalid shadow preflight result",
+                    code="invalid_result", source_sha256=source_sha,
+                    inventory=inventory, stages={**stages, "qualification": 2},
+                    artifacts=artifacts) from None
+            if preflight_failed:
+                _authority_outputs.discard(receipt_path)
+                raise StageFailure(
+                    diagnostic["stage"], diagnostic["message"],
+                    code=diagnostic["code"], source_sha256=source_sha,
+                    inventory=inventory, stages={**stages, "qualification": 2},
+                    artifacts=artifacts, diagnostic=diagnostic,
+                    measurement_started=False, authority_state="unchanged")
             parity = {"max_abs": failed.get("max_abs"),
                       "relative_l2": failed.get("relative_l2")}
             if args.mode == "shadow":
@@ -474,6 +527,8 @@ def execute(args):
                 if failed.get("status") != "failed" or \
                         failed.get("profile") != "shadow-measurement-v1" or \
                         failed.get("authority") is not False or \
+                        failed.get("measurement_started") is not True or \
+                        failed.get("authority_state") != "invalidated" or \
                         failed.get("bounds") != {
                             "max_abs": 0.25, "relative_l2": 0.05} or \
                         failed.get("threshold_outcome") is not False or \
@@ -506,7 +561,9 @@ def execute(args):
                 code=failed.get("failure_code"), parity=parity,
                 stages={**stages, "qualification": 1},
                 artifacts=artifacts,
-                diagnostic=diagnostic if args.mode == "shadow" else None)
+                diagnostic=diagnostic if args.mode == "shadow" else None,
+                measurement_started=measurement_started,
+                authority_state=authority_state)
         stages["qualification"] = 0
         qualification = json.loads(qualification_output.read_text())
         if args.mode == "shadow":
@@ -520,6 +577,8 @@ def execute(args):
             if qualification.get("status") != "passed" or \
                     qualification.get("profile") != "shadow-measurement-v1" or \
                     qualification.get("authority") is not False or \
+                    qualification.get("measurement_started") is not True or \
+                    qualification.get("authority_state") != "invalidated" or \
                     qualification.get("bounds") != {
                         "max_abs": 0.25, "relative_l2": 0.05} or \
                     qualification.get("threshold_outcome") is not True or \
@@ -561,6 +620,9 @@ def execute(args):
                 "source_sha256": source_sha, "inventory": inventory,
                 "diagnostic": None, "parity": parity, "receipt": receipt,
                 "artifacts": artifacts, "stages": stages}
+    if args.mode == "shadow":
+        document["measurement_started"] = True
+        document["authority_state"] = "invalidated"
     try:
         atomic_json(output, document)
     except BaseException:

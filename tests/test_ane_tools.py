@@ -471,6 +471,7 @@ receipt.unlink(missing_ok=True)
 output.write_text(json.dumps({
     'schema': 'h3-ane-qualification/v1', 'status': 'passed',
     'profile': 'shadow-measurement-v1', 'authority': False,
+    'measurement_started': True, 'authority_state': 'invalidated',
     'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
     'max_abs': 0.19, 'relative_l2': 0.038,
     'bounds': {'max_abs': 0.25, 'relative_l2': 0.05},
@@ -518,6 +519,7 @@ output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
 output.write_text(json.dumps({
     'schema': 'h3-ane-qualification/v1', 'status': 'passed',
     'profile': 'shadow-measurement-v1', 'authority': False,
+    'measurement_started': True, 'authority_state': 'invalidated',
     'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
     'max_abs': 0.19, 'relative_l2': 0.038,
     'bounds': {'max_abs': 0.25, 'relative_l2': 0.05},
@@ -556,6 +558,7 @@ output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
 output.write_text(json.dumps({
     'schema': 'h3-ane-qualification/v1', 'status': 'passed',
     'profile': 'shadow-measurement-v1', 'authority': False,
+    'measurement_started': True, 'authority_state': 'invalidated',
     'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
     'max_abs': 0.25, 'relative_l2': 0.05,
     'bounds': {'max_abs': 0.25, 'relative_l2': 0.05},
@@ -600,6 +603,7 @@ receipt.unlink()
 pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({{
     'schema': 'h3-ane-qualification/v1', 'status': 'failed',
     'profile': 'shadow-measurement-v1', 'authority': False,
+    'measurement_started': True, 'authority_state': 'invalidated',
     'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
     'max_abs': {max_abs!r}, 'relative_l2': {relative_l2!r},
     'bounds': {{'max_abs': 0.25, 'relative_l2': 0.05}},
@@ -607,7 +611,7 @@ pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({{
     'failure_stage': 'parity', 'failure_code': {code!r},
     'failure_reason': 'parity qualification failed',
     'failure_operation': None, 'supported_devices': None,
-    'preferred_device': None}}))
+    'preferred_device': None, 'observed_count': None, 'limit': None}}))
 raise SystemExit(1)
 """)
                 output = root / "summary.json"
@@ -628,7 +632,8 @@ raise SystemExit(1)
                     "stage": "parity", "code": code,
                     "message": "parity qualification failed",
                     "operation": None, "supported_devices": None,
-                    "preferred_device": None})
+                    "preferred_device": None, "observed_count": None,
+                    "limit": None})
                 self.assertEqual(document["parity"], {
                     "max_abs": max_abs, "relative_l2": relative_l2})
                 self.assertIsNone(document["receipt"])
@@ -683,6 +688,7 @@ receipt.unlink()
 pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({
     'schema': 'h3-ane-qualification/v1', 'status': 'failed',
     'profile': 'shadow-measurement-v1', 'authority': False,
+    'measurement_started': True, 'authority_state': 'invalidated',
     'model_sha256': 'b' * 64, 'source_sha256': '',
     'max_abs': 0.0, 'relative_l2': 0.0,
     'bounds': {'max_abs': 0.25, 'relative_l2': 0.05},
@@ -691,7 +697,7 @@ pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({
     'failure_code': 'source_weights_unreadable',
     'failure_reason': 'source weights are unreadable',
     'failure_operation': None, 'supported_devices': None,
-    'preferred_device': None}))
+    'preferred_device': None, 'observed_count': None, 'limit': None}))
 raise SystemExit(1)
 """)
             output = root / "summary.json"; weights = root / "weights"
@@ -712,6 +718,129 @@ raise SystemExit(1)
             self.assertEqual(document["diagnostic"]["code"],
                              "source_weights_unreadable")
             self.assertIsNone(document["receipt"])
+
+    def test_shadow_coordinator_preserves_unchanged_preflight_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            converter, probe, qualifier = self.fixture_tools(root)
+            self.write_tool(qualifier, """
+import json, pathlib, sys
+model = pathlib.Path(sys.argv[sys.argv.index('--coreml-model') + 1])
+receipt = pathlib.Path(str(model) + '.qualification.json')
+receipt_document = {
+    'version': 1, 'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
+    'test_vector': 'xorshift32-v1', 'qualified_at': '2026-08-12T00:00:00Z',
+    'max_abs': 0.001, 'relative_l2': 0.01, 'status': 'passed'}
+receipt.write_text(json.dumps(receipt_document, sort_keys=True))
+pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({
+    'schema': 'h3-ane-qualification/v1', 'status': 'failed',
+    'profile': 'shadow-measurement-v1', 'authority': False,
+    'measurement_started': False, 'authority_state': 'unchanged',
+    'model_sha256': '', 'source_sha256': '', 'max_abs': None,
+    'relative_l2': None, 'bounds': {'max_abs': 0.25, 'relative_l2': 0.05},
+    'threshold_outcome': False, 'receipt_path': None,
+    'failure_stage': 'receipt', 'failure_code': 'receipt_invalid',
+    'failure_reason': 'receipt quarantine preflight failed',
+    'failure_operation': None, 'supported_devices': None,
+    'preferred_device': None, 'observed_count': None, 'limit': None}))
+raise SystemExit(2)
+""")
+            output = root / "summary.json"; weights = root / "weights"
+            weights.mkdir(); work = root / "work"
+            env = os.environ.copy()
+            env.update({"H3_ANE_INTEGRATION_CONVERTER": str(converter),
+                        "H3_ANE_INTEGRATION_PROBE": str(probe),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(qualifier)})
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                 "shadow", "--repo", str(ROOT), "--work-dir", str(work),
+                 "--output", str(output), "--weights", str(weights)],
+                env=env, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            document = json.loads(output.read_text())
+            self.assertFalse(document["measurement_started"])
+            self.assertEqual(document["authority_state"], "unchanged")
+            self.assertEqual(document["diagnostic"]["stage"], "receipt")
+            receipt = Path(f"{work / 'visual-block.mlmodelc'}.qualification.json")
+            self.assertEqual(json.loads(receipt.read_text())["status"], "passed")
+
+    def test_production_compute_plan_pairs_propagate_exactly(self):
+        production = (ROOT / "h3_ane.m").read_text()
+        cases = (
+            ("allocation_failed", None, None),
+            ("operation_inventory_empty", 0, 0),
+            ("operation_inventory_limit_exceeded", 4097, 4096),
+            ("operation_nesting_limit_exceeded", 65, 64),
+            ("operation_inventory_changed", 150, 149),
+        )
+        production_tokens = {
+            "allocation_failed": "H3_ANE_CODE_ALLOCATION_FAILED",
+            "operation_inventory_empty": "H3_ANE_CODE_OPERATION_INVENTORY_EMPTY",
+            "operation_inventory_limit_exceeded":
+                "H3_ANE_CODE_OPERATION_INVENTORY_LIMIT_EXCEEDED",
+            "operation_nesting_limit_exceeded":
+                "H3_ANE_CODE_OPERATION_NESTING_LIMIT_EXCEEDED",
+            "operation_inventory_changed":
+                "H3_ANE_CODE_OPERATION_INVENTORY_CHANGED",
+        }
+        for code, observed, limit in cases:
+            with self.subTest(code=code):
+                self.assertIn(production_tokens[code], production)
+                diagnostic = self.coordinator.validate_qualification_diagnostic({
+                    "failure_stage": "compute_plan", "failure_code": code,
+                    "failure_reason": "production compute plan failure",
+                    "failure_operation": None, "supported_devices": None,
+                    "preferred_device": None, "observed_count": observed,
+                    "limit": limit})
+                self.assertEqual(diagnostic["stage"], "compute_plan")
+                self.assertEqual(diagnostic["code"], code)
+                self.assertEqual(diagnostic["observed_count"], observed)
+                self.assertEqual(diagnostic["limit"], limit)
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    converter, probe, qualifier = self.fixture_tools(root)
+                    self.write_tool(qualifier, f"""
+import json, pathlib, sys
+model = pathlib.Path(sys.argv[sys.argv.index('--coreml-model') + 1])
+receipt = pathlib.Path(str(model) + '.qualification.json')
+receipt.write_text(json.dumps({{
+    'version': 1, 'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
+    'test_vector': 'xorshift32-v1', 'qualified_at': '2026-08-12T00:00:00Z',
+    'max_abs': 0.001, 'relative_l2': 0.01, 'status': 'passed'}}))
+receipt.unlink()
+pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({{
+    'schema': 'h3-ane-qualification/v1', 'status': 'failed',
+    'profile': 'shadow-measurement-v1', 'authority': False,
+    'measurement_started': True, 'authority_state': 'invalidated',
+    'model_sha256': 'b' * 64, 'source_sha256': 'a' * 64,
+    'max_abs': 0.0, 'relative_l2': 0.0,
+    'bounds': {{'max_abs': 0.25, 'relative_l2': 0.05}},
+    'threshold_outcome': False, 'receipt_path': None,
+    'failure_stage': 'compute_plan', 'failure_code': {code!r},
+    'failure_reason': 'production compute plan failure',
+    'failure_operation': None, 'supported_devices': None,
+    'preferred_device': None, 'observed_count': {observed!r},
+    'limit': {limit!r}}}))
+raise SystemExit(1)
+""")
+                    output = root / "summary.json"; weights = root / "weights"
+                    weights.mkdir()
+                    env = os.environ.copy()
+                    env.update({"H3_ANE_INTEGRATION_CONVERTER": str(converter),
+                                "H3_ANE_INTEGRATION_PROBE": str(probe),
+                                "H3_ANE_INTEGRATION_QUALIFIER": str(qualifier)})
+                    result = subprocess.run(
+                        [sys.executable,
+                         str(ROOT / "scripts/run_ane_integration.py"), "shadow",
+                         "--repo", str(ROOT),
+                         "--work-dir", str(root / "work"),
+                         "--output", str(output), "--weights", str(weights)],
+                        env=env, text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    summary = json.loads(output.read_text())
+                    self.assertEqual(summary["diagnostic"], diagnostic)
+                    self.assertFalse(Path(
+                        f"{root / 'work' / 'visual-block.mlmodelc'}.qualification.json").exists())
 
     def test_oversized_failure_falls_back_to_minimal_atomic_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1375,6 +1504,61 @@ class NativeToolTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertEqual(len(list(receipt.parent.glob(
                 receipt.name + ".invalid-*"))), 1)
+
+    def test_shadow_receipt_preflight_is_side_effect_free_before_quarantine(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); model, receipt = self.seed_valid_receipt(root)
+            original = receipt.read_bytes()
+            marker = root / "preflight-complete"; release = root / "release"
+            output = root / "shadow.json"
+            env = {**os.environ, "H3_ANE_TEST_METRICS": "0.19,0.038",
+                   "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+                   "H3_ANE_TEST_PAUSE_AFTER_PREFLIGHT": str(marker),
+                   "H3_ANE_TEST_RELEASE_PREFLIGHT": str(release)}
+            process = subprocess.Popen(
+                [str(ROOT / "h3_ane_qualification_test"), "--shadow-only",
+                 "--model", "unused", "--coreml-model", str(model),
+                 "--output", str(output)], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for _ in range(200):
+                if marker.exists(): break
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            self.assertEqual(receipt.read_bytes(), original)
+            self.assertFalse(output.exists())
+            self.assertFalse(list(receipt.parent.glob(receipt.name + ".invalid-*")))
+            self.assertFalse(list(receipt.parent.glob(receipt.name + ".preflight-*")))
+            release.write_text("continue")
+            process.wait(timeout=5); process.communicate()
+            self.assertEqual(process.returncode, 0)
+            self.assertFalse(receipt.exists())
+
+    def test_shadow_preflight_failure_preserves_receipt_and_never_measures(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); model, receipt = self.seed_valid_receipt(root)
+            original = receipt.read_bytes(); output = root / "result" / "shadow.json"
+            output.parent.mkdir(); marker = root / "MEASUREMENT-MUST-NOT-START"
+            os.chmod(model.parent, 0o555)
+            try:
+                result = subprocess.run(
+                    [str(ROOT / "h3_ane_qualification_test"), "--shadow-only",
+                     "--model", "unused", "--coreml-model", str(model),
+                     "--output", str(output)],
+                    env={**os.environ, "H3_ANE_TEST_METRICS": "0.19,0.038",
+                         "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+                         "H3_ANE_TEST_MEASUREMENT_MARKER": str(marker)},
+                    text=True, capture_output=True, check=False)
+            finally:
+                os.chmod(model.parent, 0o755)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(receipt.read_bytes(), original)
+            self.assertFalse(marker.exists())
+            document = json.loads(output.read_text())
+            self.assertFalse(document["measurement_started"])
+            self.assertEqual(document["authority_state"], "unchanged")
+            self.assertEqual(document["failure_stage"], "receipt")
+            self.assertEqual(document["failure_code"], "receipt_invalid")
+            self.assertFalse(list(receipt.parent.glob(receipt.name + ".preflight-*")))
 
     def test_result_write_failure_is_stderr_only_and_leaves_no_receipt(self):
         with tempfile.TemporaryDirectory() as root:

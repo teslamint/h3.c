@@ -175,6 +175,13 @@ static int parse_test_metrics(double *max_abs, double *relative_l2,
 static int qualify(const char *weights, const char *model, double *max_abs,
                    double *relative_l2, char source[65], char *error,
                    size_t error_size, h3_ane_diagnostic *diagnostic) {
+#ifdef H3_ANE_TOOL_TESTING
+    const char *measurement_marker = getenv("H3_ANE_TEST_MEASUREMENT_MARKER");
+    if (measurement_marker && *measurement_marker) {
+        FILE *stream = fopen(measurement_marker, "w");
+        if (stream) { fputs("measurement started\n", stream); fclose(stream); }
+    }
+#endif
     if (parse_test_metrics(max_abs, relative_l2, source)) return 1;
     if (!source_digest(weights, source, error, error_size, diagnostic)) return 0;
     const size_t count = (size_t)1 * 1 * 256 * 256 * 128;
@@ -317,6 +324,14 @@ static void write_diagnostic_fields(FILE *stream, const char *failure,
             "neural-engine" : NULL;
         if (device) json_string(stream, device); else fputs("null", stream);
     } else fputs("null", stream);
+    fputs(",\"observed_count\":", stream);
+    if (diagnostic && diagnostic->has_count)
+        fprintf(stream, "%llu", (unsigned long long)diagnostic->observed_count);
+    else fputs("null", stream);
+    fputs(",\"limit\":", stream);
+    if (diagnostic && diagnostic->has_count)
+        fprintf(stream, "%llu", (unsigned long long)diagnostic->limit);
+    else fputs("null", stream);
 }
 
 static int invalidate_receipt(const char *receipt, char *invalid) {
@@ -335,6 +350,59 @@ static int invalidate_receipt(const char *receipt, char *invalid) {
     fprintf(stderr, "h3_ane_qualification: cannot invalidate old receipt: %s\n",
             strerror(rename_error));
     return 0;
+}
+
+static int receipt_preflight(const char *receipt) {
+    char source[4096], target[4096];
+    if (snprintf(source, sizeof(source), "%s.preflight-source-XXXXXX", receipt) >=
+            (int)sizeof(source) ||
+        snprintf(target, sizeof(target), "%s.preflight-target-XXXXXX", receipt) >=
+            (int)sizeof(target)) return 0;
+    int source_descriptor = mkstemp(source);
+    if (source_descriptor < 0) return 0;
+    int target_descriptor = mkstemp(target);
+    if (target_descriptor < 0) {
+        close(source_descriptor); unlink(source); return 0;
+    }
+    int ok = close(source_descriptor) == 0;
+    if (close(target_descriptor) != 0) ok = 0;
+    if (ok) ok = rename(source, target) == 0;
+    unlink(source);
+    if (unlink(target) != 0) ok = 0;
+    return ok;
+}
+
+static void pause_after_preflight_if_requested(void) {
+#ifdef H3_ANE_TOOL_TESTING
+    const char *marker = getenv("H3_ANE_TEST_PAUSE_AFTER_PREFLIGHT");
+    const char *release = getenv("H3_ANE_TEST_RELEASE_PREFLIGHT");
+    if (!marker || !*marker || !release || !*release) return;
+    FILE *stream = fopen(marker, "w");
+    if (stream) { fputs("preflight complete\n", stream); fclose(stream); }
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = 1000000};
+    while (access(release, F_OK) != 0) nanosleep(&delay, NULL);
+#endif
+}
+
+static int write_shadow_preflight_failure(const char *path) {
+    int descriptor = atomic_open(path);
+    if (descriptor < 0) return 0;
+    FILE *stream = fdopen(descriptor, "w");
+    if (!stream) { close(descriptor); cleanup_temp(); return 0; }
+    fputs("{\"schema\":\"h3-ane-qualification/v1\","
+          "\"profile\":\"shadow-measurement-v1\",\"status\":\"failed\","
+          "\"authority\":false,\"measurement_started\":false,"
+          "\"authority_state\":\"unchanged\",\"model_sha256\":\"\","
+          "\"source_sha256\":\"\",\"test_vector\":\"xorshift32-v1\","
+          "\"qualified_at\":\"\",\"max_abs\":null,\"relative_l2\":null,"
+          "\"bounds\":{\"max_abs\":0.25,\"relative_l2\":0.05},"
+          "\"threshold_outcome\":false,\"receipt_path\":null,"
+          "\"failure_reason\":\"receipt quarantine preflight failed\","
+          "\"failure_stage\":\"receipt\",\"failure_code\":\"receipt_invalid\","
+          "\"failure_operation\":null,\"supported_devices\":null,"
+          "\"preferred_device\":null,\"observed_count\":null,"
+          "\"limit\":null}\n", stream);
+    return atomic_finish(stream, path);
 }
 
 static int write_shadow_result(const char *path, int passed,
@@ -361,6 +429,8 @@ static int write_shadow_result(const char *path, int passed,
     fputs(passed ? "true" : "false", stream);
     fputs(",\"receipt_path\":null", stream);
     write_diagnostic_fields(stream, failure, diagnostic);
+    fputs(",\"measurement_started\":true,"
+          "\"authority_state\":\"invalidated\"", stream);
     fputs("}\n", stream);
     return atomic_finish(stream, path);
 }
@@ -404,6 +474,13 @@ int main(int argc, char **argv) {
     if (!receipt || !invalid) return 2;
     snprintf(receipt, receipt_size, "%s.qualification.json", model);
     invalid[0] = '\0';
+    if (shadow_only && !receipt_preflight(receipt)) {
+        int published = write_shadow_preflight_failure(output);
+        if (!published)
+            fprintf(stderr, "h3_ane_qualification: receipt/preflight_failed\n");
+        free(receipt); free(invalid); return 2;
+    }
+    if (shadow_only) pause_after_preflight_if_requested();
     sigset_t invalidation_signals, previous_signals;
     sigemptyset(&invalidation_signals);
     sigaddset(&invalidation_signals, SIGINT);
