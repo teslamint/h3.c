@@ -1,6 +1,6 @@
 ---
 title: ANE Eligibility and Qualification Diagnostics
-status: draft
+status: approved
 date: 2026-08-12
 schema: spec/v1
 ---
