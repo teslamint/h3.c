@@ -335,6 +335,27 @@ class NativeToolTests(unittest.TestCase):
             self.assertNotIn(str(root), result.stderr)
             self.assertFalse(receipt.exists())
 
+    def test_prehandle_private_path_is_redacted(self):
+        with tempfile.TemporaryDirectory(prefix="private-sentinel-") as root:
+            root = Path(root)
+            model = root / "model.mlmodelc"
+            model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            output = root / "result.json"
+            result = subprocess.run(
+                [str(ROOT / "h3_ane_qualification_test"), "--model",
+                 str(root / "PRIVATE-SENTINEL-WEIGHTS"), "--coreml-model",
+                 str(model), "--output", str(output)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            document = json.loads(output.read_text())
+            encoded = json.dumps(document)
+            self.assertEqual(document["failure_stage"], "artifact")
+            self.assertEqual(document["failure_code"], "source_weights_unreadable")
+            self.assertNotIn("PRIVATE-SENTINEL", encoded)
+            self.assertNotIn(str(root), encoded)
+
     def test_receipt_is_final_commit_point_under_post_receipt_signal(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

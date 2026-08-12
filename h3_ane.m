@@ -760,6 +760,17 @@ static h3_ane *create_impl(const char *model_path,
     }
     if (!shadow) {
         char digest[65];
+        struct stat model_status;
+        if (lstat(model_path, &model_status) != 0 ||
+            !S_ISDIR(model_status.st_mode)) {
+            record_first(ane, H3_ANE_STAGE_ARTIFACT,
+                         H3_ANE_CODE_COMPILED_MODEL_UNREADABLE,
+                         H3_ANE_REASON_FINGERPRINT,
+                         "compiled model is unreadable");
+            mark_unavailable(ane, H3_ANE_REASON_FINGERPRINT, error, error_size,
+                             "compiled ANE model is unreadable");
+            return ane;
+        }
         if (!h3_ane_sha256_directory(model_path, digest, error, error_size)) {
             record_first(ane, H3_ANE_STAGE_ARTIFACT,
                          H3_ANE_CODE_COMPILED_MODEL_DIGEST_FAILED,
@@ -803,6 +814,15 @@ static h3_ane *create_impl(const char *model_path,
                          "source fingerprint does not match");
             mark_unavailable(ane, H3_ANE_REASON_FINGERPRINT, error, error_size,
                              "ANE source fingerprint does not match");
+            return ane;
+        }
+        if (strcmp(receipt.model_sha256, digest) != 0) {
+            record_first(ane, H3_ANE_STAGE_RECEIPT,
+                         H3_ANE_CODE_RECEIPT_DIGEST_MISMATCH,
+                         H3_ANE_REASON_RECEIPT,
+                         "receipt model digest does not match");
+            mark_unavailable(ane, H3_ANE_REASON_RECEIPT, error, error_size,
+                             "ANE qualification receipt digest does not match");
             return ane;
         }
         if (!h3_ane_receipt_validate(contract, &receipt, digest, error,
@@ -902,10 +922,14 @@ static h3_ane *create_impl(const char *model_path,
             snprintf(diagnostic->operation, sizeof(diagnostic->operation), "%s",
                      usage->name);
             diagnostic->has_operation = 1;
-            diagnostic->supported_devices = usage->supported_devices;
-            diagnostic->has_supported_devices = 1;
-            diagnostic->preferred_device = usage->preferred_device;
-            diagnostic->has_preferred_device = 1;
+            if (usage->supported_devices) {
+                diagnostic->supported_devices = usage->supported_devices;
+                diagnostic->has_supported_devices = 1;
+            }
+            if (usage->preferred_device) {
+                diagnostic->preferred_device = usage->preferred_device;
+                diagnostic->has_preferred_device = 1;
+            }
             mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
                              "Core ML operation device usage is unknown");
             return ane;

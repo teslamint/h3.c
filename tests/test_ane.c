@@ -587,6 +587,33 @@ static void test_complete_diagnostic_taxonomy(void) {
             "invalid diagnostic code received a name");
 }
 
+static void test_diagnostic_code_snapshots(void) {
+    static const struct {
+        h3_ane_stage stage;
+        h3_ane_code code;
+        h3_ane_reason reason;
+    } cases[] = {
+        {H3_ANE_STAGE_SETUP, H3_ANE_CODE_DISABLED, H3_ANE_REASON_DISABLED},
+        {H3_ANE_STAGE_ARTIFACT, H3_ANE_CODE_COMPILED_MODEL_UNREADABLE, H3_ANE_REASON_FINGERPRINT},
+        {H3_ANE_STAGE_CONTRACT, H3_ANE_CODE_INPUT_DTYPE_MISMATCH, H3_ANE_REASON_DTYPE},
+        {H3_ANE_STAGE_RECEIPT, H3_ANE_CODE_RECEIPT_DIGEST_MISMATCH, H3_ANE_REASON_RECEIPT},
+        {H3_ANE_STAGE_ELIGIBILITY, H3_ANE_CODE_OPERATION_USAGE_UNKNOWN, H3_ANE_REASON_ELIGIBILITY},
+        {H3_ANE_STAGE_OUTPUT, H3_ANE_CODE_OUTPUT_COPY_FAILED, H3_ANE_REASON_SHAPE},
+        {H3_ANE_STAGE_PUBLICATION, H3_ANE_CODE_RESULT_WRITE_FAILED, H3_ANE_REASON_RECEIPT},
+    };
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        h3_ane_diagnostic diagnostic = {0};
+        h3_ane_diagnostic_record_first(&diagnostic, cases[index].stage,
+                                       cases[index].code, cases[index].reason,
+                                       "stable fixture failure");
+        require(diagnostic.stage == cases[index].stage &&
+                    diagnostic.code == cases[index].code &&
+                    h3_ane_stage_name(diagnostic.stage) != NULL &&
+                    h3_ane_code_name(diagnostic.code) != NULL,
+                "diagnostic fixture did not snapshot exact taxonomy");
+    }
+}
+
 static size_t capture_create_diagnostic(const char *model_path,
                                         const h3_ane_contract *contract,
                                         int authorized, char output[512]) {
@@ -1269,6 +1296,7 @@ int main(void) {
     test_multiarray_stride_copy();
     test_first_diagnostic_is_immutable();
     test_complete_diagnostic_taxonomy();
+    test_diagnostic_code_snapshots();
     test_runtime_bridge(root);
     test_dispatch_fallback(root);
     test_video_encoder_ane_surface();

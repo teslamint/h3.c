@@ -932,21 +932,46 @@ int h3_video_encoder_block0_qualification(
     char *error, size_t error_size) {
     const size_t expected = (size_t)1 * 1 * 256 * 256 * 128;
     if (error && error_size) error[0] = '\0';
+    if (diagnostic) memset(diagnostic, 0, sizeof(*diagnostic));
     if (!weight_directory || !*weight_directory || !model_path ||
         !*model_path || !input || !metal_output || !coreml_output ||
         input_count != expected || output_count != expected) {
+        h3_ane_diagnostic_record_first(
+            diagnostic, H3_ANE_STAGE_INPUT, H3_ANE_CODE_INPUT_SHAPE_MISMATCH,
+            H3_ANE_REASON_SHAPE, "qualification input contract is invalid");
         fail(error, error_size, "invalid block-0 qualification arguments");
         return 0;
     }
     encoder_context encoder = {0};
     encoder.gpu = h3_gpu_create("h3_shaders.metal", error, error_size);
+    if (!encoder.gpu)
+        h3_ane_diagnostic_record_first(
+            diagnostic, H3_ANE_STAGE_SETUP, H3_ANE_CODE_ALLOCATION_FAILED,
+            H3_ANE_REASON_LOAD, "Metal qualification setup failed");
     if (encoder.gpu)
         encoder.store = h3_weight_store_open(weight_directory, error,
                                              error_size);
-    int ok = encoder.gpu && encoder.store &&
-             load_weights(&encoder, error, error_size);
+    if (encoder.gpu && !encoder.store)
+        h3_ane_diagnostic_record_first(
+            diagnostic, H3_ANE_STAGE_ARTIFACT,
+            H3_ANE_CODE_SOURCE_WEIGHTS_UNREADABLE,
+            H3_ANE_REASON_FINGERPRINT, "source weights are unreadable");
+    int ok = encoder.gpu && encoder.store;
+    if (ok && !load_weights(&encoder, error, error_size)) {
+        h3_ane_diagnostic_record_first(
+            diagnostic, H3_ANE_STAGE_ARTIFACT,
+            H3_ANE_CODE_SOURCE_WEIGHTS_UNREADABLE,
+            H3_ANE_REASON_FINGERPRINT, "source weights are incompatible");
+        ok = 0;
+    }
     h3_ane_contract contract;
-    if (ok) ok = block0_contract(encoder.store, &contract, error, error_size);
+    if (ok && !block0_contract(encoder.store, &contract, error, error_size)) {
+        h3_ane_diagnostic_record_first(
+            diagnostic, H3_ANE_STAGE_ARTIFACT,
+            H3_ANE_CODE_SOURCE_TENSOR_DIGEST_FAILED,
+            H3_ANE_REASON_FINGERPRINT, "source tensor digest failed");
+        ok = 0;
+    }
     if (ok) encoder.ane = h3_ane_create_authorized(
         model_path, &contract, 1, error, error_size);
     if (ok && !encoder.ane) ok = 0;
@@ -958,6 +983,9 @@ int h3_video_encoder_block0_qualification(
                           1, 256, 256, 128, 128, error, error_size);
         ok = metal && h3_gpu_tensor_read_f32(metal, metal_output, output_count);
     } else if (ok) {
+        h3_ane_diagnostic_record_first(
+            diagnostic, H3_ANE_STAGE_SETUP, H3_ANE_CODE_ALLOCATION_FAILED,
+            H3_ANE_REASON_LOAD, "qualification input allocation failed");
         fail(error, error_size, "cannot allocate qualification input");
         ok = 0;
     }
