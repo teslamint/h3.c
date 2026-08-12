@@ -686,7 +686,7 @@ def execute(args):
                 code=failed.get("failure_code"), parity=parity,
                 stages={**stages, "qualification": 1},
                 artifacts=artifacts,
-                diagnostic=diagnostic if args.mode == "shadow" else None,
+                diagnostic=diagnostic,
                 measurement_started=measurement_started,
                 authority_state=authority_state)
         stages["qualification"] = 0
