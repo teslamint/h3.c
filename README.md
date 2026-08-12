@@ -397,20 +397,21 @@ are collected under `docs/solutions/`.
 
 The Apple Neural Engine (ANE) path is an **experimental, default-off measurement
 harness** for one fixed FL2VA visual-encoder block. Normal builds and runs remain
-Metal-only. Setting `H3_ANE_MODEL` opts a supported macOS 14.4 or newer process
-into the experiment; `H3_ANE_SHADOW=1` keeps Metal output authoritative while
-measuring Core ML, and `H3_ANE_TRACE=1` prints compute-plan diagnostics.
+Metal-only. The current artifact passes production compute-plan eligibility with
+441 total operations, 149 nonconstant operations, all 149 Neural
+Engine-supported, and no CPU-only or unknown nonconstant operations.
 
-This checkout has converted and compiled the real block successfully, but real
-qualification failed closed with `ANE backend is unavailable`. No passing
-qualification receipt exists, so there is currently no verified ANE execution,
-placement, or acceleration claim. Build success and Core ML compute-plan
-eligibility are harness-readiness evidence only.
+Strict qualification still fails closed: `max_abs` is
+`0.19216197729110718` against `< 0.002`, relative L2 is
+`0.038400878187031535` against `< 0.02`, and no receipt exists. The approved
+shadow-only measurement profile passes its wider `0.25 / 0.05` exploratory
+bounds, but reports `authority: false`, keeps `receipt: null`, discards Core ML
+output, and always returns Metal output. This is not production parity or
+observed ANE execution. Placement, latency, memory, and energy remain unverified.
 
-See [Experimental ANE acceleration](docs/ane-acceleration.md) for the pinned
-conversion environment, artifact contract, qualification and fallback rules,
-benchmark commands, and the independent parity, placement, latency, process
-memory, and energy evidence gates.
+See [Experimental ANE eligibility and shadow measurement](docs/ane-acceleration.md)
+for structured diagnostics, pinned one-command integration targets, strict and
+shadow authority rules, and independent placement/performance gates.
 
 FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 (`H3_FFMPEG` and `H3_FFPROBE` may select explicit executables). Generated RGB24 and
