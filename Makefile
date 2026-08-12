@@ -7,6 +7,11 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
 	-framework Accelerate -framework CoreML
 LDLIBS := $(FRAMEWORKS) -licucore -lm
+ANE_UV_CACHE ?= /private/tmp/uv-cache
+ANE_INTEGRATION_WORK ?= /private/tmp/h3-ane-integration
+ANE_INTEGRATION_OUTPUT ?= .release-loop/evidence/ane-integration.json
+ANE_PINNED_RUN := UV_CACHE_DIR=$(ANE_UV_CACHE) uv run --python 3.12 \
+	--with coremltools==9.0 --with numpy==2.3.2 --with safetensors==0.6.2
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 	h3_dit_schedule.c h3_dit.c h3_ane_receipt.c h3_ane_dispatch.c
@@ -17,7 +22,8 @@ LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m h3_ane.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
-.PHONY: all test parity real-parity h3_ane_tool_tests clean
+.PHONY: all test parity real-parity h3_ane_tool_tests \
+	h3_ane_integration_test h3_ane_real_qualification_test clean
 
 all: h3 libh3.a
 
@@ -52,6 +58,22 @@ h3_ane_tests: tests/test_ane.o \
 
 h3_ane_qualification: tests/qualify_ane.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_integration_probe: tests/ane_integration_probe.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_integration_test: h3_ane_integration_probe h3_ane_qualification
+	$(ANE_PINNED_RUN) scripts/run_ane_integration.py synthetic --repo "$(CURDIR)" \
+		--work-dir "$(ANE_INTEGRATION_WORK)" --output "$(ANE_INTEGRATION_OUTPUT)"
+
+h3_ane_real_qualification_test: h3_ane_integration_probe h3_ane_qualification
+	@if test -z "$(H3_ANE_WEIGHT_DIR)"; then \
+		echo "H3_ANE_WEIGHT_DIR is required for h3_ane_real_qualification_test" >&2; \
+		exit 2; \
+	fi
+	$(ANE_PINNED_RUN) scripts/run_ane_integration.py real --repo "$(CURDIR)" \
+		--work-dir "$(ANE_INTEGRATION_WORK)" --output "$(ANE_INTEGRATION_OUTPUT)" \
+		--weights "$(H3_ANE_WEIGHT_DIR)"
 
 h3_ane_bench: tests/bench_ane.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
@@ -239,7 +261,7 @@ clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_ane_tests \
-		h3_ane_qualification h3_ane_bench \
+		h3_ane_qualification h3_ane_integration_probe h3_ane_bench \
 		h3_ane_qualification_test h3_ane_bench_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \

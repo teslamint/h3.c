@@ -5,6 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 import os
+import signal
+import sys
+import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -391,6 +394,365 @@ class AnalyzerTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)["claim_passed"])
+
+
+class IntegrationCoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        self.coordinator = load_script("run_ane_integration.py")
+
+    def write_tool(self, path, body):
+        path.write_text("#!/usr/bin/env python3\n" + body)
+        path.chmod(0o755)
+
+    def fixture_tools(self, root, inventory=None):
+        converter = root / "converter.py"
+        probe = root / "probe.py"
+        qualifier = root / "qualifier.py"
+        inventory = inventory or {
+            "total": 441, "constant": 292, "nonconstant": 149,
+            "neural_engine_supported": 149, "cpu_only": 0, "gpu_only": 0,
+            "unknown_nonconstant": 0, "constant_nil_usage": 0,
+        }
+        self.write_tool(converter, """
+import json, pathlib, sys
+pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).mkdir()
+pathlib.Path(sys.argv[sys.argv.index('--compile-output') + 1]).mkdir()
+print(json.dumps({'source_sha256': 'a' * 64}))
+""")
+        self.write_tool(probe, f"""
+import json, pathlib, sys
+pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({{
+    'status': 'passed', 'model_sha256': 'b' * 64,
+    'source_sha256': 'a' * 64,
+    'inventory': {inventory!r}, 'diagnostic': None}}))
+""")
+        self.write_tool(qualifier, """
+import json, pathlib, sys
+model = pathlib.Path(sys.argv[sys.argv.index('--coreml-model') + 1])
+output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
+document = {'status': 'passed', 'model_sha256': 'b' * 64,
+            'source_sha256': 'a' * 64, 'max_abs': 0.001, 'relative_l2': 0.01}
+output.write_text(json.dumps(document))
+receipt = dict(document, version=1, test_vector='xorshift32-v1',
+               qualified_at='2026-08-12T00:00:00Z')
+pathlib.Path(str(model) + '.qualification.json').write_text(json.dumps(receipt))
+""")
+        return converter, probe, qualifier
+
+    def run_real(self, root, tools):
+        converter, probe, qualifier = tools
+        output = root / "summary.json"
+        env = os.environ.copy()
+        env.update({"H3_ANE_INTEGRATION_CONVERTER": str(converter),
+                    "H3_ANE_INTEGRATION_PROBE": str(probe),
+                    "H3_ANE_INTEGRATION_QUALIFIER": str(qualifier)})
+        weights = root / "weights"; weights.mkdir(exist_ok=True)
+        command = [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                   "real", "--repo", str(ROOT), "--work-dir", str(root / "work"),
+                   "--output", str(output), "--weights", str(weights)]
+        return subprocess.run(command, env=env, text=True, capture_output=True,
+                              check=False), output, env, command
+
+    def test_exact_synthetic_fixture_contract_has_only_eight_pinned_tensors(self):
+        self.assertEqual(len(self.coordinator.TENSOR_SHAPES), 8)
+        self.assertEqual(self.coordinator.TENSOR_SHAPES[
+            "encoder.down.0.block.0.conv1.weight"], (128, 128, 3, 3, 3))
+
+    def test_child_capture_is_bounded_while_pipes_are_drained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tool = Path(directory) / "noisy.py"
+            self.write_tool(
+                tool, "import sys\nsys.stdout.write('x' * 70000 + 'tail')\n")
+            output = self.coordinator.run_command(
+                [sys.executable, str(tool)], "noisy")
+            self.assertLessEqual(len(output.encode()), self.coordinator.CAPTURE_LIMIT)
+            self.assertTrue(output.endswith("tail"))
+
+    def test_real_success_is_sanitized_and_rerunnable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            result, output, _, _ = self.run_real(root, tools)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            document = json.loads(output.read_text())
+            self.assertEqual(document["schema"], "h3-ane-integration/v1")
+            self.assertEqual(document["inventory"]["total"], 441)
+            self.assertEqual(document["receipt"]["status"], "passed")
+            self.assertEqual(document["artifacts"]["model_sha256"], "b" * 64)
+            self.assertEqual(document["artifacts"]["source_sha256"], "a" * 64)
+            self.assertEqual(document["stages"], {
+                "conversion": 0, "probe": 0, "qualification": 0})
+            result, _, _, _ = self.run_real(root, tools)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(list(root.glob(".summary.json.tmp-*")))
+
+    def test_failure_is_bounded_sanitized_and_has_no_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root, dict(total=441, constant=292,
+                nonconstant=149, neural_engine_supported=148, cpu_only=1,
+                gpu_only=0, unknown_nonconstant=0, constant_nil_usage=0))
+            result, output, _, _ = self.run_real(root, tools)
+            self.assertEqual(result.returncode, 1)
+            document = json.loads(output.read_text())
+            self.assertEqual(document["diagnostic"]["stage"], "eligibility")
+            self.assertIsNone(document["receipt"])
+            self.assertLessEqual(len(document["diagnostic"]["message"]), 160)
+            self.assertNotIn(str(root), output.read_text())
+
+    def test_child_failure_is_stable_and_does_not_publish_private_stderr(self):
+        with tempfile.TemporaryDirectory(prefix="private-integration-") as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            self.write_tool(
+                tools[0],
+                "import pathlib, sys\n"
+                "print('failed at ' + str(pathlib.Path.cwd()), file=sys.stderr)\n"
+                "raise SystemExit(7)\n")
+            result, output, _, _ = self.run_real(root, tools)
+            self.assertEqual(result.returncode, 1)
+            document = json.loads(output.read_text())
+            self.assertEqual(document["diagnostic"], {
+                "stage": "conversion", "code": "child_exit_7",
+                "message": "conversion child failed"})
+            self.assertEqual(document["stages"], {"conversion": 7})
+            self.assertNotIn(str(root), output.read_text())
+
+    def test_real_parity_failure_keeps_inventory_and_publishes_no_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            self.write_tool(tools[2], """
+import json, pathlib, sys
+output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
+output.write_text(json.dumps({
+    'status': 'failed', 'failure_stage': 'parity',
+    'failure_code': 'parity_bounds_failed',
+    'failure_reason': 'parity qualification failed',
+    'max_abs': 0.19, 'relative_l2': 0.038}))
+raise SystemExit(1)
+""")
+            result, output, _, _ = self.run_real(root, tools)
+            self.assertEqual(result.returncode, 1)
+            document = json.loads(output.read_text())
+            self.assertEqual(document["diagnostic"]["stage"], "parity")
+            self.assertEqual(document["diagnostic"]["code"],
+                             "parity_bounds_failed")
+            self.assertEqual(document["inventory"]["total"], 441)
+            self.assertEqual(document["stages"]["qualification"], 1)
+            self.assertIsNone(document["receipt"])
+
+    def test_probe_failure_preserves_exact_production_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            self.write_tool(tools[1], """
+import json, pathlib, sys
+pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({
+    'status': 'failed', 'model_sha256': 'b' * 64,
+    'source_sha256': 'a' * 64, 'inventory': {'total': 0},
+    'diagnostic': {'stage': 'contract', 'code': 'metadata_missing',
+                   'message': 'Core ML metadata is missing'}}))
+raise SystemExit(1)
+""")
+            result, output, _, _ = self.run_real(root, tools)
+            self.assertEqual(result.returncode, 1)
+            document = json.loads(output.read_text())
+            self.assertEqual(document["diagnostic"], {
+                "stage": "contract", "code": "metadata_missing",
+                "message": "Core ML metadata is missing"})
+            self.assertEqual(document["stages"], {"conversion": 0, "probe": 1})
+
+    def test_cross_stage_digest_mismatch_cannot_publish_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            self.write_tool(tools[1], """
+import json, pathlib, sys
+pathlib.Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps({
+    'status': 'passed', 'model_sha256': 'c' * 64,
+    'source_sha256': 'd' * 64, 'inventory': {
+        'total': 441, 'constant': 292, 'nonconstant': 149,
+        'neural_engine_supported': 149, 'cpu_only': 0, 'gpu_only': 0,
+        'unknown_nonconstant': 0, 'constant_nil_usage': 0},
+    'diagnostic': None}))
+""")
+            result, output, _, _ = self.run_real(root, tools)
+            self.assertEqual(result.returncode, 1)
+            document = json.loads(output.read_text())
+            self.assertEqual(document["diagnostic"]["stage"], "artifact")
+            self.assertEqual(document["diagnostic"]["code"], "digest_mismatch")
+            self.assertIsNone(document["receipt"])
+            work = root / "work"
+            self.assertFalse((work / "qualification.json").exists())
+            self.assertFalse(Path(
+                f"{work / 'visual-block.mlmodelc'}.qualification.json").exists())
+
+    def test_refuses_existing_unowned_work_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            work = root / "work"; work.mkdir()
+            sentinel = work / "unrelated"; sentinel.write_text("preserve")
+            result, output, _, _ = self.run_real(root, tools)
+            self.assertEqual(result.returncode, 1)
+            self.assertTrue(sentinel.exists())
+            document = json.loads(output.read_text())
+            self.assertEqual(document["diagnostic"]["stage"], "setup")
+            self.assertEqual(document["diagnostic"]["code"],
+                             "unsafe_work_directory")
+
+    def test_summary_publication_failure_removes_result_and_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            output = root / "output-directory"; output.mkdir()
+            env = os.environ.copy()
+            env.update({"H3_ANE_INTEGRATION_CONVERTER": str(tools[0]),
+                        "H3_ANE_INTEGRATION_PROBE": str(tools[1]),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(tools[2])})
+            weights = root / "weights"; weights.mkdir()
+            work = root / "work"
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                 "real", "--repo", str(ROOT), "--work-dir", str(work),
+                 "--output", str(output), "--weights", str(weights)],
+                env=env, text=True, capture_output=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((work / "qualification.json").exists())
+            self.assertFalse(Path(
+                f"{work / 'visual-block.mlmodelc'}.qualification.json").exists())
+
+    def test_sigterm_cleans_summary_temp_and_leaves_no_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            self.write_tool(tools[0], "import time\ntime.sleep(30)\n")
+            output = root / "summary.json"
+            weights = root / "weights"; weights.mkdir()
+            env = os.environ.copy()
+            env.update({"H3_ANE_INTEGRATION_CONVERTER": str(tools[0]),
+                        "H3_ANE_INTEGRATION_PROBE": str(tools[1]),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(tools[2])})
+            command = [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                       "real", "--repo", str(ROOT),
+                       "--work-dir", str(root / "work"), "--output", str(output),
+                       "--weights", str(weights)]
+            process = subprocess.Popen(command, env=env)
+            time.sleep(0.2)
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)
+            self.assertEqual(process.returncode, 143)
+            self.assertFalse(output.exists())
+            self.assertFalse(list(root.glob(".summary.json.tmp-*")))
+
+    def test_sigterm_after_qualifier_receipt_removes_uncommitted_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            ready = root / "receipt-ready"
+            self.write_tool(tools[2], f"""
+import pathlib, sys, time
+model = pathlib.Path(sys.argv[sys.argv.index('--coreml-model') + 1])
+pathlib.Path(str(model) + '.qualification.json').write_text('{{}}')
+pathlib.Path({str(ready)!r}).write_text('ready')
+time.sleep(30)
+""")
+            output = root / "summary.json"
+            env = os.environ.copy()
+            env.update({"H3_ANE_INTEGRATION_CONVERTER": str(tools[0]),
+                        "H3_ANE_INTEGRATION_PROBE": str(tools[1]),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(tools[2])})
+            weights = root / "weights"; weights.mkdir()
+            work = root / "work"
+            process = subprocess.Popen(
+                [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                 "real", "--repo", str(ROOT), "--work-dir", str(work),
+                 "--output", str(output), "--weights", str(weights)], env=env)
+            for _ in range(100):
+                if ready.exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(ready.exists())
+            receipt = Path(f"{work / 'visual-block.mlmodelc'}.qualification.json")
+            self.assertTrue(receipt.exists())
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)
+            self.assertEqual(process.returncode, 143)
+            self.assertFalse(receipt.exists())
+            self.assertFalse(output.exists())
+
+    def test_sigterm_waits_for_child_handler_before_authority_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            ready = root / "qualifier-ready"
+            self.write_tool(tools[2], f"""
+import pathlib, signal, sys, time
+model = pathlib.Path(sys.argv[sys.argv.index('--coreml-model') + 1])
+receipt = pathlib.Path(str(model) + '.qualification.json')
+def cancelled(*_):
+    receipt.write_text('{{}}')
+    raise SystemExit(143)
+signal.signal(signal.SIGTERM, cancelled)
+pathlib.Path({str(ready)!r}).write_text('ready')
+time.sleep(30)
+""")
+            output = root / "summary.json"
+            env = os.environ.copy()
+            env.update({"H3_ANE_INTEGRATION_CONVERTER": str(tools[0]),
+                        "H3_ANE_INTEGRATION_PROBE": str(tools[1]),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(tools[2])})
+            weights = root / "weights"; weights.mkdir()
+            work = root / "work"
+            process = subprocess.Popen(
+                [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                 "real", "--repo", str(ROOT), "--work-dir", str(work),
+                 "--output", str(output), "--weights", str(weights)], env=env)
+            for _ in range(100):
+                if ready.exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(ready.exists())
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)
+            receipt = Path(f"{work / 'visual-block.mlmodelc'}.qualification.json")
+            self.assertEqual(process.returncode, 143)
+            self.assertFalse(receipt.exists())
+            self.assertFalse(output.exists())
+
+    def test_sigterm_kills_uncooperative_child_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = self.fixture_tools(root)
+            ready = root / "converter-ready"
+            self.write_tool(tools[0], f"""
+import pathlib, signal, time
+signal.signal(signal.SIGTERM, lambda *_: None)
+pathlib.Path({str(ready)!r}).write_text('ready')
+time.sleep(30)
+""")
+            output = root / "summary.json"
+            env = os.environ.copy()
+            env.update({"H3_ANE_INTEGRATION_CONVERTER": str(tools[0]),
+                        "H3_ANE_INTEGRATION_PROBE": str(tools[1]),
+                        "H3_ANE_INTEGRATION_QUALIFIER": str(tools[2])})
+            weights = root / "weights"; weights.mkdir()
+            process = subprocess.Popen(
+                [sys.executable, str(ROOT / "scripts/run_ane_integration.py"),
+                 "real", "--repo", str(ROOT), "--work-dir", str(root / "work"),
+                 "--output", str(output), "--weights", str(weights)], env=env)
+            for _ in range(100):
+                if ready.exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(ready.exists())
+            started = time.monotonic()
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)
+            self.assertLess(time.monotonic() - started, 4.0)
+            self.assertEqual(process.returncode, 143)
+            self.assertFalse(output.exists())
 
 
 class NativeToolTests(unittest.TestCase):
