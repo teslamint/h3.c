@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 enum { H3_ANE_MAX_OPERATIONS = 256 };
@@ -97,6 +98,39 @@ void h3_ane_diagnostic_merge_first(h3_ane_diagnostic *destination,
     if (!destination || destination->code != H3_ANE_CODE_NONE || !source ||
         source->code == H3_ANE_CODE_NONE) return;
     *destination = *source;
+}
+
+const char *h3_ane_stage_name(h3_ane_stage stage) {
+    static const char *const names[] = {
+        "none", "setup", "artifact", "contract", "receipt", "load",
+        "compute_plan", "eligibility", "input", "prediction", "output",
+        "parity", "publication",
+    };
+    return stage >= H3_ANE_STAGE_NONE && stage <= H3_ANE_STAGE_PUBLICATION ?
+        names[stage] : NULL;
+}
+
+const char *h3_ane_code_name(h3_ane_code code) {
+    static const char *const names[] = {
+        "none", "disabled", "os_unsupported", "allocation_failed",
+        "compiled_model_unreadable", "compiled_model_digest_failed",
+        "source_weights_unreadable", "source_tensor_digest_failed",
+        "metadata_missing", "metadata_mismatch", "fingerprint_mismatch",
+        "shape_mismatch", "dtype_mismatch", "receipt_missing",
+        "receipt_malformed", "receipt_digest_mismatch", "receipt_invalid",
+        "model_load_failed", "model_load_exception", "plan_timeout",
+        "plan_load_failed", "program_missing", "main_missing",
+        "operation_inventory_empty", "operation_inventory_limit_exceeded",
+        "operation_nesting_limit_exceeded", "operation_inventory_changed",
+        "operation_usage_unknown", "operation_not_neural_engine_supported",
+        "device_unknown", "input_shape_mismatch", "input_dtype_mismatch",
+        "input_copy_failed", "prediction_failed", "prediction_exception",
+        "output_shape_mismatch", "output_dtype_mismatch", "output_copy_failed",
+        "output_nonfinite", "parity_metrics_nonfinite", "parity_bounds_failed",
+        "result_write_failed", "receipt_write_failed",
+    };
+    return code >= H3_ANE_CODE_NONE && code <= H3_ANE_CODE_RECEIPT_WRITE_FAILED ?
+        names[code] : NULL;
 }
 
 static void record_first(h3_ane *ane, h3_ane_stage stage, h3_ane_code code,
@@ -376,24 +410,40 @@ static int real_load(void *opaque, h3_ane_diagnostic *diagnostic) {
             model.modelDescription.inputDescriptionsByName;
         NSDictionary<NSString *, MLFeatureDescription *> *outputs =
             model.modelDescription.outputDescriptionsByName;
-        if (inputs.count != 1 || outputs.count != 1)
+        if (inputs.count != 1 || outputs.count != 1) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_CONTRACT,
+                H3_ANE_CODE_SHAPE_MISMATCH, H3_ANE_REASON_SHAPE,
+                "Core ML boundary feature count is incompatible");
             return -(int)H3_ANE_REASON_SHAPE;
+        }
         NSString *inputName = inputs.allKeys.firstObject;
         NSString *outputName = outputs.allKeys.firstObject;
         MLFeatureDescription *input = inputs[inputName];
         MLFeatureDescription *output = outputs[outputName];
         if (input.type != MLFeatureTypeMultiArray ||
-            output.type != MLFeatureTypeMultiArray)
+            output.type != MLFeatureTypeMultiArray) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_CONTRACT,
+                H3_ANE_CODE_DTYPE_MISMATCH, H3_ANE_REASON_DTYPE,
+                "Core ML boundary dtype is incompatible");
             return -(int)H3_ANE_REASON_DTYPE;
+        }
         MLMultiArrayConstraint *inputConstraint = input.multiArrayConstraint;
         MLMultiArrayConstraint *outputConstraint = output.multiArrayConstraint;
         if (inputConstraint.dataType != MLMultiArrayDataTypeFloat32 ||
-            outputConstraint.dataType != MLMultiArrayDataTypeFloat32)
+            outputConstraint.dataType != MLMultiArrayDataTypeFloat32) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_CONTRACT,
+                H3_ANE_CODE_DTYPE_MISMATCH, H3_ANE_REASON_DTYPE,
+                "Core ML boundary dtype is incompatible");
             return -(int)H3_ANE_REASON_DTYPE;
+        }
         NSArray<NSNumber *> *shape = @[@1, @1, @256, @256, @128];
         if (![inputConstraint.shape isEqualToArray:shape] ||
-            ![outputConstraint.shape isEqualToArray:shape])
+            ![outputConstraint.shape isEqualToArray:shape]) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_CONTRACT,
+                H3_ANE_CODE_SHAPE_MISMATCH, H3_ANE_REASON_SHAPE,
+                "Core ML boundary shape is incompatible");
             return -(int)H3_ANE_REASON_SHAPE;
+        }
         backend.model = model;
         backend.inputName = inputName;
         backend.outputName = outputName;
@@ -508,22 +558,40 @@ static int real_predict(void *opaque, const float *input, size_t input_count,
         double start = monotonic_seconds();
         MLMultiArray *inputArray = [[MLMultiArray alloc]
             initWithShape:shape dataType:MLMultiArrayDataTypeFloat32 error:&error];
-        if (!inputArray || error || (size_t)inputArray.count != input_count)
+        if (!inputArray || error || (size_t)inputArray.count != input_count) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_INPUT,
+                H3_ANE_CODE_INPUT_SHAPE_MISMATCH, H3_ANE_REASON_SHAPE,
+                "Core ML input shape is incompatible");
             return -(int)H3_ANE_REASON_SHAPE;
+        }
         ptrdiff_t inputStrides[5];
-        if (inputArray.strides.count != 5) return -(int)H3_ANE_REASON_SHAPE;
+        if (inputArray.strides.count != 5) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_INPUT,
+                H3_ANE_CODE_INPUT_SHAPE_MISMATCH, H3_ANE_REASON_SHAPE,
+                "Core ML input shape is incompatible");
+            return -(int)H3_ANE_REASON_SHAPE;
+        }
         for (size_t index = 0; index < 5; index++)
             inputStrides[index] = inputArray.strides[index].longLongValue;
         const uint32_t dimensions[5] = {1, 1, 256, 256, 128};
         if (!copy_to_strided(inputArray.dataPointer, inputStrides, dimensions,
-                             input))
+                             input)) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_INPUT,
+                H3_ANE_CODE_INPUT_COPY_FAILED, H3_ANE_REASON_SHAPE,
+                "Core ML input copy failed");
             return -(int)H3_ANE_REASON_SHAPE;
+        }
         MLDictionaryFeatureProvider *provider = [[MLDictionaryFeatureProvider alloc]
             initWithDictionary:@{backend.inputName:
                                      [MLFeatureValue featureValueWithMultiArray:
                                                          inputArray]}
                            error:&error];
-        if (!provider || error) return 0;
+        if (!provider || error) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_INPUT,
+                H3_ANE_CODE_INPUT_COPY_FAILED, H3_ANE_REASON_PREDICTION,
+                "Core ML input provider creation failed");
+            return 0;
+        }
         backend.inputSeconds = monotonic_seconds() - start;
         start = monotonic_seconds();
         id<MLFeatureProvider> prediction =
@@ -538,21 +606,47 @@ static int real_predict(void *opaque, const float *input, size_t input_count,
         start = monotonic_seconds();
         MLFeatureValue *value = [prediction featureValueForName:backend.outputName];
         MLMultiArray *array = value.multiArrayValue;
-        if (!array || array.dataType != MLMultiArrayDataTypeFloat32)
+        if (!array) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_OUTPUT,
+                H3_ANE_CODE_OUTPUT_COPY_FAILED, H3_ANE_REASON_SHAPE,
+                "Core ML output is missing");
+            return -(int)H3_ANE_REASON_SHAPE;
+        }
+        if (array.dataType != MLMultiArrayDataTypeFloat32) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_OUTPUT,
+                H3_ANE_CODE_OUTPUT_DTYPE_MISMATCH, H3_ANE_REASON_DTYPE,
+                "Core ML output dtype is incompatible");
             return -(int)H3_ANE_REASON_DTYPE;
-        if ((size_t)array.count != output_count)
+        }
+        if ((size_t)array.count != output_count) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_OUTPUT,
+                H3_ANE_CODE_OUTPUT_SHAPE_MISMATCH, H3_ANE_REASON_SHAPE,
+                "Core ML output shape is incompatible");
             return -(int)H3_ANE_REASON_SHAPE;
+        }
         ptrdiff_t outputStrides[5];
-        if (array.shape.count != 5 || array.strides.count != 5)
+        if (array.shape.count != 5 || array.strides.count != 5) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_OUTPUT,
+                H3_ANE_CODE_OUTPUT_SHAPE_MISMATCH, H3_ANE_REASON_SHAPE,
+                "Core ML output shape is incompatible");
             return -(int)H3_ANE_REASON_SHAPE;
+        }
         for (size_t index = 0; index < 5; index++) {
-            if (array.shape[index].unsignedLongLongValue != dimensions[index])
+            if (array.shape[index].unsignedLongLongValue != dimensions[index]) {
+                h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_OUTPUT,
+                    H3_ANE_CODE_OUTPUT_SHAPE_MISMATCH, H3_ANE_REASON_SHAPE,
+                    "Core ML output shape is incompatible");
                 return -(int)H3_ANE_REASON_SHAPE;
+            }
             outputStrides[index] = array.strides[index].longLongValue;
         }
         if (!copy_from_strided(output, array.dataPointer, outputStrides,
-                               dimensions))
+                               dimensions)) {
+            h3_ane_diagnostic_record_first(diagnostic, H3_ANE_STAGE_OUTPUT,
+                H3_ANE_CODE_OUTPUT_COPY_FAILED, H3_ANE_REASON_SHAPE,
+                "Core ML output copy failed");
             return -(int)H3_ANE_REASON_SHAPE;
+        }
         backend.outputSeconds = monotonic_seconds() - start;
         return 1;
     } @catch (__unused NSException *exception) {
@@ -688,11 +782,14 @@ static h3_ane *create_impl(const char *model_path,
         }
         snprintf(receipt_path, receipt_size, "%s.qualification.json", model_path);
         h3_ane_receipt receipt;
+        struct stat receipt_status;
+        int receipt_exists = lstat(receipt_path, &receipt_status) == 0;
         int loaded = h3_ane_receipt_load(receipt_path, &receipt, error, error_size);
         free(receipt_path);
         if (!loaded) {
             record_first(ane, H3_ANE_STAGE_RECEIPT,
-                         H3_ANE_CODE_RECEIPT_MALFORMED,
+                         receipt_exists ? H3_ANE_CODE_RECEIPT_MALFORMED :
+                                          H3_ANE_CODE_RECEIPT_MISSING,
                          H3_ANE_REASON_RECEIPT,
                          "qualification receipt is missing or malformed");
             mark_unavailable(ane, H3_ANE_REASON_RECEIPT, error, error_size,
@@ -791,6 +888,27 @@ static h3_ane *create_impl(const char *model_path,
                     "preferred=0x%x\n",
                     usage->name, usage->is_constant, usage->supported_devices,
                     usage->preferred_device);
+        }
+        if (!usage->is_constant &&
+            (usage->supported_devices == 0 || usage->preferred_device == 0)) {
+            h3_ane_code code = usage->supported_devices == 0 ?
+                H3_ANE_CODE_OPERATION_USAGE_UNKNOWN : H3_ANE_CODE_DEVICE_UNKNOWN;
+            record_first(ane, H3_ANE_STAGE_ELIGIBILITY, code,
+                         H3_ANE_REASON_ELIGIBILITY,
+                         usage->supported_devices == 0 ?
+                             "operation device usage is unknown" :
+                             "operation preferred device is unknown");
+            h3_ane_diagnostic *diagnostic = &ane->diagnostic;
+            snprintf(diagnostic->operation, sizeof(diagnostic->operation), "%s",
+                     usage->name);
+            diagnostic->has_operation = 1;
+            diagnostic->supported_devices = usage->supported_devices;
+            diagnostic->has_supported_devices = 1;
+            diagnostic->preferred_device = usage->preferred_device;
+            diagnostic->has_preferred_device = 1;
+            mark_unavailable(ane, H3_ANE_REASON_ELIGIBILITY, error, error_size,
+                             "Core ML operation device usage is unknown");
+            return ane;
         }
         if (!usage->is_constant &&
             !(usage->supported_devices & H3_ANE_DEVICE_NEURAL_ENGINE)) {

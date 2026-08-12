@@ -101,6 +101,8 @@ void h3_ane_diagnostic_record_first(h3_ane_diagnostic *diagnostic,
                                     const char *message);
 void h3_ane_diagnostic_merge_first(h3_ane_diagnostic *destination,
                                    const h3_ane_diagnostic *source);
+const char *h3_ane_stage_name(h3_ane_stage stage);
+const char *h3_ane_code_name(h3_ane_code code);
 
 enum {
     H3_ANE_DEVICE_CPU = 1u << 0,

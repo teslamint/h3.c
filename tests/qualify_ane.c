@@ -192,11 +192,24 @@ static int write_receipt(const char *path, const char *model_sha,
     return atomic_finish(stream, path);
 }
 
+#ifdef H3_ANE_TOOL_TESTING
+static int result_write_count;
+#endif
+
 static int write_result(const char *path, int passed, const char *model_sha,
                         const char *source_sha, const char *qualified_at,
                         double max_abs, double relative_l2,
-                        const char *receipt_path, const char *failure,
+                        const char *failure,
                         const h3_ane_diagnostic *diagnostic) {
+#ifdef H3_ANE_TOOL_TESTING
+    result_write_count++;
+    const char *fail_rewrite = getenv("H3_ANE_TEST_FAIL_RESULT_REWRITE");
+    if (result_write_count > 1 && fail_rewrite &&
+        strcmp(fail_rewrite, "1") == 0) {
+        errno = EIO;
+        return 0;
+    }
+#endif
     int descriptor = atomic_open(path);
     if (descriptor < 0) return 0;
     FILE *stream = fdopen(descriptor, "w");
@@ -207,39 +220,20 @@ static int write_result(const char *path, int passed, const char *model_sha,
                     "\"max_abs\":%.17g,\"relative_l2\":%.17g,\"receipt_path\":",
             passed ? "passed" : "failed", model_sha, source_sha, qualified_at,
             max_abs, relative_l2);
-    json_string(stream, receipt_path);
+    if (passed) json_string(stream, "compiled-model.qualification.json");
+    else fputs("null", stream);
     fputs(",\"failure_reason\":", stream);
-    if (failure) json_string(stream, failure); else fputs("null", stream);
+    if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE)
+        json_string(stream, diagnostic->message);
+    else if (failure) json_string(stream, failure);
+    else fputs("null", stream);
     fputs(",\"failure_stage\":", stream);
     if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE) {
-        static const char *const stages[] = {
-            "none", "setup", "artifact", "contract", "receipt", "load",
-            "compute_plan", "eligibility", "input", "prediction", "output",
-            "parity", "publication",
-        };
-        json_string(stream, stages[diagnostic->stage]);
+        json_string(stream, h3_ane_stage_name(diagnostic->stage));
     } else fputs("null", stream);
     fputs(",\"failure_code\":", stream);
     if (diagnostic && diagnostic->code != H3_ANE_CODE_NONE) {
-        static const char *const codes[] = {
-            "none", "disabled", "os_unsupported", "allocation_failed",
-            "compiled_model_unreadable", "compiled_model_digest_failed",
-            "source_weights_unreadable", "source_tensor_digest_failed",
-            "metadata_missing", "metadata_mismatch", "fingerprint_mismatch",
-            "shape_mismatch", "dtype_mismatch", "receipt_missing",
-            "receipt_malformed", "receipt_digest_mismatch", "receipt_invalid",
-            "model_load_failed", "model_load_exception", "plan_timeout",
-            "plan_load_failed", "program_missing", "main_missing",
-            "operation_inventory_empty", "operation_inventory_limit_exceeded",
-            "operation_nesting_limit_exceeded", "operation_inventory_changed",
-            "operation_usage_unknown", "operation_not_neural_engine_supported",
-            "device_unknown", "input_shape_mismatch", "input_dtype_mismatch",
-            "input_copy_failed", "prediction_failed", "prediction_exception",
-            "output_shape_mismatch", "output_dtype_mismatch", "output_copy_failed",
-            "output_nonfinite", "parity_metrics_nonfinite", "parity_bounds_failed",
-            "result_write_failed", "receipt_write_failed",
-        };
-        json_string(stream, codes[diagnostic->code]);
+        json_string(stream, h3_ane_code_name(diagnostic->code));
     } else fputs("null", stream);
     fputs(",\"failure_operation\":", stream);
     if (diagnostic && diagnostic->has_operation)
@@ -354,7 +348,7 @@ int main(int argc, char **argv) {
         diagnostic.has_metrics = 1;
     }
     if (!write_result(output, passed, model_sha, source_sha, at, max_abs,
-                      relative_l2, receipt, failure, &diagnostic)) {
+                      relative_l2, failure, &diagnostic)) {
         fprintf(stderr, "h3_ane_qualification: publication/result_write_failed\n");
         unlink(receipt); free(receipt); free(invalid); return 2;
     }
@@ -366,8 +360,12 @@ int main(int argc, char **argv) {
             H3_ANE_CODE_RECEIPT_WRITE_FAILED, H3_ANE_REASON_RECEIPT,
             "qualification receipt publication failed");
         unlink(receipt);
-        (void)write_result(output, 0, model_sha, source_sha, at, max_abs,
-                           relative_l2, receipt, failure, &diagnostic);
+        if (!write_result(output, 0, model_sha, source_sha, at, max_abs,
+                          relative_l2, failure, &diagnostic)) {
+            fprintf(stderr,
+                    "h3_ane_qualification: publication/receipt_write_failed; publication/result_write_failed\n");
+            free(receipt); free(invalid); return 2;
+        }
     }
     if (passed) pause_after_receipt_if_requested();
     else unlink(receipt);

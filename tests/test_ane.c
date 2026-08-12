@@ -570,6 +570,23 @@ static void test_first_diagnostic_is_immutable(void) {
             "diagnostic message is not bounded and terminated");
 }
 
+static void test_complete_diagnostic_taxonomy(void) {
+    for (int stage = H3_ANE_STAGE_NONE; stage <= H3_ANE_STAGE_PUBLICATION;
+         stage++) {
+        const char *name = h3_ane_stage_name((h3_ane_stage)stage);
+        require(name != NULL && *name, "diagnostic stage has no stable name");
+    }
+    require(h3_ane_stage_name((h3_ane_stage)-1) == NULL,
+            "invalid diagnostic stage received a name");
+    for (int code = H3_ANE_CODE_NONE;
+         code <= H3_ANE_CODE_RECEIPT_WRITE_FAILED; code++) {
+        const char *name = h3_ane_code_name((h3_ane_code)code);
+        require(name != NULL && *name, "diagnostic code has no stable name");
+    }
+    require(h3_ane_code_name((h3_ane_code)-1) == NULL,
+            "invalid diagnostic code received a name");
+}
+
 static size_t capture_create_diagnostic(const char *model_path,
                                         const h3_ane_contract *contract,
                                         int authorized, char output[512]) {
@@ -1251,6 +1268,7 @@ int main(void) {
     test_runtime_metadata();
     test_multiarray_stride_copy();
     test_first_diagnostic_is_immutable();
+    test_complete_diagnostic_taxonomy();
     test_runtime_bridge(root);
     test_dispatch_fallback(root);
     test_video_encoder_ane_surface();

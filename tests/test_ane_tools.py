@@ -238,6 +238,9 @@ class NativeToolTests(unittest.TestCase):
                           "failure_operation", "supported_devices",
                           "preferred_device"):
                 self.assertIsNone(first[field])
+            self.assertEqual(first["receipt_path"],
+                             "compiled-model.qualification.json")
+            self.assertNotIn(str(root), json.dumps(first))
             self.assertTrue(receipt.exists())
 
             (model / "weights.bin").write_bytes(b"changed")
@@ -252,6 +255,8 @@ class NativeToolTests(unittest.TestCase):
             self.assertIsNone(second["failure_operation"])
             self.assertIsNone(second["supported_devices"])
             self.assertIsNone(second["preferred_device"])
+            self.assertIsNone(second["receipt_path"])
+            self.assertNotIn(str(root), json.dumps(second))
             self.assertNotEqual(first["model_sha256"], second["model_sha256"])
             self.assertFalse(receipt.exists())
             self.assertTrue(Path(f"{receipt}.invalid").exists())
@@ -302,6 +307,32 @@ class NativeToolTests(unittest.TestCase):
             self.assertEqual(document["status"], "failed")
             self.assertEqual(document["failure_stage"], "publication")
             self.assertEqual(document["failure_code"], "receipt_write_failed")
+            self.assertFalse(receipt.exists())
+
+    def test_receipt_rewrite_failure_reports_both_publication_failures(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            model = root / "model.mlmodelc"
+            model.mkdir()
+            (model / "weights.bin").write_bytes(b"model")
+            output = root / "result.json"
+            receipt = Path(f"{model}.qualification.json")
+            env = os.environ.copy()
+            env.update({
+                "H3_ANE_TEST_METRICS": "0.001,0.01",
+                "H3_ANE_TEST_SOURCE_SHA256": "1" * 64,
+                "H3_ANE_TEST_FAIL_RECEIPT_WRITE": "1",
+                "H3_ANE_TEST_FAIL_RESULT_REWRITE": "1",
+            })
+            result = subprocess.run(
+                [str(ROOT / "h3_ane_qualification_test"), "--model", "unused",
+                 "--coreml-model", str(model), "--output", str(output)],
+                env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("publication/receipt_write_failed", result.stderr)
+            self.assertIn("publication/result_write_failed", result.stderr)
+            self.assertNotIn(str(root), result.stderr)
             self.assertFalse(receipt.exists())
 
     def test_receipt_is_final_commit_point_under_post_receipt_signal(self):
