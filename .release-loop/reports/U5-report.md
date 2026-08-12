@@ -109,5 +109,5 @@ unrelated cache was changed.
 
 ## Final branch review closure
 
-- Exact source commit: `17ef0f1dc8436de56c689cd2f3b5f9445ee738af`.
+- Exact source commit: `4aa234fb6cd54d3b1ca198ed4da0177e5cb42c45`.
 - Closed first-failure diagnostic context, strict receipt preflight, coordinator reuse authority preservation, and sealed taxonomy were revalidated by 69 Python tests, strict Clang analysis, actual-Metal ANE tests, and fresh isolated synthetic/real runs.

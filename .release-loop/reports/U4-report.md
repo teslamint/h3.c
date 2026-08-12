@@ -2,7 +2,7 @@
 
 Status: DONE
 
-Final-review source commit: `17ef0f1dc8436de56c689cd2f3b5f9445ee738af`
+Final-review source commit: `4aa234fb6cd54d3b1ca198ed4da0177e5cb42c45`
 
 ## Authority boundary
 
@@ -115,7 +115,7 @@ Final-review source commit: `17ef0f1dc8436de56c689cd2f3b5f9445ee738af`
 
 ## Final review evidence
 
-- Exact source commit: `17ef0f1dc8436de56c689cd2f3b5f9445ee738af`.
+- Exact source commit: `4aa234fb6cd54d3b1ca198ed4da0177e5cb42c45`.
 - Fresh isolated synthetic integration passed `441/292/149/149/0` with null parity and receipt; `.release-loop/evidence/ane-integration.json` is the bounded summary.
 - Fresh real shadow passed non-authorizing parity with no receipt; fresh strict real exited 1 at `parity/parity_bounds_failed` with no receipt.
 - Actual disposable production-table evidence is retained in `.release-loop/evidence/U4/conversion.json`, `compile.json`, and `integration.json`.
