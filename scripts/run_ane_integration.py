@@ -39,6 +39,33 @@ EXPECTED_INVENTORY = {
     "unknown_nonconstant": 0,
     "constant_nil_usage": 292,
 }
+# Closed mirror of the public h3_ane_stage/h3_ane_code taxonomy in h3_ane.h;
+# stage grouping follows the production record sites in h3_ane.m.
+DIAGNOSTIC_CODES = {
+    "setup": {"disabled", "os_unsupported", "allocation_failed"},
+    "artifact": {"compiled_model_unreadable", "compiled_model_digest_failed",
+                 "source_weights_unreadable", "source_tensor_digest_failed"},
+    "contract": {"metadata_missing", "metadata_mismatch",
+                 "fingerprint_mismatch", "shape_mismatch", "dtype_mismatch"},
+    "receipt": {"receipt_missing", "receipt_malformed",
+                "receipt_digest_mismatch", "receipt_invalid"},
+    "load": {"model_load_failed", "model_load_exception"},
+    "compute_plan": {"plan_timeout", "plan_load_failed", "program_missing",
+                     "main_missing"},
+    "eligibility": {"operation_inventory_empty",
+                    "operation_inventory_limit_exceeded",
+                    "operation_nesting_limit_exceeded",
+                    "operation_inventory_changed", "operation_usage_unknown",
+                    "operation_not_neural_engine_supported", "device_unknown"},
+    "input": {"input_shape_mismatch", "input_dtype_mismatch",
+              "input_copy_failed"},
+    "prediction": {"prediction_failed", "prediction_exception"},
+    "output": {"output_shape_mismatch", "output_dtype_mismatch",
+               "output_copy_failed", "output_nonfinite"},
+    "parity": {"parity_metrics_nonfinite", "parity_bounds_failed"},
+    "publication": {"result_write_failed", "receipt_write_failed"},
+}
+DEVICE_LABELS = ("cpu", "gpu", "neural-engine")
 
 _child = None
 _temporary_outputs = set()
@@ -207,13 +234,99 @@ def _failed(mode, failure):
     diagnostic = failure.diagnostic or {
         "stage": failure.stage, "code": failure.code,
         "message": str(failure)[:160]}
+    diagnostic = _bounded_mapping(diagnostic, 8)
+    inventory = dict(EXPECTED_INVENTORY) \
+        if failure.inventory == EXPECTED_INVENTORY else None
+    parity = _bounded_parity(failure.parity)
+    artifacts = failure.artifacts if isinstance(failure.artifacts, dict) and \
+        set(failure.artifacts) == {"model_sha256", "source_sha256"} and \
+        all(_digest(value) for value in failure.artifacts.values()) else None
+    stages = {key: value for key, value in failure.stages.items()
+              if key in ("conversion", "probe", "qualification") and
+              isinstance(value, int) and not isinstance(value, bool)}
     return {"schema": SCHEMA, "status": "failed", "mode": mode,
             "profile": "shadow-measurement-v1" if mode == "shadow" else None,
             "authority": False if mode == "shadow" else None,
-            "source_sha256": failure.source_sha256,
-            "inventory": failure.inventory, "diagnostic": diagnostic,
-            "parity": failure.parity, "receipt": None,
-            "artifacts": failure.artifacts, "stages": failure.stages}
+            "source_sha256": failure.source_sha256
+                if _digest(failure.source_sha256) else None,
+            "inventory": inventory, "diagnostic": diagnostic,
+            "parity": parity, "receipt": None,
+            "artifacts": artifacts, "stages": stages}
+
+
+def _bounded_mapping(value, limit):
+    if not isinstance(value, dict):
+        return {"stage": "integration", "code": "invalid_result",
+                "message": "integration result is invalid"}
+    result = {}
+    canonical_keys = ("stage", "code", "message", "operation",
+                      "supported_devices", "preferred_device")
+    for key in canonical_keys[:limit]:
+        if key not in value:
+            continue
+        item = value[key]
+        if item is None or isinstance(item, (bool, int, float)):
+            result[key] = item if not isinstance(item, float) or \
+                math.isfinite(item) else None
+        elif isinstance(item, str):
+            result[key] = item[:160]
+        elif isinstance(item, list) and len(item) <= 3 and all(
+                isinstance(entry, str) and len(entry) <= 32 for entry in item):
+            result[key] = item
+    return result
+
+
+def _bounded_parity(value):
+    if not isinstance(value, dict) or set(value) != {"max_abs", "relative_l2"}:
+        return None
+    result = {}
+    for key in ("max_abs", "relative_l2"):
+        metric = value[key]
+        result[key] = metric if isinstance(metric, (int, float)) and \
+            not isinstance(metric, bool) and math.isfinite(metric) else None
+    return result
+
+
+def validate_qualification_diagnostic(document):
+    stage = document.get("failure_stage")
+    code = document.get("failure_code")
+    message = document.get("failure_reason")
+    operation = document.get("failure_operation")
+    devices = document.get("supported_devices")
+    preferred = document.get("preferred_device")
+    if stage not in DIAGNOSTIC_CODES or code not in DIAGNOSTIC_CODES[stage] or \
+            not isinstance(message, str) or not message or len(message) > 159:
+        raise ValueError("invalid qualifier diagnostic taxonomy")
+    if operation is not None and (stage != "eligibility" or
+                                  not isinstance(operation, str) or
+                                  not operation or len(operation) > 95):
+        raise ValueError("invalid qualifier operation context")
+    if devices is not None:
+        if stage != "eligibility" or not isinstance(devices, list) or \
+                not devices or len(devices) > len(DEVICE_LABELS) or \
+                any(device not in DEVICE_LABELS for device in devices) or \
+                devices != [device for device in DEVICE_LABELS if device in devices]:
+            raise ValueError("invalid qualifier device context")
+    if preferred is not None and (stage != "eligibility" or
+                                  preferred not in DEVICE_LABELS or
+                                  not devices or preferred not in devices):
+        raise ValueError("invalid qualifier preferred device")
+    return {"stage": stage, "code": code, "message": message,
+            "operation": operation, "supported_devices": devices,
+            "preferred_device": preferred}
+
+
+def publish_failure(path, document):
+    try:
+        atomic_json(path, document)
+    except ValueError:
+        atomic_json(path, {
+            "schema": SCHEMA, "status": "failed", "mode": document.get("mode"),
+            "profile": document.get("profile"), "authority": document.get("authority"),
+            "source_sha256": None, "inventory": None,
+            "diagnostic": {"stage": "integration", "code": "invalid_result",
+                           "message": "integration result is invalid"},
+            "parity": None, "receipt": None, "artifacts": None, "stages": {}})
 
 
 def prepare_work_directory(path):
@@ -244,7 +357,7 @@ def _overlaps(left, right):
     return left == right or left in right.parents or right in left.parents
 
 
-def validate_output_path(output, work):
+def validate_paths(output, work, weights, mode):
     protected = (
         work,
         work / "visual-block.mlpackage",
@@ -255,17 +368,21 @@ def validate_output_path(output, work):
     )
     if any(_overlaps(output, path) for path in protected):
         raise UnsafeOutput("output path overlaps coordinator work artifacts")
+    if mode in ("real", "shadow") and _overlaps(weights, work):
+        raise UnsafeOutput("weights path overlaps coordinator work directory")
+    if _overlaps(output, weights):
+        raise UnsafeOutput("output path overlaps source weights")
 
 
 def execute(args):
     repo = Path(args.repo).resolve()
     work = Path(args.work_dir).resolve()
     output = Path(args.output).resolve()
-    validate_output_path(output, work)
     if args.mode in ("real", "shadow") and not args.weights:
         raise StageFailure("setup", "--weights is required in real or shadow mode")
-    work = prepare_work_directory(work)
     weights = Path(args.weights).resolve() if args.weights else work / "weights"
+    validate_paths(output, work, weights, args.mode)
+    work = prepare_work_directory(work)
     if args.mode == "synthetic":
         generate_fixture(weights)
     package = work / "visual-block.mlpackage"
@@ -332,20 +449,18 @@ def execute(args):
             if not qualification_output.exists():
                 raise
             failed = json.loads(qualification_output.read_text())
-            diagnostic = {
-                "stage": failed.get("failure_stage"),
-                "code": failed.get("failure_code"),
-                "message": failed.get("failure_reason"),
-                "operation": failed.get("failure_operation"),
-                "supported_devices": failed.get("supported_devices"),
-                "preferred_device": failed.get("preferred_device"),
-            }
+            try:
+                diagnostic = validate_qualification_diagnostic(failed)
+            except ValueError as exc:
+                raise StageFailure(
+                    "qualification", str(exc), code="invalid_result",
+                    source_sha256=source_sha, inventory=inventory,
+                    stages={**stages, "qualification": 1},
+                    artifacts=artifacts) from None
             parity = {"max_abs": failed.get("max_abs"),
                       "relative_l2": failed.get("relative_l2")}
             if args.mode == "shadow":
                 code = failed.get("failure_code")
-                expected_outcome = code in (
-                    "parity_bounds_failed", "parity_metrics_nonfinite")
                 metrics_finite = all(
                     isinstance(value, (int, float)) and not isinstance(value, bool)
                     and math.isfinite(value) for value in parity.values())
@@ -363,7 +478,7 @@ def execute(args):
                             "max_abs": 0.25, "relative_l2": 0.05} or \
                         failed.get("threshold_outcome") is not False or \
                         failed.get("receipt_path") is not None or \
-                        receipt_path.exists() or not expected_outcome:
+                        receipt_path.exists():
                     raise StageFailure(
                         "qualification",
                         "shadow failure authority contract failed",
@@ -371,9 +486,12 @@ def execute(args):
                         source_sha256=source_sha, inventory=inventory,
                         stages={**stages, "qualification": 1},
                         artifacts=artifacts)
-                if not code_matches_metrics or \
+                if diagnostic["stage"] == "parity" and not code_matches_metrics or \
                         failed.get("model_sha256") != artifacts["model_sha256"] or \
-                        failed.get("source_sha256") != source_sha:
+                        (failed.get("source_sha256") != source_sha and
+                         diagnostic["code"] not in {
+                             "source_weights_unreadable",
+                             "source_tensor_digest_failed"}):
                     raise StageFailure(
                         "qualification",
                         "shadow failure diagnostic contract failed",
@@ -469,7 +587,7 @@ def main(argv=None):
         return 2
     except StageFailure as exc:
         cleanup_authority()
-        atomic_json(args.output, _failed(args.mode, exc))
+        publish_failure(args.output, _failed(args.mode, exc))
         print(f"run_ane_integration.py: {exc.stage}: {exc}", file=sys.stderr)
         return 1
     except (OSError, ValueError) as exc:
@@ -477,7 +595,7 @@ def main(argv=None):
         failure = StageFailure("integration", "integration result is invalid",
                                code="invalid_result")
         try:
-            atomic_json(args.output, _failed(args.mode, failure))
+            publish_failure(args.output, _failed(args.mode, failure))
         except OSError:
             pass
         print("run_ane_integration.py: integration: integration result is invalid",

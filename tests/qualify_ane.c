@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -26,6 +27,18 @@ static void cleanup_temp(void) {
 static void cancelled(int signal_number) {
     cleanup_temp();
     _exit(128 + signal_number);
+}
+
+static void pause_during_invalidation_if_requested(void) {
+#ifdef H3_ANE_TOOL_TESTING
+    const char *marker_path = getenv("H3_ANE_TEST_PAUSE_DURING_INVALIDATION");
+    const char *release_path = getenv("H3_ANE_TEST_RELEASE_INVALIDATION");
+    if (!marker_path || !*marker_path || !release_path || !*release_path) return;
+    FILE *stream = fopen(marker_path, "w");
+    if (stream) { fputs("signals blocked\n", stream); fclose(stream); }
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = 1000000};
+    while (access(release_path, F_OK) != 0) nanosleep(&delay, NULL);
+#endif
 }
 
 static void usage(FILE *stream) {
@@ -306,18 +319,19 @@ static void write_diagnostic_fields(FILE *stream, const char *failure,
     } else fputs("null", stream);
 }
 
-static int invalidate_receipt(const char *receipt, const char *invalid) {
-    if (access(receipt, F_OK) != 0) return 1;
-    unlink(invalid);
+static int invalidate_receipt(const char *receipt, char *invalid) {
+    struct stat status;
+    if (lstat(receipt, &status) != 0) return errno == ENOENT;
+    if (snprintf(invalid, strlen(receipt) + sizeof(".invalid-XXXXXX"),
+                 "%s.invalid-XXXXXX", receipt) < 0) return 0;
+    int quarantine = mkstemp(invalid);
+    if (quarantine < 0) return 0;
+    if (close(quarantine) != 0) { unlink(invalid); return 0; }
+    pause_during_invalidation_if_requested();
     if (rename(receipt, invalid) == 0) return 1;
     int rename_error = errno;
+    unlink(invalid);
     if (unlink(receipt) == 0) return 1;
-    int descriptor = open(receipt, O_WRONLY | O_TRUNC);
-    if (descriptor >= 0) {
-        int ok = fsync(descriptor) == 0;
-        if (close(descriptor) != 0) ok = 0;
-        if (ok) return 1;
-    }
     fprintf(stderr, "h3_ane_qualification: cannot invalidate old receipt: %s\n",
             strerror(rename_error));
     return 0;
@@ -386,12 +400,23 @@ int main(int argc, char **argv) {
     signal(SIGINT, cancelled); signal(SIGTERM, cancelled);
     size_t receipt_size = strlen(model) + sizeof(".qualification.json");
     char *receipt = malloc(receipt_size);
-    char *invalid = malloc(receipt_size + sizeof(".invalid"));
+    char *invalid = malloc(receipt_size + sizeof(".invalid-XXXXXX"));
     if (!receipt || !invalid) return 2;
     snprintf(receipt, receipt_size, "%s.qualification.json", model);
-    snprintf(invalid, receipt_size + sizeof(".invalid"), "%s.invalid", receipt);
-    if (!invalidate_receipt(receipt, invalid)) {
+    invalid[0] = '\0';
+    sigset_t invalidation_signals, previous_signals;
+    sigemptyset(&invalidation_signals);
+    sigaddset(&invalidation_signals, SIGINT);
+    sigaddset(&invalidation_signals, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &invalidation_signals, &previous_signals) != 0) {
         free(receipt); free(invalid); return 2;
+    }
+    if (!invalidate_receipt(receipt, invalid)) {
+        sigprocmask(SIG_SETMASK, &previous_signals, NULL);
+        free(receipt); free(invalid); return 2;
+    }
+    if (sigprocmask(SIG_SETMASK, &previous_signals, NULL) != 0) {
+        unlink(receipt); free(receipt); free(invalid); return 2;
     }
     pause_after_invalidation_if_requested();
 
