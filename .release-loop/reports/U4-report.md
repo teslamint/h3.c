@@ -2,7 +2,7 @@
 
 Status: DONE
 
-Review-fix source commit: `e0e62cba0806f7bdeae1f239fa3197ac88a690ff`
+Review-fix source commit: `fe14e88047f949d913e46cb1b017d926e0ca8c0b`
 
 ## Authority boundary
 
@@ -16,8 +16,13 @@ Review-fix source commit: `e0e62cba0806f7bdeae1f239fa3197ac88a690ff`
 - The coordinator independently validates the shadow profile, bounds,
   threshold outcome, finite metrics, digests, and absence of a receipt before
   atomically publishing a passed non-authorizing summary.
-- Receipt audit-rename conflicts now fall back to removal and then truncation;
-  the qualifier cannot continue while the original receipt remains loadable.
+- Receipt invalidation atomically renames only the receipt pathname to a unique
+  sibling quarantine, with pathname unlink as the only fallback. It never
+  opens or truncates a receipt target. Symlink and hardlink adversarial tests
+  prove an external sentinel remains byte-for-byte unchanged.
+- SIGINT and SIGTERM are blocked across the entire invalidation critical
+  section. A synchronized pending-signal test proves SIGTERM is handled only
+  after the live receipt pathname becomes non-authorizing.
 - Shadow failures retain the same complete structured diagnostic fields as the
   strict qualifier, and the coordinator validates and propagates
   `parity_bounds_failed` versus `parity_metrics_nonfinite` without collapsing
@@ -25,13 +30,20 @@ Review-fix source commit: `e0e62cba0806f7bdeae1f239fa3197ac88a690ff`
 - Coordinator inventory is a closed eight-field canonical object, serialized
   summaries are capped at 16,384 bytes, and output/work artifact aliases are
   rejected before work-directory mutation.
+- Real/shadow output, work, and resolved source-weight trees must be pairwise
+  disjoint before any coordinator mutation. Closed production stage/code
+  taxonomy and stage-specific operation/device validation preserve every
+  legitimate qualifier failure while rejecting fabricated context.
+- Every coordinator shadow success, qualifier failure, summary-publication
+  failure, and cancellation fixture independently seeds a genuine-format
+  strict sidecar and proves the live authority pathname is absent afterward.
 
 ## TDD and verification
 
 - Red tests first proved the qualifier rejected `--shadow-only`, the
   coordinator rejected `shadow`, and an out-of-bounds passing qualifier was
   initially accepted; the implementation then made each test pass.
-- `python3 -m unittest tests/test_ane_tools.py`: 53 passed.
+- `python3 -m unittest tests/test_ane_tools.py`: 60 passed.
 - `python3 -m py_compile scripts/run_ane_integration.py`: passed.
 - `make h3_ane_tool_tests`: passed.
 - Strict warning build (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion`) and

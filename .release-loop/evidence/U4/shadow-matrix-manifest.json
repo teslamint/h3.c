@@ -4,21 +4,21 @@
   "plan": "docs/plans/2026-08-12-001-feat-ane-eligibility-fix-plan.md",
   "records": [
     {
-      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_invalidation_rename_conflict_removes_runtime_authority",
-      "fixture": "NativeToolTests.test_shadow_invalidation_rename_conflict_removes_runtime_authority",
-      "injection": "independently generated strict passing receipt plus nonempty .invalid directory blocks audit rename",
-      "mechanism": "rename failure falls back to unlink, then truncate if unlink fails; measurement never starts while a loadable receipt remains",
-      "next_invocation": "a later strict pass must recompute and publish new authority",
-      "outcome": "exit 0 shadow result; original live receipt removed; conflicting .invalid remains non-authorizing",
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_invalidation_never_modifies_link_targets tests.test_ane_tools.NativeToolTests.test_signal_pending_during_invalidation_runs_after_path_is_safe tests.test_ane_tools.NativeToolTests.test_shadow_invalidation_rename_conflict_removes_runtime_authority",
+      "fixture": "NativeToolTests.test_shadow_invalidation_never_modifies_link_targets; test_signal_pending_during_invalidation_runs_after_path_is_safe; test_shadow_invalidation_rename_conflict_removes_runtime_authority",
+      "injection": "genuine strict receipt pathname is independently replaced by symlink and hardlink to an external sentinel; adversarial .invalid directory; SIGTERM queued at the blocked-signal pause before unique quarantine rename",
+      "mechanism": "same-directory unique quarantine rename changes only the receipt directory entry; fallback unlink changes only that entry; no pathname truncate/open follows links; SIGINT/SIGTERM remain blocked for the full invalidation critical section",
+      "next_invocation": "a later strict pass must recompute and publish new authority; quarantine is never runtime-authorizing",
+      "outcome": "external sentinel bytes unchanged; live receipt pathname atomically renamed to unique sibling quarantine; pending SIGTERM exits 143 only after pathname is absent",
       "plan_row": "Invalidate prior receipt"
     },
     {
-      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_bounds_profile_and_strict_threshold_preservation tests.test_ane_tools.NativeToolTests.test_shadow_result_write_failure_leaves_no_authority",
-      "fixture": "NativeToolTests.test_shadow_bounds_profile_and_strict_threshold_preservation and test_shadow_result_write_failure_leaves_no_authority",
-      "injection": "inside/outside/negative/nonfinite metrics and absent result parent, each after independently generating a strict passing receipt",
-      "mechanism": "shared diagnostic serializer preserves full stage/code/context and atomic temp cleanup prevents partial RESULT",
-      "next_invocation": "rerun begins by invalidating any newly seeded strict authority and recreates RESULT atomically",
-      "outcome": "atomic structured shadow RESULT on measurable outcomes; result-write failure exits 2; no live receipt in every case",
+      "exact_command": "python3 -m unittest tests.test_ane_tools.NativeToolTests.test_shadow_bounds_profile_and_strict_threshold_preservation tests.test_ane_tools.NativeToolTests.test_shadow_result_write_failure_leaves_no_authority tests.test_ane_tools.NativeToolTests.test_signal_pending_during_invalidation_runs_after_path_is_safe",
+      "fixture": "NativeToolTests shadow bounds/nonfinite/negative/result-write/cancellation tests",
+      "injection": "inside/outside/negative/nonfinite metrics, absent result parent, and pending SIGTERM, each after independent strict receipt generation",
+      "mechanism": "shared diagnostic serialization, finite/nonnegative bounds, atomic temp cleanup, and signal-atomic invalidation",
+      "next_invocation": "rerun creates a new atomic RESULT only after repeating link-safe invalidation",
+      "outcome": "complete structured RESULT or stable exit 2/143 with no partial result and no live authority pathname",
       "plan_row": "Publish initial qualification RESULT"
     },
     {
@@ -41,15 +41,15 @@
     },
     {
       "exact_command": "python3 -m unittest tests.test_ane_tools.IntegrationCoordinatorTests",
-      "fixture": "IntegrationCoordinatorTests shadow success/failure/alias/size/inventory tests",
-      "injection": "success, both parity failure codes, output aliases, extra inventory key, oversized summary, and summary publication failure",
-      "mechanism": "closed inventory equality, 16384-byte serialized ceiling, atomic JSON, and exact structured shadow diagnostics",
-      "next_invocation": "safe distinct output reruns replace summary atomically after all stages",
-      "outcome": "bounded canonical summary or stable failure; aliases rejected before work mutation; authority outputs cleaned",
+      "fixture": "IntegrationCoordinatorTests shadow success/failure/publication/cancellation/taxonomy/path/size/inventory tests",
+      "injection": "genuine-format strict sidecar before every shadow outcome; all production stage/code pairs; mismatched pairs/fabricated context; output/weights/work overlaps; extra inventory; oversized failure",
+      "mechanism": "closed h3_ane.h/h3_ane.m taxonomy mirror, stage-specific context validation, canonical failure projection, 16384-byte ceiling, minimal failure fallback, and authority cleanup",
+      "next_invocation": "only disjoint paths and closed production diagnostics can publish a replacement summary",
+      "outcome": "legitimate diagnostics propagate exactly; fabricated taxonomy rejected; aliases exit 2 before mutation; oversized detail falls back to bounded atomic failure; sidecar absent after every outcome",
       "plan_row": "Publish integration summary"
     },
     {
-      "exact_command": "git diff f7b4784..e0e62cba0806f7bdeae1f239fa3197ac88a690ff -- h3_ane.c h3_ane_dispatch.c h3_video_encoder.c && ANE_INTEGRATION_OUTPUT=/private/tmp/u4-strict-summary-review1.json ANE_INTEGRATION_WORK=/private/tmp/u4-strict-work-review1 H3_ANE_WEIGHT_DIR=MiniMax-H3/FL2VA/video_vae/source make h3_ane_real_qualification_test",
+      "exact_command": "git diff f7b4784..fe14e88 -- h3_ane.m h3_ane_dispatch.c h3_video_encoder.c && ANE_INTEGRATION_OUTPUT=/private/tmp/u4-strict-summary-round3.json ANE_INTEGRATION_WORK=/private/tmp/u4-strict-work-round3 H3_ANE_WEIGHT_DIR=MiniMax-H3/FL2VA/video_vae/source make h3_ane_real_qualification_test",
       "fixture": "scope/diff authority check plus strict real target",
       "injection": "same FP16 candidate exceeds unchanged strict max_abs bound",
       "mechanism": "shadow evidence is authority false and runtime receipt validation/adoption code is unchanged",
@@ -58,7 +58,7 @@
       "plan_row": "Adopt Core ML request output"
     }
   ],
-  "schema": "h3-release-loop-shadow-matrix/v1",
-  "source_commit": "e0e62cba0806f7bdeae1f239fa3197ac88a690ff",
-  "timestamp_utc": "2026-08-12T08:51:10Z"
+  "schema": "h3-release-loop-shadow-matrix/v2",
+  "source_commit": "fe14e88047f949d913e46cb1b017d926e0ca8c0b",
+  "timestamp_utc": "2026-08-12T09:10:35Z"
 }
