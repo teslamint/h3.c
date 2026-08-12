@@ -489,15 +489,20 @@ static void install_fake_backend(fake_ane_backend *fake) {
 }
 
 static void test_shared_plan_deadline(void) {
-    require(h3_ane_test_plan_wait_nanoseconds(105.0, 100.0) ==
+    double deadline = 0.0;
+    require(h3_ane_test_plan_phase_wait_nanoseconds(&deadline, 100.0) ==
                 5LL * 1000 * 1000 * 1000,
             "compute-plan deadline did not allow the initial five seconds");
-    require(h3_ane_test_plan_wait_nanoseconds(105.0, 102.25) ==
+    require(deadline == 105.0,
+            "compute-plan count pass did not establish one deadline");
+    require(h3_ane_test_plan_phase_wait_nanoseconds(&deadline, 102.25) ==
                 2750LL * 1000 * 1000,
-            "compute-plan fill pass received a fresh timeout");
-    require(h3_ane_test_plan_wait_nanoseconds(105.0, 105.0) == 0 &&
-                h3_ane_test_plan_wait_nanoseconds(105.0, 106.0) == 0,
-            "expired compute-plan deadline still allowed a wait");
+            "cached compute-plan fill received a fresh timeout");
+    require(deadline == 105.0,
+            "compute-plan fill replaced the transaction deadline");
+    require(h3_ane_test_plan_phase_wait_nanoseconds(&deadline, 105.0) == 0 &&
+                h3_ane_test_plan_phase_wait_nanoseconds(&deadline, 106.0) == 0,
+            "expired cached-plan fill still received execution time");
 }
 
 static void make_qualified_model(const char *root, const char *name,

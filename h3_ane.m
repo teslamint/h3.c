@@ -20,6 +20,10 @@ typedef int (*h3_ane_predict_fn)(void *, const float *, size_t, float *, size_t,
                                  h3_ane_diagnostic *);
 typedef void (*h3_ane_free_fn)(void *);
 
+typedef struct {
+    double at;
+} h3_ane_plan_deadline;
+
 struct h3_ane {
     h3_ane_load_fn load;
     h3_ane_plan_fn plan;
@@ -43,7 +47,7 @@ struct h3_ane {
 @property(nonatomic, copy) NSString *inputName;
 @property(nonatomic, copy) NSString *outputName;
 @property(nonatomic, strong) MLComputePlan *computePlan;
-@property(nonatomic) double computePlanDeadline;
+@property(nonatomic) h3_ane_plan_deadline computePlanDeadline;
 @property(nonatomic) double inputSeconds;
 @property(nonatomic) double predictionSeconds;
 @property(nonatomic) double outputSeconds;
@@ -76,16 +80,22 @@ static double monotonic_seconds(void) {
     return (double)value.tv_sec + (double)value.tv_nsec / 1000000000.0;
 }
 
-static int64_t plan_wait_nanoseconds(double deadline, double now) {
-    double remaining = deadline - now;
+static int64_t plan_phase_wait_nanoseconds(h3_ane_plan_deadline *deadline,
+                                           double now) {
+    if (deadline->at <= 0.0) deadline->at = now + 5.0;
+    double remaining = deadline->at - now;
     if (remaining <= 0.0) return 0;
     if (remaining >= 5.0) return 5LL * NSEC_PER_SEC;
     return (int64_t)(remaining * (double)NSEC_PER_SEC);
 }
 
 #ifdef H3_ANE_TESTING
-int64_t h3_ane_test_plan_wait_nanoseconds(double deadline, double now) {
-    return plan_wait_nanoseconds(deadline, now);
+int64_t h3_ane_test_plan_phase_wait_nanoseconds(double *deadline,
+                                                double now) {
+    h3_ane_plan_deadline state = {.at = *deadline};
+    int64_t result = plan_phase_wait_nanoseconds(&state, now);
+    *deadline = state.at;
+    return result;
 }
 #endif
 
@@ -728,20 +738,19 @@ static int real_plan(void *opaque, h3_ane_operation_usage *operations,
     if (@available(macOS 14.4, *)) {
         H3ANERealBackend *backend = (__bridge H3ANERealBackend *)opaque;
         @try {
+            h3_ane_plan_deadline deadline = backend.computePlanDeadline;
+            int64_t waitNanoseconds = plan_phase_wait_nanoseconds(
+                &deadline, monotonic_seconds());
+            backend.computePlanDeadline = deadline;
+            if (waitNanoseconds == 0) {
+                h3_ane_diagnostic_record_first(diagnostic,
+                    H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_TIMEOUT,
+                    H3_ANE_REASON_ELIGIBILITY,
+                    "Core ML compute plan timed out");
+                return 0;
+            }
             MLComputePlan *loadedPlan = backend.computePlan;
             if (!loadedPlan) {
-                double now = monotonic_seconds();
-                if (backend.computePlanDeadline <= 0.0)
-                    backend.computePlanDeadline = now + 5.0;
-                int64_t waitNanoseconds = plan_wait_nanoseconds(
-                    backend.computePlanDeadline, now);
-                if (waitNanoseconds == 0) {
-                    h3_ane_diagnostic_record_first(diagnostic,
-                        H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_TIMEOUT,
-                        H3_ANE_REASON_ELIGIBILITY,
-                        "Core ML compute plan timed out");
-                    return 0;
-                }
                 MLModelConfiguration *configuration =
                     [[MLModelConfiguration alloc] init];
                 configuration.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
@@ -795,8 +804,18 @@ static int real_plan(void *opaque, h3_ane_operation_usage *operations,
                 .child_count = real_child_count, .child_at = real_child_at,
                 .usage = real_usage,
             };
-            return h3_ane_walk_plan_tree(&adapter, &tree, operations,
-                                         operation_count, diagnostic);
+            int walked = h3_ane_walk_plan_tree(&adapter, &tree, operations,
+                                               operation_count, diagnostic);
+            deadline = backend.computePlanDeadline;
+            if (walked > 0 && plan_phase_wait_nanoseconds(
+                                  &deadline, monotonic_seconds()) == 0) {
+                h3_ane_diagnostic_record_first(diagnostic,
+                    H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_TIMEOUT,
+                    H3_ANE_REASON_ELIGIBILITY,
+                    "Core ML compute plan timed out");
+                return 0;
+            }
+            return walked;
         } @catch (__unused NSException *exception) {
             h3_ane_diagnostic_record_first(diagnostic,
                 H3_ANE_STAGE_COMPUTE_PLAN, H3_ANE_CODE_PLAN_LOAD_FAILED,
@@ -1244,8 +1263,8 @@ static h3_ane *create_impl(const char *model_path,
                          "Core ML compute plan is unavailable");
         return ane;
     }
-    int trace = getenv("H3_ANE_TRACE") &&
-                strcmp(getenv("H3_ANE_TRACE"), "1") == 0;
+    const char *trace_environment = getenv("H3_ANE_TRACE");
+    int trace = trace_environment && strcmp(trace_environment, "1") == 0;
     h3_ane_diagnostic eligibility_diagnostic = {0};
     uint32_t preferred_devices = 0;
     int eligible = h3_ane_reduce_inventory(
