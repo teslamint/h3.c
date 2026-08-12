@@ -248,6 +248,7 @@ nonconstant / Neural-Engine-supported / CPU-only-and-unknown (both zero).
 The explicit real target requires released weights:
 
 ```sh
+export ANE_INTEGRATION_WORK=/private/tmp/h3-ane-integration
 export H3_ANE_WEIGHT_DIR="$PWD/MiniMax-H3/FL2VA/video_vae/source"
 make h3_ane_real_qualification_test
 ```
@@ -262,13 +263,35 @@ only after both pass, and alone can authorize non-shadow Core ML output. The
 current real target exits nonzero with `parity/parity_bounds_failed`, the
 metrics shown above, and `receipt: null`.
 
+Only after that target succeeds, bind later strict commands to its exact
+compiled artifact and receipt:
+
+```sh
+export H3_ANE_STRICT_MODEL="$ANE_INTEGRATION_WORK/visual-block.mlmodelc"
+test -d "$H3_ANE_STRICT_MODEL"
+test -f "$H3_ANE_STRICT_MODEL.qualification.json"
+
+./h3_ane_qualification \
+  --model "$H3_ANE_WEIGHT_DIR" \
+  --coreml-model "$H3_ANE_STRICT_MODEL" \
+  --output /absolute/local/path/strict-qualification.json
+```
+
+`ANE_INTEGRATION_WORK` defaults to `/private/tmp/h3-ane-integration`; set it
+before the Make target to choose another work directory. Always derive
+`H3_ANE_STRICT_MODEL` from that same value. Never substitute the shadow
+artifact: shadow measurement cannot create the receipt required here.
+
 ### Non-authorizing shadow measurement
 
 Run the approved shadow profile with the same released weights:
 
 ```sh
+export ANE_SHADOW_WORK=/private/tmp/h3-ane-shadow-measurement
 export H3_ANE_WEIGHT_DIR="$PWD/MiniMax-H3/FL2VA/video_vae/source"
 make h3_ane_shadow_measurement_test
+export H3_ANE_SHADOW_MODEL="$ANE_SHADOW_WORK/visual-block.mlmodelc"
+test -d "$H3_ANE_SHADOW_MODEL"
 ```
 
 The Make target invokes the qualifier with `--shadow-only`. Direct use against
@@ -277,7 +300,7 @@ an existing compiled model is:
 ```sh
 ./h3_ane_qualification --shadow-only \
   --model "$H3_ANE_WEIGHT_DIR" \
-  --coreml-model "$H3_ANE_MODEL" \
+  --coreml-model "$H3_ANE_SHADOW_MODEL" \
   --output /absolute/local/path/shadow-qualification.json
 ```
 
@@ -322,12 +345,10 @@ or cancellation never publishes replacement authority.
 
 ## Runtime shadow and observed placement
 
-After the shadow target passes, its default local compiled model is
-`/private/tmp/h3-ane-shadow-measurement/visual-block.mlmodelc`. Use a real
-256-by-256 first-frame condition so the fixed block executes:
+After the shadow target passes, use its explicit `H3_ANE_SHADOW_MODEL` path and
+a real 256-by-256 first-frame condition so the fixed block executes:
 
 ```sh
-export H3_ANE_MODEL=/private/tmp/h3-ane-shadow-measurement/visual-block.mlmodelc
 export FIRST_FRAME=/absolute/path/to/first-frame-256.png
 test -f "$FIRST_FRAME"
 test "$(ffprobe -v error -select_streams v:0 \
@@ -342,7 +363,7 @@ env -u H3_ANE_MODEL -u H3_ANE_SHADOW -u H3_ANE_TRACE \
   --layers 50 --reuse 1 \
   -o outputs/ane-metal-baseline.mp4
 
-H3_ANE_MODEL="$H3_ANE_MODEL" H3_ANE_SHADOW=1 H3_ANE_TRACE=1 \
+H3_ANE_MODEL="$H3_ANE_SHADOW_MODEL" H3_ANE_SHADOW=1 H3_ANE_TRACE=1 \
 ./h3 -d ./MiniMax-H3 \
   -p "A slow camera move around the supplied first frame." \
   --first-frame "$FIRST_FRAME" \
@@ -354,6 +375,40 @@ H3_ANE_MODEL="$H3_ANE_MODEL" H3_ANE_SHADOW=1 H3_ANE_TRACE=1 \
 The baseline and shadow commands use the same real first frame, prompt, and
 generation geometry. The baseline explicitly removes every ANE opt-in variable,
 so it exercises the unchanged Metal visual-conditioning path.
+
+Record the same shadow workload with the installed `Core ML` Instruments
+template. Use a new deterministic local path; `xctrace` does not overwrite an
+existing trace:
+
+```sh
+export ANE_SHADOW_WORK="${ANE_SHADOW_WORK:-/private/tmp/h3-ane-shadow-measurement}"
+export H3_ANE_SHADOW_MODEL="$ANE_SHADOW_WORK/visual-block.mlmodelc"
+export FIRST_FRAME=/absolute/path/to/first-frame-256.png
+export H3_ANE_SHADOW_TRACE=/private/tmp/h3-ane-shadow-placement.trace
+test -d "$H3_ANE_SHADOW_MODEL"
+test -f "$FIRST_FRAME"
+test "$(ffprobe -v error -select_streams v:0 \
+  -show_entries stream=width,height -of csv=s=x:p=0 \
+  "$FIRST_FRAME")" = "256x256"
+test ! -e "$H3_ANE_SHADOW_TRACE"
+
+xcrun xctrace record \
+  --template 'Core ML' \
+  --output "$H3_ANE_SHADOW_TRACE" \
+  --env H3_ANE_MODEL="$H3_ANE_SHADOW_MODEL" \
+  --env H3_ANE_SHADOW=1 \
+  --env H3_ANE_TRACE=1 \
+  --launch -- ./h3 -d ./MiniMax-H3 \
+  -p "A slow camera move around the supplied first frame." \
+  --first-frame "$FIRST_FRAME" \
+  --width 256 --height 256 --frames 22 --steps 4 \
+  --layers 50 --reuse 1 \
+  -o outputs/ane-shadow-placement.mp4
+```
+
+This trace is placement evidence only. Shadow remains non-authorizing, creates
+no receipt, discards the Core ML block output, and returns Metal output. Retain
+the trace locally and commit only a bounded sanitized summary.
 
 `eligible` means every nonconstant operation advertises Neural Engine support.
 `preferred` means the compute plan names a preferred device. Neither word means
@@ -373,7 +428,8 @@ transfer-inclusive latency:
 
 ```sh
 make h3_ane_bench
-./h3_ane_bench --backend ab --coreml-model "$H3_ANE_MODEL" \
+test -f "$H3_ANE_STRICT_MODEL.qualification.json"
+./h3_ane_bench --backend ab --coreml-model "$H3_ANE_STRICT_MODEL" \
   --warmup 2 --pairs 20 --output /absolute/local/path/ane-ab.json
 python3 scripts/analyze_ane_benchmark.py /absolute/local/path/ane-ab.json
 ```
@@ -388,12 +444,36 @@ Record process memory independently:
 /usr/bin/time -l ./h3_ane_bench --backend metal --pairs 20 \
   --output /absolute/local/path/ane-metal.json 2> /absolute/local/path/ane-metal-time.txt
 /usr/bin/time -l ./h3_ane_bench --backend coreml \
-  --coreml-model "$H3_ANE_MODEL" --pairs 20 \
+  --coreml-model "$H3_ANE_STRICT_MODEL" --pairs 20 \
   --output /absolute/local/path/ane-coreml.json 2> /absolute/local/path/ane-coreml-time.txt
 ```
 
 Process memory passes only when Core ML maximum resident set size grows no more
 than 5% relative to matched Metal. GPU allocation statistics cannot substitute.
+
+Energy is a separate, conditional strict-receipt run. The installed catalog
+names the template `Core ML` and the additional instrument `Neural Engine`:
+
+```sh
+export H3_ANE_ENERGY_TRACE=/private/tmp/h3-ane-strict-energy.trace
+test -f "$H3_ANE_STRICT_MODEL.qualification.json"
+test ! -e "$H3_ANE_ENERGY_TRACE"
+
+xcrun xctrace record \
+  --template 'Core ML' \
+  --instrument 'Neural Engine' \
+  --output "$H3_ANE_ENERGY_TRACE" \
+  --env H3_ANE_WEIGHT_DIR="$H3_ANE_WEIGHT_DIR" \
+  --launch -- ./h3_ane_bench \
+  --backend ab --coreml-model "$H3_ANE_STRICT_MODEL" \
+  --warmup 2 --pairs 20 \
+  --output /absolute/local/path/ane-energy-ab.json
+```
+
+Run this only after strict qualification succeeds. Inspect and export one
+available energy counter with its exact name and unit. If the installed
+instrument exposes placement/activity but no unit-bearing energy counter for
+the host target, the energy gate remains unverified.
 
 Placement requires an Instruments trace with Neural Engine activity overlapping
 prediction. Energy requires a named exported counter and unit with at least 5%
